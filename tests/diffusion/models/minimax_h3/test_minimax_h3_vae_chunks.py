@@ -182,6 +182,7 @@ def _compat_vae(
         "latents_std": [1.0, 1.0, 1.0],
     }
     vae.parallel_size = parallel_size
+    vae._chunk_decode_coordinator = None
     return vae, model
 
 
