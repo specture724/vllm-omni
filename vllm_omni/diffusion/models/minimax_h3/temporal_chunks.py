@@ -36,10 +36,13 @@ class MiniMaxH3TemporalChunkCompatibilityError(RuntimeError):
     """Raised when remote H3 code cannot use the local compatibility path."""
 
 
-class _RawTemporalChunkCallback(Protocol):
+class _TemporalChunkCallbackSignature(Protocol):
+    """Shared callable shape; each producer defines tensor semantics."""
+
     def __call__(
         self,
         frames: torch.Tensor,
+        /,
         *,
         chunk_index: int,
         total_chunks: int,
@@ -63,7 +66,7 @@ class _RawChunkAssembly:
     def __init__(
         self,
         *,
-        callback: _RawTemporalChunkCallback,
+        callback: _TemporalChunkCallbackSignature,
         plan: MiniMaxH3TemporalDecodePlan,
     ) -> None:
         self.callback = callback
@@ -330,13 +333,16 @@ def resolve_minimax_h3_temporal_cat_dtype(model: nn.Module) -> torch.dtype | Non
 def decode_minimax_h3_temporal_chunks_compat(
     model: nn.Module,
     plan: MiniMaxH3TemporalDecodePlan,
-    callback: _RawTemporalChunkCallback,
+    callback: _TemporalChunkCallbackSignature,
 ) -> torch.Tensor:
     """Mirror the released Apache-2.0 H3 temporal assembler with callbacks.
 
     Keep this implementation and the source/config fingerprints above in sync
     with ``MiniMaxAI/MiniMax-H3@42ed227e``. Unknown remote code fails closed
     before this function is called.
+
+    Callback tensors are borrowed decoder-domain views and must not be retained
+    or mutated. The high-level adapter owns normalization and storage isolation.
     """
 
     chunk_decoded_frames = int(model.tokens_chunk_size) * int(model.vae_ratio_t)  # type: ignore[attr-defined]

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-local coordination for MiniMax H3 temporal chunk decoding.
 
-This boundary owns released-code compatibility and VAE-group failure semantics.
-Cropping, representation conversion, transport, and encoding remain runtime
+This boundary owns released-code compatibility and reconciles preflight and
+callback failures at fixed VAE-group rendezvous points. Cropping,
+representation conversion, transport, and encoding remain runtime
 responsibilities.
 """
 
@@ -19,30 +20,23 @@ import torch.nn as nn
 from .temporal_chunks import (
     MiniMaxH3TemporalChunkCompatibilityError,
     MiniMaxH3TemporalDecodePlan,
+    _TemporalChunkCallbackSignature,
     decode_minimax_h3_temporal_chunks_compat,
     prepare_minimax_h3_temporal_chunks_compat,
 )
 
 
-class MiniMaxH3VideoChunkCallback(Protocol):
+class MiniMaxH3VideoChunkCallback(_TemporalChunkCallbackSignature, Protocol):
     """Consume one ordered, temporally committed H3 video chunk.
 
     ``frames`` is an owned, contiguous float32 RGB tensor in ``BCTHW`` layout
     and the ``[0, 1]`` value range. The callback runs synchronously on the
     producer's current device stream. Before reading it on another stream, the
     consumer must establish ordering from the producer stream (for example via
-    an event) and retain the allocation for that stream's lifetime.
+    an event) and retain the allocation for that stream's lifetime. The
+    consumer may retain or mutate the tensor; it does not alias the returned
+    complete decode.
     """
-
-    def __call__(
-        self,
-        frames: torch.Tensor,
-        *,
-        chunk_index: int,
-        total_chunks: int,
-        frame_start: int,
-        is_final: bool,
-    ) -> None: ...
 
 
 class MiniMaxH3ChunkedDecodeUnsupportedError(RuntimeError):
@@ -77,6 +71,12 @@ class _MiniMaxH3ChunkDecodeCoordinator:
     The coordinator is a plain Python object. It caches only successful source
     validation; request callbacks, tensors, metadata, and process groups remain
     local to :meth:`decode`.
+
+    Errors raised inside the checkpoint decoder after native collectives begin
+    cannot be reconciled here: another rank may already be blocked inside that
+    collective. Resolving such a failure requires native collective handling or
+    supervisor-level timeout and worker-group teardown; the process group cannot
+    be assumed reusable.
     """
 
     def __init__(self) -> None:
@@ -93,14 +93,16 @@ class _MiniMaxH3ChunkDecodeCoordinator:
             return chunk_callback is not None
 
         group_rank = dist.get_rank(group)
-        callback_owners = torch.tensor(
-            [int(chunk_callback is not None)],
-            dtype=torch.int32,
+        # A valid configuration has one contribution: rank 0 contributes 1.
+        # A non-zero owner contributes at least 2, and multiple owners sum to
+        # at least 3, so every rank makes the same decision from one reduction.
+        callback_owner = torch.tensor(
+            [group_rank + 1 if chunk_callback is not None else 0],
+            dtype=torch.int64,
             device=device,
         )
-        dist.all_reduce(callback_owners, group=group)
-        valid_owner = int(callback_owners.item()) == 1 and ((group_rank == 0) == (chunk_callback is not None))
-        if not valid_owner:
+        dist.all_reduce(callback_owner, op=dist.ReduceOp.SUM, group=group)
+        if int(callback_owner.item()) != 1:
             raise ValueError("MiniMax-H3 chunk decode requires a callback on exactly VAE group rank 0")
         return group_rank == 0
 
@@ -282,6 +284,11 @@ class _MiniMaxH3ChunkDecodeCoordinator:
                 exc.__traceback__ = None
                 callback_error = exc
 
+        # Do not catch and reduce exceptions from this region. A peer may
+        # already be blocked in one of the checkpoint's native tile
+        # collectives, in which case a new adapter-level collective would also
+        # deadlock. A native backend or supervisor must handle timeout and
+        # worker-group teardown.
         with host._decode_tiling_context(latent):
             decoded = decode_minimax_h3_temporal_chunks_compat(
                 host.model,

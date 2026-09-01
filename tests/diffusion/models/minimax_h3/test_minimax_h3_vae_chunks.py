@@ -402,6 +402,29 @@ def test_compat_callback_failure_finishes_decode_and_recovers(
     assert model.adaptive_decode_calls == model.num_chunks * 2
 
 
+def test_native_decoder_failure_propagates_on_single_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_released_source(monkeypatch)
+    vae, model = _compat_vae(37)
+    callback_calls = 0
+
+    def fail_decode(latent: torch.Tensor) -> torch.Tensor:
+        del latent
+        raise LookupError("native decoder failed")
+
+    def consume(*args, **kwargs) -> None:
+        nonlocal callback_calls
+        del args, kwargs
+        callback_calls += 1
+
+    monkeypatch.setattr(model, "_adaptive_decode", fail_decode)
+    with pytest.raises(LookupError, match="native decoder failed"):
+        vae.decode_latent_with_chunks(_latent(), consume)
+
+    assert callback_calls == 0
+
+
 @pytest.mark.parametrize("drift", ["changed", "missing"])
 def test_compat_source_drift_fails_closed_before_decode(
     monkeypatch: pytest.MonkeyPatch,
@@ -744,6 +767,98 @@ def _distributed_worker(
         )
     finally:
         dist.destroy_process_group()
+
+
+def _wrong_owner_worker(
+    rank: int,
+    init_file: str,
+    result_queue: Any,
+) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=3,
+    )
+    try:
+        vae_module.get_data_parallel_world_size = lambda: 1
+        vae_module.model_parallel_is_initialized = lambda: True
+        _install_released_source_fingerprint()
+        vae, model = _compat_vae(
+            37,
+            parallel_size=3,
+            collective=True,
+            tile_count=3,
+        )
+        vae._native_parallel_state = MethodType(
+            lambda self: {"sp_process_group": dist.group.WORLD},
+            vae,
+        )
+
+        try:
+            vae.decode_latent_with_chunks(
+                _latent(),
+                (lambda *args, **kwargs: None) if rank == 1 else None,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            failure_type = type(exc).__name__
+        else:
+            failure_type = "none"
+
+        recovery = torch.tensor([rank + 1], dtype=torch.int32)
+        dist.all_reduce(recovery)
+        result_queue.put(
+            {
+                "rank": rank,
+                "failure_type": failure_type,
+                "adaptive_calls": model.adaptive_decode_calls,
+                "recovery": int(recovery.item()),
+            }
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parallel
+def test_three_rank_wrong_callback_owner_is_symmetric_and_group_recovers(
+    tmp_path: Path,
+) -> None:
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    init_file = str(tmp_path / "gloo-wrong-owner-init")
+    processes = [
+        context.Process(
+            target=_wrong_owner_worker,
+            args=(rank, init_file, result_queue),
+        )
+        for rank in range(3)
+    ]
+    for process in processes:
+        process.start()
+    deadline = time.monotonic() + 90
+    for process in processes:
+        process.join(timeout=max(0, deadline - time.monotonic()))
+    for process in processes:
+        if process.is_alive():
+            process.join(timeout=1)
+    hung = [process for process in processes if process.is_alive()]
+    for process in hung:
+        process.terminate()
+        process.join(timeout=5)
+    assert not hung, "three-rank callback-owner validation deadlocked"
+    assert [process.exitcode for process in processes] == [0, 0, 0]
+
+    results = sorted(
+        [result_queue.get(timeout=5) for _ in range(3)],
+        key=lambda result: result["rank"],
+    )
+    assert [result["failure_type"] for result in results] == [
+        "ValueError",
+        "ValueError",
+        "ValueError",
+    ]
+    assert [result["adaptive_calls"] for result in results] == [0, 0, 0]
+    assert [result["recovery"] for result in results] == [6, 6, 6]
 
 
 @pytest.mark.parallel
