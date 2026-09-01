@@ -21,7 +21,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_data_parallel_world_size,
+    get_world_group,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -29,6 +33,12 @@ from vllm_omni.diffusion.offloader.module_residency import (
 
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .temporal_chunks import (
+    MiniMaxH3TemporalChunkCompatibilityError,
+    MiniMaxH3TemporalDecodePlan,
+    decode_minimax_h3_temporal_chunks_compat,
+    prepare_minimax_h3_temporal_chunks_compat,
+)
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -60,7 +70,7 @@ class MiniMaxH3VideoChunkCallback(Protocol):
 
 
 class MiniMaxH3ChunkedDecodeUnsupportedError(RuntimeError):
-    """Raised when the loaded MiniMax H3 VAE lacks the vendor chunk API."""
+    """Raised when loaded MiniMax H3 code cannot honor the chunk contract."""
 
 
 class MiniMaxH3ChunkCallbackPeerError(RuntimeError):
@@ -338,6 +348,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def _chunk_process_group(self) -> dist.ProcessGroup | None:
         if not self.is_distributed_enabled():
             return None
+        if model_parallel_is_initialized() and get_data_parallel_world_size() > 1:
+            raise MiniMaxH3ChunkedDecodeUnsupportedError(
+                "MiniMax-H3 temporal chunks do not yet support combining data parallelism with VAE patch parallelism"
+            )
         group = self._native_parallel_state().get("sp_process_group")
         if group is None or dist.get_world_size(group) != self.parallel_size:
             raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
@@ -395,14 +409,48 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise callback_error
         raise MiniMaxH3ChunkCallbackPeerError("MiniMax-H3 video chunk callback failed on this VAE group's output rank")
 
-    def _validate_vendor_chunk_api(self) -> None:
-        version = getattr(self.model, "temporal_chunk_callback_api_version", None)
-        if version != 1:
-            raise MiniMaxH3ChunkedDecodeUnsupportedError(
-                "Loaded MiniMax-H3 VAE does not provide temporal_chunk_callback API v1 "
-                f"(found {version!r}); install a model snapshot containing the official "
-                "MiniMax temporal chunk callback"
+    @staticmethod
+    def _synchronize_chunk_preflight_error(
+        preflight_error: Exception | None,
+        temporal_dtype: torch.dtype | None,
+        *,
+        group: dist.ProcessGroup | None,
+        device: torch.device,
+    ) -> None:
+        if group is None:
+            if preflight_error is not None:
+                raise preflight_error
+            return
+        failed = torch.tensor(
+            [int(preflight_error is not None)],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        if int(failed.item()) == 0:
+            dtype_codes = {
+                None: 0,
+                torch.float16: 1,
+                torch.bfloat16: 2,
+                torch.float32: 3,
+            }
+            code = torch.tensor(
+                [dtype_codes.get(temporal_dtype, -1)],
+                dtype=torch.int32,
+                device=device,
             )
+            lowest = code.clone()
+            highest = code.clone()
+            dist.all_reduce(lowest, op=dist.ReduceOp.MIN, group=group)
+            dist.all_reduce(highest, op=dist.ReduceOp.MAX, group=group)
+            if int(lowest.item()) == int(highest.item()) and int(lowest.item()) >= 0:
+                return
+            raise MiniMaxH3ChunkedDecodeUnsupportedError(
+                "MiniMax-H3 VAE ranks selected incompatible temporal concat dtypes"
+            )
+        if preflight_error is not None:
+            raise preflight_error
+        raise MiniMaxH3ChunkedDecodeUnsupportedError("A peer VAE rank rejected the MiniMax-H3 temporal chunk preflight")
 
     @torch.inference_mode()
     def encode_image(self, image: Image.Image) -> torch.Tensor:
@@ -506,11 +554,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         latent: torch.Tensor,
         chunk_callback: MiniMaxH3VideoChunkCallback | None,
     ) -> torch.Tensor:
-        """Decode a video while publishing vendor-committed temporal chunks.
+        """Decode a video while publishing committed temporal chunks.
 
         Every rank collaborating in the configured H3 VAE tile group must call
         this method, with ``chunk_callback`` supplied only on group rank 0. A
-        callback failure is deferred until the vendor decoder finishes its
+        callback failure is deferred until the compatibility decoder finishes its
         remaining collectives, then propagated to every group rank. With
         ``parallel_size=1`` the runtime designates each request's output owner
         by supplying a callback there and ``None`` on replica peers.
@@ -522,8 +570,41 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         requested-size crop as the complete H3 pipeline output.
         """
 
-        self._validate_vendor_chunk_api()
         group = self._chunk_process_group()
+        plan: MiniMaxH3TemporalDecodePlan | None = None
+        preflight_error: Exception | None = None
+        if latent.ndim != 5:
+            preflight_error = MiniMaxH3ChunkedDecodeUnsupportedError(
+                f"MiniMax-H3 video latent must be rank 5, got {tuple(latent.shape)}"
+            )
+        else:
+            try:
+                denormalized = self._denormalize_latent(latent)
+                plan = prepare_minimax_h3_temporal_chunks_compat(
+                    self.model,
+                    denormalized,
+                    validate_sources=not getattr(
+                        self,
+                        "_minimax_h3_chunk_sources_validated",
+                        False,
+                    ),
+                )
+                self._minimax_h3_chunk_sources_validated = True
+                del denormalized
+            except MiniMaxH3TemporalChunkCompatibilityError as exc:
+                preflight_error = MiniMaxH3ChunkedDecodeUnsupportedError(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                # Every VAE rank must reach the preflight reduction even when
+                # one node's private planner or environment fails locally.
+                exc.__traceback__ = None
+                preflight_error = exc
+        self._synchronize_chunk_preflight_error(
+            preflight_error,
+            plan.temporal_dtype if plan is not None else None,
+            group=group,
+            device=latent.device,
+        )
+        assert plan is not None
         is_output_rank = self._is_chunk_output_rank(
             chunk_callback,
             group=group,
@@ -560,7 +641,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     or is_final != (chunk_index + 1 == total_chunks)
                 ):
                     raise RuntimeError(
-                        "MiniMax-H3 vendor callback emitted discontinuous chunk metadata: "
+                        "MiniMax-H3 temporal backend emitted discontinuous chunk metadata: "
                         f"index={chunk_index}/{next_chunk_index}, "
                         f"total={total_chunks}/{expected_total_chunks}, "
                         f"frame_start={frame_start}/{next_frame_start}, "
@@ -570,7 +651,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 frames = frames.clone(memory_format=torch.contiguous_format)
                 frame_count = int(frames.shape[2])
                 if frame_count <= 0:
-                    raise RuntimeError("MiniMax-H3 vendor callback emitted an empty chunk")
+                    raise RuntimeError("MiniMax-H3 temporal backend emitted an empty chunk")
                 next_chunk_index += 1
                 next_frame_start += frame_count
                 saw_final = is_final
@@ -589,9 +670,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 callback_error = exc
 
         with self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(
-                self._denormalize_latent(latent),
-                temporal_chunk_callback=publish,
+            decoded = decode_minimax_h3_temporal_chunks_compat(
+                self.model,
+                plan,
+                publish,
             )
         frames = self._normalize_decoded_frames(decoded)
         if (
@@ -600,7 +682,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             and (not saw_final or next_chunk_index != expected_total_chunks or next_frame_start != int(frames.shape[2]))
         ):
             callback_error = RuntimeError(
-                "MiniMax-H3 vendor callback did not reconstruct the full decode: "
+                "MiniMax-H3 temporal backend did not reconstruct the full decode: "
                 f"final={saw_final}, chunks={next_chunk_index}/{expected_total_chunks}, "
                 f"frames={next_frame_start}/{frames.shape[2]}"
             )
