@@ -822,7 +822,7 @@ def spatial_shard_decode(
                     first_chunk=(i == 0),
                 )
                 if produce_output:
-                    if on_chunk is not None:
+                    if on_chunk is not None and callback_error is None:
                         try:
                             if vae.config.patch_size is not None:
                                 chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
