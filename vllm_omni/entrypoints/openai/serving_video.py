@@ -368,11 +368,15 @@ class OmniOpenAIServingVideo:
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
+                    (
+                        base64.b64encode(video).decode("utf-8")
+                        if isinstance(video, bytes)
+                        else encode_video_base64(
+                            video,
+                            fps=artifacts.output_fps,
+                            video_codec_options=video_codec_options,
+                            frame_converter=self._video_frame_converter,
+                        )
                     )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
@@ -433,6 +437,11 @@ class OmniOpenAIServingVideo:
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
 
         _t_encode_start = time.perf_counter()
+        if isinstance(artifacts.videos[0], bytes):
+            video_bytes = artifacts.videos[0]
+            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+            logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
+            return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
             fps=artifacts.output_fps,
