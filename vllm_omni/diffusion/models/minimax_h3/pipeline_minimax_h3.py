@@ -2095,17 +2095,35 @@ class MiniMaxH3Pipeline(
         *,
         height: int,
         width: int,
+        on_video_chunk: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode H3 audio/video, optionally publishing ordered video chunks.
+
+        Audio is decoded first so a mux consumer can create its audio stream
+        before the first video chunk arrives.  The public callback receives
+        only cropped ``BCTHW`` float frames; model-local chunk metadata remains
+        private to the H3 producer adapter.
+        """
+        with self._component_on_device(self.audio_vae):
+            audio = self.audio_vae.decode_latent(audio_latent)
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
                 enabled=True,
             ):
-                video = self.video_vae.decode_latent(video_latent)
+                if on_video_chunk is None:
+                    video = self.video_vae.decode_latent(video_latent)
+                else:
+                    decode_chunks = getattr(self.video_vae, "decode_latent_with_chunks", None)
+                    if decode_chunks is None:
+                        raise RuntimeError("MiniMax-H3 VAE does not support temporal chunk callbacks")
+
+                    def publish(frames: torch.Tensor, **_: Any) -> None:
+                        on_video_chunk(frames[..., :height, :width].contiguous())
+
+                    video = decode_chunks(video_latent, publish)
         video = video[..., :height, :width].contiguous()
-        with self._component_on_device(self.audio_vae):
-            audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
 
     @staticmethod
