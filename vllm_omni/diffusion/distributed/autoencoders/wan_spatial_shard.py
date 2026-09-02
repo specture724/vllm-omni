@@ -794,6 +794,7 @@ def spatial_shard_decode(
     group: dist.ProcessGroup,
     return_dict: bool = True,
     split_dim: str = "height",
+    on_chunk: Any | None = None,
 ) -> DecoderOutput | tuple[torch.Tensor]:
     install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
 
@@ -820,13 +821,21 @@ def spatial_shard_decode(
                     first_chunk=(i == 0),
                 )
                 if produce_output:
-                    decoded_chunks.append(chunk)
+                    if on_chunk is not None:
+                        if vae.config.patch_size is not None:
+                            chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
+                        on_chunk(torch.clamp(chunk, min=-1.0, max=1.0))
+                    else:
+                        decoded_chunks.append(chunk)
 
             if produce_output:
-                out = torch.cat(decoded_chunks, dim=2)
-                if vae.config.patch_size is not None:
-                    out = unpatchify(out, patch_size=vae.config.patch_size)
-                out = torch.clamp(out, min=-1.0, max=1.0)
+                if on_chunk is None:
+                    out = torch.cat(decoded_chunks, dim=2)
+                    if vae.config.patch_size is not None:
+                        out = unpatchify(out, patch_size=vae.config.patch_size)
+                    out = torch.clamp(out, min=-1.0, max=1.0)
+                else:
+                    out = z.new_empty((0,))
             else:
                 out = z.new_zeros(0)
     finally:
