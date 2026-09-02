@@ -44,9 +44,51 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         with self._execution_context():
             return super().encode(x, return_dict=return_dict)
 
-    def decode(self, z: torch.Tensor, return_dict: bool = True):
+    def decode(
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        on_chunk: Any | None = None,
+    ):
+        """Decode a Wan latent, optionally emitting temporal chunks.
+
+        With ``on_chunk=None`` this is exactly the diffusers decode path.  When
+        a callback is provided, each decoded temporal chunk is normalized and
+        delivered synchronously in order; the full video is not materialized.
+        Tiled decode is intentionally fail-closed because its spatial-first
+        traversal cannot provide a temporal seam without multiplying caches.
+        """
         with self._execution_context():
-            return super().decode(z, return_dict=return_dict)
+            if on_chunk is None:
+                return super().decode(z, return_dict=return_dict)
+            if self.use_tiling:
+                if hasattr(self, "is_distributed_enabled") and self.is_distributed_enabled():
+                    return self.tiled_decode(z, return_dict=return_dict, on_chunk=on_chunk)
+                tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+                tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+                if z.shape[-1] > tile_latent_min_width or z.shape[-2] > tile_latent_min_height:
+                    raise ValueError("Wan chunk callbacks are unsupported for spatial tiling")
+            self.clear_cache()
+            try:
+                x = self.post_quant_conv(z)
+                for i in range(z.shape[2]):
+                    self._conv_idx = [0]
+                    chunk = self.decoder(
+                        x[:, :, i : i + 1, :, :],
+                        feat_cache=self._feat_map,
+                        feat_idx=self._conv_idx,
+                        first_chunk=(i == 0),
+                    )
+                    if self.config.patch_size is not None:
+                        chunk = unpatchify(chunk, patch_size=self.config.patch_size)
+                    chunk = torch.clamp(chunk, min=-1.0, max=1.0)
+                    on_chunk(chunk)
+            finally:
+                self.clear_cache()
+        empty = z.new_empty((0,))
+        if not return_dict:
+            return (empty,)
+        return DecoderOutput(sample=empty)
 
 
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
@@ -303,11 +345,17 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return False
         return True
 
-    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
+    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True, on_chunk: Any | None = None):
         if not self.is_distributed_enabled():
+            if on_chunk is not None:
+                raise ValueError("Wan chunk callbacks are unsupported for spatial tiling")
             return super().tiled_decode(z, return_dict=return_dict)
 
-        if self._spatial_shard_decode_enabled(z):
+        spatial_shard_enabled = self._spatial_shard_decode_enabled(z)
+        if on_chunk is not None and not spatial_shard_enabled:
+            raise ValueError("Wan chunk callbacks require spatial-shard decode when tiling is enabled")
+
+        if spatial_shard_enabled:
             split_dim = self._spatial_shard_decode_split_dim()
             logger.debug("Decode running with Wan VAE spatial_shard_%s mode", split_dim)
             return wan_spatial_shard.spatial_shard_decode(
@@ -316,6 +364,7 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                 group=self.distributed_executor.group,
                 return_dict=return_dict,
                 split_dim=split_dim,
+                on_chunk=on_chunk,
             )
 
         logger.debug("Decode running with distributed executor")
