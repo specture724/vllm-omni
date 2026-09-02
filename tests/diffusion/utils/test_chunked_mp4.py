@@ -28,6 +28,25 @@ def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
     assert chunked == baseline
     assert hashlib.sha256(chunked).digest() == hashlib.sha256(baseline).digest()
 
+    audio = np.zeros((2, 320), dtype=np.float32)
+    baseline_audio = mux_av_video_audio_bytes(
+        (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in frames),
+        width=24,
+        height=16,
+        fps=24,
+        audio_waveform=audio,
+        audio_sample_rate=32000,
+    )
+    encoder_audio = ChunkedMP4Encoder(
+        width=24,
+        height=16,
+        fps=24,
+        audio_waveform=audio,
+        audio_sample_rate=32000,
+    )
+    encoder_audio.push(frames)
+    assert encoder_audio.finish() == baseline_audio
+
 
 def test_chunked_mp4_abort_joins_worker() -> None:
     encoder = ChunkedMP4Encoder(width=24, height=16, fps=24)
