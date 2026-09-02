@@ -62,11 +62,12 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             if on_chunk is None:
                 return super().decode(z, return_dict=return_dict)
             if self.use_tiling:
-                if hasattr(self, "is_distributed_enabled") and self.is_distributed_enabled():
-                    return self.tiled_decode(z, return_dict=return_dict, on_chunk=on_chunk)
                 tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
                 tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
-                if z.shape[-1] > tile_latent_min_width or z.shape[-2] > tile_latent_min_height:
+                exceeds_tile = z.shape[-1] > tile_latent_min_width or z.shape[-2] > tile_latent_min_height
+                if exceeds_tile:
+                    if hasattr(self, "is_distributed_enabled") and self.is_distributed_enabled():
+                        return self.tiled_decode(z, return_dict=return_dict, on_chunk=on_chunk)
                     raise ValueError("Wan chunk callbacks are unsupported for spatial tiling")
             self.clear_cache()
             try:
