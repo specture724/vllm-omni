@@ -365,30 +365,29 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+        def encode_video_result(idx: int, video: Any) -> str:
+            if isinstance(video, bytes):
+                return base64.b64encode(video).decode("utf-8")
+            if artifacts.audios[idx] is None:
+                return encode_video_base64(
+                    video,
+                    fps=artifacts.output_fps,
+                    video_codec_options=video_codec_options,
+                    frame_converter=self._video_frame_converter,
+                )
+            return encode_video_base64(
+                video,
+                fps=artifacts.output_fps,
+                audio=artifacts.audios[idx],
+                audio_sample_rate=artifacts.audio_sample_rate,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+            )
+
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
-                b64_json=(
-                    (
-                        base64.b64encode(video).decode("utf-8")
-                        if isinstance(video, bytes)
-                        else encode_video_base64(
-                            video,
-                            fps=artifacts.output_fps,
-                            video_codec_options=video_codec_options,
-                            frame_converter=self._video_frame_converter,
-                        )
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                ),
+                b64_json=encode_video_result(idx, video),
                 action=artifacts.actions[idx],
             )
             for idx, video in enumerate(artifacts.videos)
