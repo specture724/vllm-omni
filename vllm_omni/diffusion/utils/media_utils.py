@@ -14,7 +14,6 @@ from typing import Any, cast
 import av
 import numpy as np
 
-
 _CHUNKED_MP4_DONE = object()
 
 
@@ -145,7 +144,7 @@ class ChunkedMP4Encoder:
 
     close = abort
 
-    def __enter__(self) -> "ChunkedMP4Encoder":
+    def __enter__(self) -> ChunkedMP4Encoder:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
