@@ -807,6 +807,7 @@ def spatial_shard_decode(
     produce_output = world_size <= 1 or rank == 0
 
     vae.clear_cache()
+    callback_error: BaseException | None = None
     try:
         context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
         with context:
@@ -822,9 +823,14 @@ def spatial_shard_decode(
                 )
                 if produce_output:
                     if on_chunk is not None:
-                        if vae.config.patch_size is not None:
-                            chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
-                        on_chunk(torch.clamp(chunk, min=-1.0, max=1.0))
+                        try:
+                            if vae.config.patch_size is not None:
+                                chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
+                            on_chunk(torch.clamp(chunk, min=-1.0, max=1.0))
+                        except BaseException as exc:
+                            # Keep all ranks in the temporal collective loop;
+                            # surface the callback failure only after decode.
+                            callback_error = exc
                     else:
                         decoded_chunks.append(chunk)
 
@@ -841,6 +847,8 @@ def spatial_shard_decode(
     finally:
         vae.clear_cache()
 
+    if callback_error is not None:
+        raise callback_error
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)
