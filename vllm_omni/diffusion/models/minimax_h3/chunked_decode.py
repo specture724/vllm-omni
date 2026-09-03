@@ -53,10 +53,11 @@ def decode_h3_chunks(
             exc.__traceback__ = None
             error = exc
 
+    sink = publish if owner else (None if group is None else (lambda _frames: None))
     result = decode_temporal_chunks(
         host.model,
         host._denormalize_latent(latent),
-        publish if owner else None,
+        sink,
     )
 
     if group is not None:
