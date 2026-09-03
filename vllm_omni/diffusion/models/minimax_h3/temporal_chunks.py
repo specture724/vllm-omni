@@ -31,20 +31,19 @@ def decode_temporal_chunks(
 
     isolated_first = bool(model.isolated_first_frame and pre_padding == 0)
     isolated_last = bool(model.isolated_last_frame)
-    isolated = int(isolated_first) + int(isolated_last)
-    pseudo_tokens = int(latent.shape[2]) - isolated + token_drop
+    z_head = latent[:, :, :1] if isolated_first else None
+    z_tail = latent[:, :, -1:] if isolated_last else None
+    start = int(isolated_first)
+    stop = int(latent.shape[2]) - int(isolated_last)
+    latent = latent[:, :, start:stop]
+
+    pseudo_tokens = int(latent.shape[2]) + token_drop
     pad_tokens = (-pseudo_tokens) % chunk_size
     if pad_tokens:
         latent = torch.cat((latent, latent[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)), dim=2)
     num_chunks = (pseudo_tokens + pad_tokens) // chunk_size - int(token_drop > 0)
     if num_chunks <= 0:
         raise ValueError("MiniMax-H3 temporal chunk plan is empty")
-
-    z_head = latent[:, :, :1] if isolated_first else None
-    z_tail = latent[:, :, -1:] if isolated_last else None
-    start = int(isolated_first)
-    stop = int(latent.shape[2]) - int(isolated_last)
-    latent = latent[:, :, start:stop]
 
     total_frames, pad_frames, output_frames = model._decode_temporal_output_frame_plan(
         latent, z_head, z_tail, num_chunks, pad_tokens
