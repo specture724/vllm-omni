@@ -27,6 +27,11 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .chunked_decode import (
+    MiniMaxH3ChunkedDecodeUnsupportedError,
+    MiniMaxH3VideoChunkCallback,
+    decode_h3_chunks,
+)
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
@@ -395,6 +400,32 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        channels = int(self.config_dict["latent_channels"])
+        mean = torch.tensor(self.config_dict["latents_mean"], device=latent.device, dtype=latent.dtype)
+        std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
+        shape = (1, channels, 1, 1, 1)
+        return latent * std.view(shape) + mean.view(shape)
+
+    @torch.inference_mode()
+    def decode_latent_with_chunks(
+        self,
+        latent: torch.Tensor,
+        chunk_callback: MiniMaxH3VideoChunkCallback | None,
+    ) -> torch.Tensor:
+        """Decode temporal clips and synchronously publish frames-only chunks."""
+        if not callable(getattr(self.model, "_adaptive_decode", None)):
+            raise MiniMaxH3ChunkedDecodeUnsupportedError(
+                "Loaded MiniMax-H3 VAE does not expose temporal decode primitives"
+            )
+        group = None
+        if self.is_distributed_enabled():
+            group = self._native_parallel_state().get("sp_process_group")
+            if group is None or dist.get_world_size(group) != self.parallel_size:
+                raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        # Native H3 tiling performs its own collectives for every temporal clip.
+        return decode_h3_chunks(self, latent, chunk_callback, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
