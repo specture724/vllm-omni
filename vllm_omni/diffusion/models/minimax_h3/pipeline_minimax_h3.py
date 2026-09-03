@@ -2109,7 +2109,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
         max_pending: int = 2,
-        batch_frames: int = 16,
+        batch_frames: int = 17,
         video_codec_options: dict[str, str] | None = None,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
