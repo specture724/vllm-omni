@@ -394,12 +394,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
         with tiling_context:
             decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
-        if frames.ndim == 4:
-            frames = frames.unsqueeze(0).transpose(1, 2)
-        if frames.ndim != 5:
-            raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
-        return frames.float()
+        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
 
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         channels = int(self.config_dict["latent_channels"])
@@ -407,6 +402,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
         shape = (1, channels, 1, 1, 1)
         return latent * std.view(shape) + mean.view(shape)
+
+
+    @staticmethod
+    def _normalize_decoded_frames(decoded: torch.Tensor) -> torch.Tensor:
+        """Canonicalize remote H3 decoder output to [B,C,T,H,W]."""
+        frames = decoded
+        if frames.ndim == 4:
+            frames = frames.unsqueeze(0).transpose(1, 2)
+        if frames.ndim != 5:
+            raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
+        return frames.float()
 
     @torch.inference_mode()
     def decode_latent_with_chunks(
