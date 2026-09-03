@@ -364,8 +364,8 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         return output
     video, audio = output
     if isinstance(video, (bytes, bytearray, memoryview)):
-        encoded_videos = [bytes(video)]
-    elif isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+        video = [video]
+    if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
         encoded_videos = [bytes(item) for item in video]
     else:
         encoded_videos = None

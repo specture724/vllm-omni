@@ -368,13 +368,6 @@ class OmniOpenAIServingVideo:
         def encode_video_result(idx: int, video: Any) -> str:
             if isinstance(video, bytes):
                 return base64.b64encode(video).decode("utf-8")
-            if artifacts.audios[idx] is None:
-                return encode_video_base64(
-                    video,
-                    fps=artifacts.output_fps,
-                    video_codec_options=video_codec_options,
-                    frame_converter=self._video_frame_converter,
-                )
             return encode_video_base64(
                 video,
                 fps=artifacts.output_fps,
