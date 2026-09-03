@@ -17,6 +17,16 @@ import numpy as np
 _CHUNKED_MP4_DONE = object()
 
 
+def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None:
+    """Validate a ``(T, H, W, 3)`` uint8 RGB chunk against a session's frame size."""
+    if chunk.ndim != 4 or chunk.shape[-1] != 3:
+        raise ValueError("video chunk must have shape (T, H, W, 3)")
+    if chunk.dtype != np.uint8:
+        raise ValueError("video chunk must have dtype uint8")
+    if chunk.shape[1] != height or chunk.shape[2] != width:
+        raise ValueError("video chunks in a session must use a consistent frame size")
+
+
 class ChunkedMP4Encoder:
     """Encode temporal video chunks while the producer is still decoding.
 
@@ -81,14 +91,7 @@ class ChunkedMP4Encoder:
                 yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
 
     def _validate_chunk(self, chunk: np.ndarray) -> None:
-        if not isinstance(chunk, np.ndarray):
-            raise TypeError("video chunk must be a numpy.ndarray")
-        if chunk.ndim != 4 or chunk.shape[-1] != 3:
-            raise ValueError("video chunk must have shape (T, H, W, 3)")
-        if chunk.dtype != np.uint8:
-            raise ValueError("video chunk must have dtype uint8")
-        if chunk.shape[1] != self.height or chunk.shape[2] != self.width:
-            raise ValueError("video chunks must have a consistent frame size")
+        _validate_video_chunk(chunk, width=self.width, height=self.height)
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:
@@ -99,22 +102,11 @@ class ChunkedMP4Encoder:
     def push(self, chunk: np.ndarray) -> None:
         """Queue one ordered uint8 chunk, applying bounded backpressure."""
         self._validate_chunk(chunk)
-        while True:
-            self._raise_if_failed()
-            try:
-                self._queue.put(chunk, timeout=0.1)
-                return
-            except queue.Full:
-                continue
+        self._raise_if_failed()
+        self._queue.put(chunk)
 
     def _send_done(self) -> None:
-        while True:
-            try:
-                self._queue.put(_CHUNKED_MP4_DONE, timeout=0.1)
-                return
-            except queue.Full:
-                if not self._thread.is_alive():
-                    return
+        self._queue.put(_CHUNKED_MP4_DONE)
 
     def finish(self) -> bytes:
         """Flush the muxer and return complete progressive MP4 bytes."""
@@ -198,12 +190,7 @@ class FragmentedMP4Muxer:
         """Mux a batch of ``uint8`` RGB frames and return newly written MP4 bytes."""
         if self._closed:
             raise RuntimeError("Cannot mux frames after FragmentedMP4Muxer.close().")
-        if video_frames.ndim != 4 or video_frames.shape[-1] != 3:
-            raise ValueError("video_frames must have shape (T, H, W, 3).")
-        if video_frames.dtype != np.uint8:
-            raise ValueError("video_frames must be uint8.")
-        if video_frames.shape[1] != self._stream.height or video_frames.shape[2] != self._stream.width:
-            raise ValueError("All fragmented MP4 chunks in a session must use the same frame size.")
+        _validate_video_chunk(video_frames, width=self._stream.width, height=self._stream.height)
 
         for frame_data in video_frames:
             frame = av.VideoFrame.from_ndarray(frame_data, format="rgb24")
