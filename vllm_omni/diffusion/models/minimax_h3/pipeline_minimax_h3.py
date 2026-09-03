@@ -2109,6 +2109,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
         max_pending: int = 2,
+        batch_frames: int = 16,
         video_codec_options: dict[str, str] | None = None,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
@@ -2119,6 +2120,9 @@ class MiniMaxH3Pipeline(
         conversion in the worker, then applies bounded backpressure to the encoder.
         """
         from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+
+        if batch_frames <= 0:
+            raise ValueError("batch_frames must be positive")
 
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
@@ -2135,11 +2139,27 @@ class MiniMaxH3Pipeline(
             video_codec_options=video_codec_options,
         )
 
+        pending_chunks: list[torch.Tensor] = []
+        pending_frames = 0
+
+        def flush_pending() -> None:
+            nonlocal pending_frames
+            if not pending_chunks:
+                return
+            batched = torch.cat(pending_chunks, dim=1)
+            encoder.push(batched[0].cpu().numpy())
+            pending_chunks.clear()
+            pending_frames = 0
+
         def on_chunk(frames: torch.Tensor) -> None:
+            nonlocal pending_frames
             prepared = _prepare_minimax_h3_video_output(frames[..., :height, :width])
             if prepared.shape[0] != 1:
                 raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
-            encoder.push(prepared[0].detach().cpu().numpy())
+            pending_chunks.append(prepared)
+            pending_frames += int(prepared.shape[1])
+            if pending_frames >= batch_frames:
+                flush_pending()
 
         try:
             with self._component_on_device(self.video_vae):
@@ -2149,6 +2169,7 @@ class MiniMaxH3Pipeline(
                     enabled=True,
                 ):
                     self.video_vae.decode_latent_with_chunks(video_latent, on_chunk)
+            flush_pending()
             return encoder.finish()
         except BaseException:
             encoder.abort()
