@@ -98,7 +98,6 @@ def decode_temporal_chunks(
             if overlap is not None:
                 emit(overlap)
                 overlap = None
-        del decoded, clip
 
     if written != output_frames:
         raise RuntimeError(f"MiniMax-H3 temporal decode emitted {written}/{output_frames} frames")

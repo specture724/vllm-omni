@@ -11,14 +11,6 @@ import torch.distributed as dist
 from .temporal_chunks import decode_temporal_chunks
 
 
-class MiniMaxH3ChunkedDecodeUnsupportedError(RuntimeError):
-    """Raised when the loaded H3 VAE cannot provide temporal chunks."""
-
-
-class MiniMaxH3ChunkCallbackPeerError(RuntimeError):
-    """Raised on a peer rank when rank zero's callback fails."""
-
-
 MiniMaxH3VideoChunkCallback = Callable[[torch.Tensor], None]
 
 
@@ -52,7 +44,6 @@ def decode_h3_chunks(
             assert callback is not None
             callback(frames)
         except BaseException as exc:  # noqa: BLE001
-            exc.__traceback__ = None
             error = exc
 
     sink = publish if owner else (None if group is None else (lambda _frames: None))
@@ -69,7 +60,7 @@ def decode_h3_chunks(
             if rank == 0:
                 assert error is not None
                 raise error
-            raise MiniMaxH3ChunkCallbackPeerError("MiniMax-H3 video chunk callback failed on rank zero")
+            raise RuntimeError("MiniMax-H3 video chunk callback failed on rank zero")
     elif error is not None:
         raise error
 
