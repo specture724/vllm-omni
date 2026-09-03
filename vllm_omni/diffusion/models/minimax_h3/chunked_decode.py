@@ -46,7 +46,9 @@ def decode_h3_chunks(
         if not owner or error is not None:
             return
         try:
-            frames = host._normalize_decoded_frames(raw).contiguous()
+            processor = getattr(host.model, "processor", None)
+            decoded = raw if processor is None else processor.revert_tensor(raw)
+            frames = host._normalize_decoded_frames(decoded).contiguous()
             assert callback is not None
             callback(frames)
         except BaseException as exc:  # noqa: BLE001
@@ -71,4 +73,8 @@ def decode_h3_chunks(
     elif error is not None:
         raise error
 
-    return result if not result.numel() else host._normalize_decoded_frames(result)
+    if not result.numel():
+        return result
+    processor = getattr(host.model, "processor", None)
+    decoded = result if processor is None else processor.revert_tensor(result)
+    return host._normalize_decoded_frames(decoded)
