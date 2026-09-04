@@ -57,6 +57,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+from vllm_omni.diffusion.utils.media_utils import normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -2528,6 +2529,7 @@ class MiniMaxH3Pipeline(
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
+            "video_codec_options": normalize_video_codec_options(extra.get("video_codec_options")),
         }
 
     @staticmethod
@@ -2561,6 +2563,7 @@ class MiniMaxH3Pipeline(
                         audio_latent,
                         height=context["height"],
                         width=context["width"],
+                        video_codec_options=context["video_codec_options"],
                     )
                 )
                 audios.append(None)
@@ -2704,6 +2707,7 @@ class MiniMaxH3Pipeline(
                     "latent_w": context["latent_w"],
                     "audio_t": context["audio_t"],
                     "preencode_mp4": context.get("preencode_mp4", False),
+                    "video_codec_options": context.get("video_codec_options"),
                 },
             }
         )
@@ -2881,6 +2885,7 @@ class MiniMaxH3Pipeline(
                 audio_latent,
                 height=shape["height"],
                 width=shape["width"],
+                video_codec_options=shape.get("video_codec_options"),
             )
             audio = None
         else:
