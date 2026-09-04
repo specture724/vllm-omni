@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Frames-only callback coordination for MiniMax-H3 VAE decoding."""
 
 from __future__ import annotations
