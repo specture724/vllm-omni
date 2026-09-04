@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import hashlib
 
 import av
@@ -5,6 +7,8 @@ import numpy as np
 import pytest
 
 from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder, mux_av_video_audio_bytes
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _frames() -> np.ndarray:
