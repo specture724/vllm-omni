@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any, cast
 
@@ -15,6 +15,20 @@ import av
 import numpy as np
 
 _CHUNKED_MP4_DONE = object()
+
+
+def normalize_video_codec_options(value: Any) -> dict[str, str] | None:
+    """Coerce a request's ``video_codec_options`` into PyAV's str->str contract.
+
+    The value reaches a worker straight from ``extra_params``, so reject a
+    non-mapping here rather than letting it fail inside the encoder after the
+    decode has already run.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("video_codec_options must be a JSON object of encoder option names to values")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None:
