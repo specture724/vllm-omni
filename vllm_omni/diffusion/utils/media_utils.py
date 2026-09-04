@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Video/audio muxing utilities using PyAV (no ffmpeg binary dependency)."""
 
 from __future__ import annotations
@@ -64,10 +64,15 @@ class ChunkedMP4Encoder:
         def run() -> None:
             try:
                 self._result = mux_av_video_audio_bytes(
-                    self._frames(), width=self.width, height=self.height,
-                    audio_waveform=audio_waveform, fps=fps,
-                    audio_sample_rate=audio_sample_rate, video_codec=video_codec,
-                    audio_codec=audio_codec, crf=crf,
+                    self._frames(),
+                    width=self.width,
+                    height=self.height,
+                    audio_waveform=audio_waveform,
+                    fps=fps,
+                    audio_sample_rate=audio_sample_rate,
+                    video_codec=video_codec,
+                    audio_codec=audio_codec,
+                    crf=crf,
                     video_codec_options=video_codec_options,
                 )
             except BaseException as exc:
