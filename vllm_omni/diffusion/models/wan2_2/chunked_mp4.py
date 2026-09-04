@@ -76,6 +76,77 @@ def resolve_wan_output_fps(sampling_params: Any) -> int:
     return int(fps) if fps else WAN_DEFAULT_OUTPUT_FPS
 
 
+def _to_uint8_frames(video: torch.Tensor) -> np.ndarray:
+    """Quantize ``BCTHW`` in [-1, 1] to ``BTHWC`` uint8, transferring once.
+
+    The quantization runs on the accelerator so a single transfer moves the
+    final bytes rather than float frames.
+    """
+    frames = video.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+    return frames.permute(0, 2, 3, 4, 1).cpu().numpy()
+
+
+class WanClipMP4Session:
+    """Encode whole decoded clips as an autoregressive loop produces them.
+
+    Wan S2V already decodes one clip per iteration and needs each clip's
+    trailing frames to build the next clip's motion latents, so it has no use
+    for the finer temporal callback. Handing each finished clip to a bounded
+    encoder still overlaps H.264 encoding with the next clip's denoise and
+    decode, and drops the full-video concatenation.
+
+    ``audio_waveforms`` holds one waveform per batch entry, so a caller with
+    several outputs per prompt repeats a request's waveform across its entries.
+    """
+
+    def __init__(
+        self,
+        *,
+        audio_waveforms: list[np.ndarray | None],
+        audio_sample_rate: int | None,
+        fps: float,
+        video_codec_options: dict[str, str] | None = None,
+        max_pending: int = 2,
+    ) -> None:
+        self._audio_waveforms = audio_waveforms
+        self._audio_sample_rate = audio_sample_rate
+        self._fps = fps
+        self._video_codec_options = video_codec_options
+        self._max_pending = max_pending
+        self._encoders: list[ChunkedMP4Encoder] = []
+
+    def push_clip(self, clip: torch.Tensor) -> None:
+        """Queue one decoded ``BCTHW`` clip, one entry per encoder."""
+        frames = _to_uint8_frames(clip)
+        if not self._encoders:
+            if frames.shape[0] != len(self._audio_waveforms):
+                raise ValueError(
+                    f"expected one audio waveform per batch entry, got {len(self._audio_waveforms)} "
+                    f"for {frames.shape[0]} entries"
+                )
+            self._encoders = [
+                ChunkedMP4Encoder(
+                    width=frames.shape[3],
+                    height=frames.shape[2],
+                    fps=self._fps,
+                    audio_waveform=waveform,
+                    audio_sample_rate=self._audio_sample_rate,
+                    max_pending=self._max_pending,
+                    video_codec_options=self._video_codec_options,
+                )
+                for waveform in self._audio_waveforms
+            ]
+        for index, encoder in enumerate(self._encoders):
+            encoder.push(np.ascontiguousarray(frames[index]))
+
+    def finish(self) -> list[bytes]:
+        return [encoder.finish() for encoder in self._encoders]
+
+    def abort(self) -> None:
+        for encoder in self._encoders:
+            encoder.abort()
+
+
 def decode_wan_latents_to_mp4(
     vae: Any,
     latents: torch.Tensor,
@@ -105,10 +176,7 @@ def decode_wan_latents_to_mp4(
         nonlocal pending_frames
         if not pending:
             return
-        batched = torch.cat(pending, dim=2)
-        # Quantize on the accelerator so one transfer moves the final bytes.
-        frames = batched.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
-        frames = frames.permute(0, 2, 3, 4, 1).cpu().numpy()
+        frames = _to_uint8_frames(torch.cat(pending, dim=2))
         if not encoders:
             encoders.extend(
                 ChunkedMP4Encoder(
