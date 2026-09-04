@@ -79,6 +79,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     assert np.array_equal(encoder.pushes[0][3], np.full((2, 2, 3), 64, dtype=np.uint8))
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
 
+
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
