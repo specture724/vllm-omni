@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,8 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 
 logger = init_logger(__name__)
 
@@ -644,7 +646,7 @@ def _replace_child(
         )
         return
     if isinstance(child, nn.ZeroPad2d):
-        padding = tuple(int(p) for p in child.padding)
+        padding = cast(tuple[int, int, int, int], tuple(int(p) for p in child.padding))
         module_padding = padding
         if parent.__class__.__name__ == "Sequential":
             # Let the following WanDistConv2d account for global after-edge
@@ -794,8 +796,8 @@ def spatial_shard_decode(
     group: dist.ProcessGroup,
     return_dict: bool = True,
     split_dim: str = "height",
-    on_chunk: Any | None = None,
-) -> DecoderOutput | tuple[torch.Tensor]:
+    on_chunk: DecodedChunkConsumer | None = None,
+) -> DecoderOutput | tuple[torch.Tensor] | None:
     install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
 
     if z.shape[2] == 0:
@@ -831,24 +833,24 @@ def spatial_shard_decode(
                             # Keep all ranks in the temporal collective loop;
                             # surface the callback failure only after decode.
                             callback_error = exc
-                    else:
+                    elif on_chunk is None:
                         decoded_chunks.append(chunk)
+                del chunk
 
-            if produce_output:
-                if on_chunk is None:
-                    out = torch.cat(decoded_chunks, dim=2)
-                    if vae.config.patch_size is not None:
-                        out = unpatchify(out, patch_size=vae.config.patch_size)
-                    out = torch.clamp(out, min=-1.0, max=1.0)
-                else:
-                    out = z.new_empty((0,))
-            else:
-                out = z.new_zeros(0)
+            if produce_output and on_chunk is None:
+                out = torch.cat(decoded_chunks, dim=2)
+                if vae.config.patch_size is not None:
+                    out = unpatchify(out, patch_size=vae.config.patch_size)
+                out = torch.clamp(out, min=-1.0, max=1.0)
     finally:
         vae.clear_cache()
 
     if callback_error is not None:
         raise callback_error
+    if on_chunk is not None:
+        return None
+    if not produce_output:
+        out = z.new_zeros(0)
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)

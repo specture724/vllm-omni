@@ -59,6 +59,8 @@ class ChunkedMP4Encoder:
         self._result: bytes | None = None
         self._error: BaseException | None = None
         self._closed = False
+        self._aborted = False
+        self._input_done = False
         self._state_lock = threading.Lock()
 
         def run() -> None:
@@ -83,13 +85,16 @@ class ChunkedMP4Encoder:
         self._thread.start()
 
     def _drain_until_done(self) -> None:
-        while self._queue.get() is not _CHUNKED_MP4_DONE:
-            pass
+        # A flush/mux failure can occur after _frames consumed the sentinel.
+        if not self._input_done:
+            while self._queue.get() is not _CHUNKED_MP4_DONE:
+                pass
 
     def _frames(self):
         while True:
             chunk = self._queue.get()
             if chunk is _CHUNKED_MP4_DONE:
+                self._input_done = True
                 return
             assert isinstance(chunk, np.ndarray)
             for frame_data in chunk:
@@ -105,10 +110,11 @@ class ChunkedMP4Encoder:
             raise RuntimeError("ChunkedMP4Encoder is already closed")
 
     def push(self, chunk: np.ndarray) -> None:
-        """Queue one ordered uint8 chunk, applying bounded backpressure."""
+        """Queue a chunk; asynchronous failures surface here or at finish()."""
         self._validate_chunk(chunk)
         self._raise_if_failed()
         self._queue.put(chunk)
+        self._raise_if_failed()
 
     def _send_done(self) -> None:
         self._queue.put(_CHUNKED_MP4_DONE)
@@ -116,30 +122,35 @@ class ChunkedMP4Encoder:
     def finish(self) -> bytes:
         """Flush the muxer and return complete progressive MP4 bytes."""
         with self._state_lock:
-            if self._closed:
-                if self._error is not None:
-                    raise self._error
-                assert self._result is not None
-                return self._result
-            self._closed = True
-        self._send_done()
+            if not self._closed:
+                self._closed = True
+                self._send_done()
         self._thread.join()
         if self._error is not None:
             raise self._error
+        if self._aborted:
+            raise RuntimeError("ChunkedMP4Encoder was aborted")
         assert self._result is not None
         return self._result
 
     def abort(self) -> None:
-        """Stop the worker after producer cancellation or an upstream error."""
+        """Discard pending chunks and join the worker after cancellation.
+
+        Any chunk already being encoded must finish before the worker exits.
+        """
         with self._state_lock:
-            if self._closed:
-                self._thread.join()
-                return
-            self._closed = True
-        self._send_done()
+            if not self._closed:
+                self._closed = True
+                self._aborted = True
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self._send_done()
         self._thread.join()
 
-    close = abort
+    close = finish
 
     def __enter__(self) -> ChunkedMP4Encoder:
         return self
