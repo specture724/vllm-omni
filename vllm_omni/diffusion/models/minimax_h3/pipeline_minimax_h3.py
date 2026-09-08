@@ -2226,7 +2226,7 @@ class MiniMaxH3Pipeline(
                     dtype=torch.float16,
                     enabled=True,
                 ):
-                    self.video_vae.decode_latent_with_chunks(video_latent, on_chunk)
+                    self.video_vae.decode_with_chunks(video_latent, on_chunk=on_chunk)
             flush_pending()
             return encoder.finish()
         except BaseException:

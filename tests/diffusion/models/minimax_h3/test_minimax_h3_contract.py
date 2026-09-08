@@ -59,9 +59,9 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
-        def decode_latent_with_chunks(self, latent, callback):
+        def decode_with_chunks(self, latent, *, on_chunk):
             for value in (0.0, 0.25, 0.5):
-                callback(torch.full((1, 3, 3, 2, 2), value))
+                on_chunk(torch.full((1, 3, 3, 2, 2), value))
 
     pipeline = object.__new__(mod.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -115,8 +115,8 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
-        def decode_latent_with_chunks(self, latent, callback):
-            callback(torch.zeros(1, 3, 1, 2, 2))
+        def decode_with_chunks(self, latent, *, on_chunk):
+            on_chunk(torch.zeros(1, 3, 1, 2, 2))
 
     pipeline = object.__new__(mod.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
