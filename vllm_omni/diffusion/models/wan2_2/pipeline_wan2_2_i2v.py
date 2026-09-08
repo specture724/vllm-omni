@@ -32,7 +32,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
-    decode_wan_latents_to_mp4,
+    WAN_DEFAULT_BATCH_FRAMES,
     resolve_wan_output_fps,
     resolve_wan_preencode_mp4,
     resolve_wan_video_codec_options,
@@ -53,6 +53,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -757,10 +758,11 @@ class Wan22I2VPipeline(
             )
             latents = latents / latents_std + latents_mean
             if preencode_mp4:
-                output = decode_wan_latents_to_mp4(
+                output = decode_to_mp4(
                     self.vae,
                     latents,
                     fps=resolve_wan_output_fps(common),
+                    batch_frames=WAN_DEFAULT_BATCH_FRAMES,
                     video_codec_options=resolve_wan_video_codec_options(common),
                 )
             else:

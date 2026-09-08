@@ -59,6 +59,8 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             for value in (0.0, 0.25, 0.5):
                 on_chunk(torch.full((1, 3, 3, 2, 2), value))
@@ -70,7 +72,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder",
+        "vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder",
         FakeEncoder,
     )
 
@@ -115,6 +117,8 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 1, 2, 2))
 
@@ -124,7 +128,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
-    monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
+    monkeypatch.setattr("vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder", FakeEncoder)
 
     pipeline.decode_to_mp4(
         torch.zeros(1),
@@ -1936,6 +1940,8 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
     ]
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def __init__(self):
             self.calls = []
 

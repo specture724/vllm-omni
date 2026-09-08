@@ -629,6 +629,8 @@ def _make_s2v_preencode_pipeline() -> Wan22S2VPipeline:
     pipeline.transformer.encode_audio.side_effect = lambda audio, _motion: {"audio_emb": audio}
     pipeline.vae = MagicMock()
     pipeline.vae.dtype = torch.float32
+    # The shared consumer reads the published pixel range off the VAE.
+    pipeline.vae.chunk_value_range = (-1.0, 1.0)
     # One decoded clip: [B, C, T, H, W] for a batch of four (2 requests x 2 outputs).
     pipeline.vae.decode.return_value = (torch.zeros(4, 3, 8, 16, 16),)
     pipeline.od_config = SimpleNamespace(

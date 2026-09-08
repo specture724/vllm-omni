@@ -10,18 +10,20 @@ import torch
 
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     WAN_DEFAULT_OUTPUT_FPS,
-    decode_wan_latents_to_mp4,
     resolve_wan_output_fps,
     resolve_wan_preencode_mp4,
     resolve_wan_video_codec_options,
     wan_preencoded_mp4_payload,
 )
+from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class _FakeWanVAE:
     """Publish temporal chunks the way the Wan VAE seam does."""
+
+    chunk_value_range = (-1.0, 1.0)
 
     def __init__(self, *, batch: int, chunks: int, frames_per_chunk: int, height: int, width: int):
         self.batch = batch
@@ -48,7 +50,7 @@ def _decoded_frame_count(data: bytes) -> int:
 def test_decode_wan_latents_to_mp4_emits_one_playable_mp4_per_batch_entry():
     vae = _FakeWanVAE(batch=2, chunks=6, frames_per_chunk=2, height=16, width=32)
 
-    videos = decode_wan_latents_to_mp4(vae, torch.zeros(1), fps=24, batch_frames=4)
+    videos = decode_to_mp4(vae, torch.zeros(1), fps=24, batch_frames=4)
 
     assert len(videos) == 2
     for data in videos:
@@ -60,34 +62,38 @@ def test_decode_wan_latents_to_mp4_coalesces_transfers_without_losing_frames():
     unbatched = _FakeWanVAE(batch=1, chunks=8, frames_per_chunk=1, height=16, width=32)
     batched = _FakeWanVAE(batch=1, chunks=8, frames_per_chunk=1, height=16, width=32)
 
-    per_chunk = decode_wan_latents_to_mp4(unbatched, torch.zeros(1), fps=24, batch_frames=1)
-    coalesced = decode_wan_latents_to_mp4(batched, torch.zeros(1), fps=24, batch_frames=4)
+    per_chunk = decode_to_mp4(unbatched, torch.zeros(1), fps=24, batch_frames=1)
+    coalesced = decode_to_mp4(batched, torch.zeros(1), fps=24, batch_frames=4)
 
     assert _decoded_frame_count(per_chunk[0]) == _decoded_frame_count(coalesced[0]) == 8
 
 
 def test_decode_wan_latents_to_mp4_returns_nothing_for_a_rank_without_output():
     class SilentVAE:
+        chunk_value_range = (-1.0, 1.0)
+
         def decode_with_chunks(self, latents, *, on_chunk):
             del latents, on_chunk
 
-    assert decode_wan_latents_to_mp4(SilentVAE(), torch.zeros(1), fps=24) == []
+    assert decode_to_mp4(SilentVAE(), torch.zeros(1), fps=24) == []
 
 
 def test_decode_wan_latents_to_mp4_rejects_a_non_positive_batch():
     with pytest.raises(ValueError, match="batch_frames"):
-        decode_wan_latents_to_mp4(
+        decode_to_mp4(
             _FakeWanVAE(batch=1, chunks=1, frames_per_chunk=1, height=16, width=16), None, fps=24, batch_frames=0
         )
 
 
 def test_decode_wan_latents_to_mp4_rejects_a_vae_without_the_capability():
     class PlainVAE:
+        chunk_value_range = (-1.0, 1.0)
+
         def decode(self, z, return_dict=True):
             del z, return_dict
 
     with pytest.raises(TypeError, match="chunked VAE decode capability"):
-        decode_wan_latents_to_mp4(PlainVAE(), torch.zeros(1), fps=24)
+        decode_to_mp4(PlainVAE(), torch.zeros(1), fps=24)
 
 
 def test_preencode_flag_is_off_unless_the_request_asks_for_it():
