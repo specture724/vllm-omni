@@ -68,7 +68,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     pipeline.audio_vae = FakeAudioVAE()
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self: False)
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     monkeypatch.setattr(
         "vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder",
         FakeEncoder,
@@ -123,7 +123,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     pipeline.audio_vae = FakeAudioVAE()
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self: False)
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
 
     pipeline.decode_to_mp4(
