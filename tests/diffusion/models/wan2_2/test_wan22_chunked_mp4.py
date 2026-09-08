@@ -31,8 +31,8 @@ class _FakeWanVAE:
         self.width = width
         self.chunk_calls = 0
 
-    def decode(self, latents, return_dict=True, on_chunk=None):
-        del latents, return_dict
+    def decode_with_chunks(self, latents, *, on_chunk):
+        del latents
         assert on_chunk is not None
         for index in range(self.chunks):
             self.chunk_calls += 1
@@ -68,8 +68,8 @@ def test_decode_wan_latents_to_mp4_coalesces_transfers_without_losing_frames():
 
 def test_decode_wan_latents_to_mp4_returns_nothing_for_a_rank_without_output():
     class SilentVAE:
-        def decode(self, latents, return_dict=True, on_chunk=None):
-            del latents, return_dict, on_chunk
+        def decode_with_chunks(self, latents, *, on_chunk):
+            del latents, on_chunk
 
     assert decode_wan_latents_to_mp4(SilentVAE(), torch.zeros(1), fps=24) == []
 
@@ -79,6 +79,15 @@ def test_decode_wan_latents_to_mp4_rejects_a_non_positive_batch():
         decode_wan_latents_to_mp4(
             _FakeWanVAE(batch=1, chunks=1, frames_per_chunk=1, height=16, width=16), None, fps=24, batch_frames=0
         )
+
+
+def test_decode_wan_latents_to_mp4_rejects_a_vae_without_the_capability():
+    class PlainVAE:
+        def decode(self, z, return_dict=True):
+            del z, return_dict
+
+    with pytest.raises(TypeError, match="chunked VAE decode capability"):
+        decode_wan_latents_to_mp4(PlainVAE(), torch.zeros(1), fps=24)
 
 
 def test_preencode_flag_is_off_unless_the_request_asks_for_it():
