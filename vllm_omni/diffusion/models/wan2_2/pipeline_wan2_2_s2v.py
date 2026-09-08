@@ -34,7 +34,6 @@ from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImage
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
-    WanClipMP4Session,
     resolve_wan_preencode_mp4,
     resolve_wan_video_codec_options,
 )
@@ -49,6 +48,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, selected_offload_components
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -1332,7 +1332,8 @@ class Wan22S2VPipeline(
         # Encode each finished clip while the next one denoises, instead of
         # concatenating the whole video first.
         mp4_session = (
-            WanClipMP4Session(
+            ChunkedVideoMP4Session(
+                value_range=self.vae.chunk_value_range,
                 audio_waveforms=[raw_audio_waveforms[index // num_outputs_per_prompt] for index in range(batch_size)],
                 audio_sample_rate=raw_audio_sr,
                 fps=S2V_OUTPUT_FPS,
@@ -1486,7 +1487,7 @@ class Wan22S2VPipeline(
                 motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
 
             if mp4_session is not None:
-                mp4_session.push_clip(clip_video)
+                mp4_session.push(clip_video)
             else:
                 clips.append(clip_video.cpu())
 
