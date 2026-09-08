@@ -26,12 +26,18 @@ def decode_h3_chunks(
     streaming = owner
     if group is not None:
         rank = dist.get_rank(group)
-        owners = torch.tensor([int(owner)], dtype=torch.int32, device=latent.device)
-        dist.all_reduce(owners, group=group)
-        num_owners = int(owners.item())
+        # Reduce which rank owns the callback, not just how many do. Comparing
+        # a rank's own ownership against its own index is a rank-local verdict:
+        # with the callback on rank 1 of three, ranks 0 and 1 disagree and
+        # raise while rank 2 agrees with itself and enters the decoder
+        # collectives alone, hanging the stage instead of failing it.
+        census = torch.tensor([int(owner), rank if owner else 0], dtype=torch.int64, device=latent.device)
+        dist.all_reduce(census, group=group)
+        num_owners = int(census[0].item())
+        owner_rank = int(census[1].item())
         # No rank supplied a callback: every rank runs a plain full decode.
         streaming = num_owners > 0
-        if streaming and (num_owners != 1 or (rank == 0) != owner):
+        if streaming and (num_owners != 1 or owner_rank != 0):
             raise ValueError(
                 "MiniMax-H3 chunk callback must be supplied on exactly one rank "
                 "of the VAE group, and that rank must be rank 0"

@@ -378,14 +378,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
-    @torch.inference_mode()
-    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
-        # and then rejects an empty share inside the gather. A rank with no
-        # tiles raises and leaves the collective while the others block in it
-        # forever, so too few tiles hangs the whole stage rather than failing
-        # it. Tile count depends only on the latent shape, so every rank takes
-        # this branch together.
+    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+        """Pick the tiling mode a decode of ``latent`` can safely use.
+
+        The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        and then rejects an empty share inside the gather. A rank with no
+        tiles raises and leaves the collective while the others block in it
+        forever, so too few tiles hangs the whole stage rather than failing
+        it. Tile count depends only on the latent shape, so every rank takes
+        this branch together.
+        """
         num_tiles = self._decoder_tile_count(latent)
         if self.parallel_size > 1 and num_tiles < self.parallel_size:
             logger.warning_once(
@@ -395,11 +397,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            tiling_context: AbstractContextManager = self._rank_local_tiling()
-        else:
-            tiling_context = nullcontext()
+            return self._rank_local_tiling()
+        return nullcontext()
 
-        with tiling_context:
+    @torch.inference_mode()
+    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
         return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
 
@@ -434,8 +437,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             group = self._native_parallel_state().get("sp_process_group")
             if group is None or dist.get_world_size(group) != self.parallel_size:
                 raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
-        # Native H3 tiling performs its own collectives for every temporal clip.
-        return decode_h3_chunks(self, latent, chunk_callback, group=group)
+        # Native H3 tiling performs its own collectives for every temporal clip,
+        # so this path needs the same too-few-tiles fallback as the complete
+        # decode: without it a shape that leaves some ranks tileless hangs the
+        # gather instead of decoding rank-locally.
+        with self._decode_tiling_context(latent):
+            return decode_h3_chunks(self, latent, chunk_callback, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
