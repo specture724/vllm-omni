@@ -9,7 +9,7 @@ import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -423,6 +423,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    # Chunks are reverted through the checkpoint's processor, which
+    # denormalizes and clamps into the unit interval.
+    chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
 
     @torch.inference_mode()
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:

@@ -208,3 +208,16 @@ def test_chunked_decode_keeps_shared_tiling_when_every_rank_has_a_tile(monkeypat
     vae.decode_with_chunks(torch.zeros(1, 1, 8, 1, 1), on_chunk=lambda _frames: None)
 
     assert not vae.entered_rank_local
+
+
+def test_h3_vae_declares_the_chunked_decode_capability():
+    """A consumer must be able to detect the capability and the pixel range."""
+    from vllm_omni.diffusion.models.interface import supports_chunked_vae_decode
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+
+    assert supports_chunked_vae_decode(vae)
+    # H3 reverts through the checkpoint's processor, which lands in [0, 1];
+    # a Wan VAE publishes [-1, 1], so the range cannot be assumed.
+    assert vae.chunk_value_range == (0.0, 1.0)
