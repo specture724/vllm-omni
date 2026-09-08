@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.models.interface import supports_chunked_vae_decode
 from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder, normalize_video_codec_options
 
 # Matches the fallback the video serving layer applies when a request omits fps,
@@ -167,6 +168,8 @@ def decode_wan_latents_to_mp4(
     """
     if batch_frames <= 0:
         raise ValueError("batch_frames must be positive")
+    if not supports_chunked_vae_decode(vae):
+        raise TypeError(f"{type(vae).__name__} does not expose the chunked VAE decode capability")
 
     encoders: list[ChunkedMP4Encoder] = []
     pending: list[torch.Tensor] = []
@@ -201,7 +204,7 @@ def decode_wan_latents_to_mp4(
             flush()
 
     try:
-        vae.decode(latents, return_dict=False, on_chunk=on_chunk)
+        vae.decode_with_chunks(latents, on_chunk=on_chunk)
         flush()
         return [encoder.finish() for encoder in encoders]
     except BaseException:
