@@ -261,8 +261,8 @@ overlaps encoding through its own incremental fragmented-MP4 encoder. Wan also
 rejects it together with `enable_frame_interpolation`, which needs the decoded
 frames the pre-encoded path no longer materializes.
 
-Support is per model: MiniMax-H3 and Wan 2.2 (T2V and I2V) implement it, and
-other models ignore the flag and take the full-decode path.
+Support is per model: MiniMax-H3 and Wan 2.2 (T2V, I2V, and S2V) implement it,
+and other models ignore the flag and take the full-decode path.
 
 ## Storage
 
