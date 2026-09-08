@@ -82,6 +82,19 @@ def decode_temporal_chunks(
             clip = torch.cat((clip, z_tail), dim=2)
 
         decoded = model._adaptive_decode(clip)
+
+        # The isolated boundary latents were prepended/appended to the clip, so
+        # the decoder returns their frames inside this clip's block. Publish
+        # them the way the released loop does and drop their temporal block
+        # before splitting, or every later frame shifts by one block.
+        decoded_tail = None
+        if index == 0 and z_head is not None:
+            emit(decoded[:, :, ratio_t - 1 : ratio_t])
+            decoded = decoded[:, :, ratio_t:]
+        if index == num_chunks - 1 and z_tail is not None:
+            decoded_tail = decoded[:, :, -1:]
+            decoded = decoded[:, :, :-ratio_t]
+
         for split in range(split_count):
             begin = split * chunk_frames
             end = min(begin + chunk_frames, int(decoded.shape[2]))
@@ -99,6 +112,8 @@ def decode_temporal_chunks(
             if overlap is not None:
                 emit(overlap)
                 overlap = None
+            if decoded_tail is not None:
+                emit(decoded_tail)
 
     if written != output_frames:
         raise RuntimeError(f"MiniMax-H3 temporal decode emitted {written}/{output_frames} frames")

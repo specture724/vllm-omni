@@ -221,3 +221,137 @@ def test_h3_vae_declares_the_chunked_decode_capability():
     # H3 reverts through the checkpoint's processor, which lands in [0, 1];
     # a Wan VAE publishes [-1, 1], so the range cannot be assumed.
     assert vae.chunk_value_range == (0.0, 1.0)
+
+
+def _native_decode_temporal_streaming(model, z, z_head, z_tail, num_chunks, pad_tokens):
+    """The released ``_decode_temporal_streaming`` loop, as the parity oracle.
+
+    Transcribed from the checkpoint's ``AutoencoderKLLegacy`` so the fork can be
+    compared against the control flow it mirrors, including the isolated
+    head/tail extraction.
+    """
+    total_frames, pad_frames, output_frames = model._decode_temporal_output_frame_plan(
+        z, z_head, z_tail, num_chunks, pad_tokens
+    )
+    chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
+    split_count = int(model.token_drop > 0) + 1
+    dec = None
+    dec_overlap = None
+    write_pos = 0
+
+    def write_part(part):
+        nonlocal dec, write_pos
+        part_frames = int(part.shape[2])
+        if part_frames <= 0:
+            return
+        if dec is None:
+            out_shape = list(part.shape)
+            out_shape[2] = output_frames
+            dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
+        remaining = int(dec.shape[2]) - write_pos
+        copy_frames = min(part_frames, max(0, remaining))
+        if copy_frames > 0:
+            dec[:, :, write_pos : write_pos + copy_frames].copy_(part[:, :, :copy_frames])
+            write_pos += copy_frames
+
+    for i in range(num_chunks):
+        t_start = i * model.tokens_chunk_size
+        clip_z = z[:, :, t_start : t_start + model.tokens_chunk_size + model.token_overlap]
+        if i == 0 and z_head is not None:
+            clip_z = torch.cat([z_head, clip_z], dim=2)
+        if i == num_chunks - 1 and z_tail is not None:
+            clip_z = torch.cat([clip_z, z_tail], dim=2)
+
+        clip_dec = model._adaptive_decode(clip_z)
+
+        dec_tail = None
+        if i == 0 and z_head is not None:
+            write_part(clip_dec[:, :, model.vae_ratio_t - 1 : model.vae_ratio_t])
+            clip_dec = clip_dec[:, :, model.vae_ratio_t :]
+        if i == num_chunks - 1 and z_tail is not None:
+            dec_tail = clip_dec[:, :, -1:]
+            clip_dec = clip_dec[:, :, : -model.vae_ratio_t]
+
+        for j in range(split_count):
+            f_start = j * chunk_dec
+            f_end = min(f_start + chunk_dec, clip_dec.shape[2])
+            chunk = clip_dec[:, :, f_start:f_end][:, :, model.frame_pre_padding :]
+            if j == 0:
+                if dec_overlap is not None:
+                    chunk = model.blend(dec_overlap, chunk, model.frame_overlap, dim=-3)
+                    dec_overlap = None
+                write_part(chunk)
+            else:
+                dec_overlap = chunk.contiguous()
+
+        if i == num_chunks - 1:
+            if dec_overlap is not None:
+                write_part(dec_overlap)
+                dec_overlap = None
+            if dec_tail is not None:
+                write_part(dec_tail)
+
+    return dec
+
+
+class _IsolatedFrameModel(_FakeTemporalModel):
+    """Fake decoder with the isolated boundaries the released config can set."""
+
+    frame_pre_padding = 0
+
+    def __init__(self, *, first: bool, last: bool):
+        self.isolated_first_frame = first
+        self.isolated_last_frame = last
+
+    def _decode_temporal_output_frame_plan(self, z, z_head, z_tail, num_chunks, pad_tokens):
+        del pad_tokens
+        frames = num_chunks * self.tokens_chunk_size * self.vae_ratio_t
+        frames += int(z_head is not None) + int(z_tail is not None)
+        del z
+        return frames, 0, frames
+
+    def _adaptive_decode(self, clip):
+        # Every latent token decodes to a distinct, ordered block, so a shifted
+        # or reordered emission is visible in the values themselves.
+        base = float(clip[:, :, 0].mean())
+        frames = int(clip.shape[2]) * self.vae_ratio_t
+        return torch.arange(frames, dtype=torch.float32).view(1, 1, frames, 1, 1) + base
+
+
+@pytest.mark.parametrize(
+    ("first", "last"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_temporal_chunks_match_the_native_loop_at_isolated_boundaries(first, last):
+    """The fork must extract the isolated head/tail the way the native loop does."""
+    model = _IsolatedFrameModel(first=first, last=last)
+    latent = torch.arange(12, dtype=torch.float32).view(1, 1, 12, 1, 1)
+
+    chunks: list[torch.Tensor] = []
+    decode_temporal_chunks(model, latent, chunks.append)
+    streamed = torch.cat(chunks, dim=2)
+
+    # Feed the oracle exactly what the released ``decode_temporal`` would:
+    # split the isolated tokens off, then pad the remainder to a whole chunk.
+    isolated = int(first) + int(last)
+    pseudo_tokens = int(latent.shape[2]) - isolated + model.token_drop
+    remainder = pseudo_tokens % model.tokens_chunk_size
+    pad_tokens = (model.tokens_chunk_size - remainder) if remainder else 0
+    num_chunks = (pseudo_tokens + pad_tokens) // model.tokens_chunk_size - int(model.token_drop > 0)
+
+    body = latent
+    z_head = None
+    if first:
+        z_head = body[:, :, :1]
+        body = body[:, :, 1:]
+    z_tail = None
+    if last:
+        z_tail = body[:, :, -1:]
+        body = body[:, :, :-1]
+    if pad_tokens:
+        body = torch.cat([body, body[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+    expected = _native_decode_temporal_streaming(model, body, z_head, z_tail, num_chunks, pad_tokens)
+
+    assert streamed.shape == expected.shape
+    assert torch.equal(streamed, expected)
