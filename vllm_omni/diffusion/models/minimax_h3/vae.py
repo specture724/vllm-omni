@@ -22,12 +22,13 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
 
-from .chunked_decode import MiniMaxH3VideoChunkCallback, decode_h3_chunks
+from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
@@ -424,12 +425,19 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return frames.float()
 
     @torch.inference_mode()
-    def decode_latent_with_chunks(
-        self,
-        latent: torch.Tensor,
-        chunk_callback: MiniMaxH3VideoChunkCallback | None,
-    ) -> torch.Tensor:
-        """Decode temporal clips and synchronously publish frames-only chunks."""
+    def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
+        """Decode temporal clips and synchronously publish frames-only chunks.
+
+        Implements :class:`SupportsChunkedVAEDecode`. Every rank participating
+        in distributed VAE execution must invoke this method with a callback so
+        the temporal collectives stay in lockstep; ``on_chunk`` is called only
+        on the rank that owns output. Chunks arrive as ``[B, C, T, H, W]``
+        float frames, normalized through the checkpoint's processor to match
+        the complete decode path. After a callback failure, the remaining
+        chunks are decoded and discarded before the exception is re-raised.
+        """
+        if not callable(on_chunk):
+            raise TypeError("on_chunk must be callable")
         if not callable(getattr(self.model, "_adaptive_decode", None)):
             raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
         group = None
@@ -441,8 +449,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # so this path needs the same too-few-tiles fallback as the complete
         # decode: without it a shape that leaves some ranks tileless hangs the
         # gather instead of decoding rank-locally.
-        with self._decode_tiling_context(latent):
-            return decode_h3_chunks(self, latent, chunk_callback, group=group)
+        with self._decode_tiling_context(z):
+            decode_h3_chunks(self, z, on_chunk, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
