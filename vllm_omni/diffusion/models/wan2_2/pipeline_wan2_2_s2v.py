@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImage
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    resolve_wan_preencode_batch_frames,
     resolve_wan_preencode_mp4,
     resolve_wan_video_codec_options,
 )
@@ -1191,6 +1192,7 @@ class Wan22S2VPipeline(
         num_steps = common.num_inference_steps or num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type or "np")
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common, default=1) if preencode_mp4 else 1
 
         if common.guidance_scale_provided:
             guidance_scale = common.guidance_scale
@@ -1337,6 +1339,7 @@ class Wan22S2VPipeline(
                 audio_waveforms=[raw_audio_waveforms[index // num_outputs_per_prompt] for index in range(batch_size)],
                 audio_sample_rate=raw_audio_sr,
                 fps=S2V_OUTPUT_FPS,
+                batch_frames=preencode_batch_frames,
                 video_codec_options=resolve_wan_video_codec_options(common),
             )
             if preencode_mp4

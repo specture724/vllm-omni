@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_omni.diffusion.utils.media_utils import normalize_video_codec_options
+from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 
 # Matches the fallback the video serving layer applies when a request omits fps,
 # so the bytes the worker encodes carry the rate the response advertises.
@@ -52,6 +52,12 @@ def resolve_wan_preencode_mp4(sampling_params: Any, *, output_type: str) -> bool
     if output_type != "np":
         raise ValueError(f"preencode_mp4 returns MP4 bytes and cannot serve output_type={output_type!r}")
     return True
+
+
+def resolve_wan_preencode_batch_frames(sampling_params: Any, *, default: int = WAN_DEFAULT_BATCH_FRAMES) -> int:
+    """Read the MP4 batching threshold before starting expensive generation."""
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    return normalize_preencode_batch_frames(extra_args.get("preencode_batch_frames", default))
 
 
 def resolve_wan_video_codec_options(sampling_params: Any) -> dict[str, str] | None:
