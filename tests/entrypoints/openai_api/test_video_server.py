@@ -128,6 +128,36 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
+    from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    artifacts = VideoGenerationArtifacts(
+        videos=[b"preencoded-mp4"],
+        audios=[None],
+        actions=[None],
+        audio_sample_rate=24000,
+        output_fps=24.0,
+        stage_durations={"decode": 0.5},
+        peak_memory_mb=123.0,
+        metrics={"generation_time": 1.25},
+    )
+    mocker.patch.object(handler, "_run_and_extract", return_value=artifacts)
+    encoder = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
+    try:
+        result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
+        assert result == (
+            b"preencoded-mp4",
+            {"decode": 0.5},
+            123.0,
+            None,
+            {"fps": 24.0, "metrics": {"generation_time": 1.25}},
+        )
+        encoder.assert_not_called()
+    finally:
+        handler.shutdown()
+
+
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
     od_config = SimpleNamespace(model_class_name="WanPipeline")
     handler = OmniOpenAIServingVideo.for_diffusion(

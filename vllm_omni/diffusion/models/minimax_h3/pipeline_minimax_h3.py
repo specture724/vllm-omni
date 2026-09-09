@@ -2586,7 +2586,9 @@ class MiniMaxH3Pipeline(
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
-            "video_codec_options": normalize_video_codec_options(extra.get("video_codec_options")),
+            "video_codec_options": normalize_video_codec_options(
+                extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"})
+            ),
         }
 
     @staticmethod
