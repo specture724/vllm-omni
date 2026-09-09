@@ -32,6 +32,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     TensorBinding,
     build_checkpoint_mmap_plan,
 )
+from vllm_omni.diffusion.offloader import plan_resolver
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.block_discovery import (
     get_blocks_attr_names,
@@ -52,7 +53,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
     get_offload_plan,
 )
-from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
+from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent, resolve_offload_plan
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
@@ -1250,10 +1251,7 @@ class TestMmapWeightLoading:
             ),
             torch.device("cpu"),
         )
-        modules = SimpleNamespace(
-            dits=[pipeline.transformer],
-            dit_names=["transformer"],
-        )
+        dits = (ResolvedComponent(path="transformer", module=pipeline.transformer, selected=True),)
         plan = HostWeightPlan(
             backing_kind="checkpoint_mmap",
             bindings={
@@ -1265,7 +1263,7 @@ class TestMmapWeightLoading:
             },
         )
 
-        backend._load_weights_via_mmap(pipeline, modules, plan)
+        backend._load_weights_via_mmap(pipeline, dits, plan)
 
         assert pipeline.transformer.post_load_calls == 1
         assert pipeline.transformer.time_embedder.weight.dtype == torch.float32
@@ -1717,6 +1715,89 @@ class TestOffloadPlan:
         for name, parameter in pipeline.named_parameters():
             torch.testing.assert_close(parameter, expected_parameters[name])
 
+    def test_unstageable_submodule_is_rejected_before_any_hook(self, patched_offload_runtime):
+        """Plan-dependent rejection happens before earlier components are hooked."""
+
+        class Pipeline(nn.Module):
+            _offload_plan = OffloadPlan(
+                offload_submodules={"refiner": "missing"},
+                encoder_component_types={"text_encoder": "text_encoder"},
+                encoder_block_attrs={"text_encoder": ("encoder.block",)},
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=2)
+                # Declared for submodule offload but without a block list or the
+                # load_to_device/offload_to_cpu lifecycle.
+                self.transformer.refiner = nn.Linear(2, 2)
+                self.text_encoder = _PlainEncoder()
+
+        pipeline = Pipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False),
+            torch.device("cpu"),
+        )
+
+        # Storage identity proves the encoder was never staged and rolled back.
+        encoder_storage = [block.weight.data_ptr() for block in pipeline.text_encoder.encoder.block]
+
+        with pytest.raises(ValueError, match="must implement load_to_device"):
+            backend.enable(pipeline)
+
+        assert not backend.enabled
+        assert [block.weight.data_ptr() for block in pipeline.text_encoder.encoder.block] == encoder_storage
+        assert not getattr(pipeline.text_encoder, "_omni_layerwise_enabled", False)
+        for block in pipeline.transformer.blocks:
+            assert getattr(block, "_hook_registry", None) is None
+
+    def test_undeclared_submodule_block_scan_warns(self, patched_offload_runtime, monkeypatch):
+        """The size-triggered attribute scan still works and is deprecated."""
+
+        class Refiner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+        class Transformer(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+                self.refiner = Refiner()
+
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = Transformer()
+
+        warnings: list[str] = []
+
+        class _Recorder:
+            def warning(self, message, *args):
+                warnings.append(message % args if args else message)
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        monkeypatch.setattr(plan_resolver, "logger", _Recorder())
+        monkeypatch.setattr(plan_resolver, "_NESTED_OFFLOAD_THRESHOLD_MB", 0)
+        plan_resolver._warn_nested_block_scan.cache_clear()
+        plan_resolver._warn_legacy_discovery.cache_clear()
+        pipeline = Pipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False),
+            torch.device("cpu"),
+        )
+
+        backend.enable(pipeline)
+
+        assert len(backend._all_hook_groups) == 2
+        assert sum("OffloadPlan.offload_submodules" in message for message in warnings) == 1
+
+        backend.disable()
+
 
 class TestMmapValidation:
     """Tests for loader preflight and backend plan realization."""
@@ -2101,7 +2182,7 @@ class TestMmapValidation:
             ),
             torch.device("cpu"),
         )
-        modules = SimpleNamespace(dits=[pipeline.transformer], dit_names=["transformer"])
+        dits = (ResolvedComponent(path="transformer", module=pipeline.transformer, selected=True),)
         result = build_checkpoint_mmap_plan(
             pipeline,
             dit_modules=(("transformer", pipeline.transformer),),
@@ -2113,7 +2194,7 @@ class TestMmapValidation:
         )
 
         assert result.plan is not None
-        backend._load_weights_via_mmap(pipeline, modules, result.plan)
+        backend._load_weights_via_mmap(pipeline, dits, result.plan)
         assert pipeline.transformer.validate_called, "validate_loaded_weights should be called"
 
 
