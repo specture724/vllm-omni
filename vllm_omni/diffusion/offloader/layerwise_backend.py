@@ -14,11 +14,6 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
-from .block_discovery import (
-    get_blocks_attr_names,
-    get_blocks_from_dit,
-    set_blocks_attr_names,
-)
 from .component_utils import (
     clear_encoder_layerwise_state,
     iter_streamable_dits,
@@ -526,8 +521,3 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_weights=True)
-
-    # Compatibility aliases for existing model integrations.
-    get_blocks_attr_names = staticmethod(get_blocks_attr_names)
-    set_blocks_attr_names = staticmethod(set_blocks_attr_names)
-    get_blocks_from_dit = staticmethod(get_blocks_from_dit)

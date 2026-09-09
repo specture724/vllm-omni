@@ -116,16 +116,14 @@ describes how these feature contracts fit into the larger diffusion runtime.
 
 ## Backend acceptance tests
 
-`tests/diffusion/offloader/test_backend_plan_contract.py` exercises model-level
-and ordinary layerwise offload with omitted selection, explicit DiT, explicit
-text encoder, and both components. CPU tests exercise hook and storage
-lifecycles; CUDA cases use actual transfers and check residency after encoder
-and DiT execution. Each case compares outputs with offload disabled, runs two
-enable/forward/disable cycles, and verifies restored parameters and buffers,
-hook removal, and release of hook-owned host storage. Each layerwise ring
-retains its prefetched first block between iterations, as before the cutover.
+`tests/diffusion/offloader/test_backend_plan_contract.py` covers the two
+behaviors the generic cutover changed. A DiT attribute aliasing a streamed
+block must keep the ring's host residency, so placement cannot follow attribute
+names; the CUDA case fails against the previous name-based placement. Both
+backends must then run with their selector helpers and the model declaration
+made unreadable, proving execution consumes the resolved plan alone.
 
-The tests also reject an invalid later component before any placement or hook
-installation and guard against backend reads of selectors and declarations
-after resolution. These small executable pipelines cover backend contracts;
-model-specific phases and executed tied aliases remain the J4 contract suite.
+Selection errors, rollback, residency, and enable/disable cycles stay in
+`test_plan_resolver.py`, `test_layerwise_backend.py` and
+`test_sequential_backend.py`. Model-specific phases and executed tied aliases
+remain the J4 contract suite.

@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Executable output, residency and teardown contracts for the J2 backends."""
+"""Executable contracts for the two behaviors the generic cutover changed.
 
-import gc
-import weakref
+Placement now follows resolved block identity, and the backends run on the
+resolved plan alone. Declaration parsing, selection errors, rollback,
+residency and enable/disable cycles are covered by ``test_plan_resolver.py``,
+``test_layerwise_backend.py`` and ``test_sequential_backend.py``.
+"""
+
 from typing import ClassVar
 
 import pytest
@@ -22,6 +26,9 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
+STRATEGIES = [OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE]
+CPU = torch.device("cpu")
+
 
 class _Block(nn.Linear):
     def __init__(self):
@@ -33,6 +40,8 @@ class _Block(nn.Linear):
 
 
 class _Stack(nn.Module):
+    """Two block containers plus non-block state that must stay resident."""
+
     def __init__(self):
         super().__init__()
         self.blocks = nn.ModuleList([_Block() for _ in range(3)])
@@ -77,23 +86,16 @@ def execution_device(request, monkeypatch):
         return torch.device("cuda:0")
     patch_offload_runtime(monkeypatch, current_omni_platform, synchronize=True)
     monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda: 0)
-    return torch.device("cpu")
+    return CPU
 
 
-def _tensors(module):
-    return (*module.parameters(), *module.buffers())
+def _config(strategy, components):
+    return OffloadConfig(strategy=strategy, components=components, pin_cpu_memory=False)
 
 
-def _assert_device(module, device):
-    assert all(tensor.device == device for tensor in _tensors(module))
-
-
-def _assert_ring_residency(blocks, device):
-    # The final block prefetches block zero for the next iteration. Each
-    # encoder stack has its own ring; the DiT's containers form one ring.
-    _assert_device(blocks[0], device)
-    assert all(t.numel() > 0 for t in _tensors(blocks[0]))
-    assert all(t.numel() == 0 for block in blocks[1:] for t in _tensors(block))
+def _backend(config, device):
+    kind = ModelLevelOffloadBackend if config.strategy is OffloadStrategy.MODEL_LEVEL else LayerWiseOffloadBackend
+    return kind(config, device)
 
 
 def _assert_no_offload_hooks(pipeline):
@@ -105,125 +107,54 @@ def _assert_no_offload_hooks(pipeline):
         assert not getattr(module, "_omni_layerwise_enabled", False)
 
 
-@pytest.mark.parametrize("strategy", [OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE])
-@pytest.mark.parametrize(
-    "components", [None, frozenset({"dit"}), frozenset({"text_encoder"}), frozenset({"dit", "text_encoder"})]
-)
 @torch.inference_mode()
-def test_output_residency_and_reenable(execution_device, strategy, components):
-    torch.manual_seed(42)
-    device = execution_device
-    pipeline = _Pipeline().to(device)
-    x = torch.randn(2, 4, device=device)
-    expected = pipeline(x)
-    if strategy is OffloadStrategy.LAYER_WISE:
-        # Exercise placement of real CPU-loaded non-block state as well as
-        # streaming. The module swap baseline starts device-resident.
-        pipeline.to("cpu")
-    original = {name: value.cpu().clone() for name, value in pipeline.state_dict().items()}
-    parameter_ids = [id(parameter) for parameter in pipeline.parameters()]
-    backend_type = ModelLevelOffloadBackend if strategy is OffloadStrategy.MODEL_LEVEL else LayerWiseOffloadBackend
-    backend = backend_type(OffloadConfig(strategy=strategy, components=components, pin_cpu_memory=False), device)
-    dit_selected = components is None or "dit" in components
-    encoder_selected = components is None or "text_encoder" in components
+def test_alias_of_a_streamed_block_is_not_placed(execution_device):
+    """Placement moves DiT state by resolved block identity, not by attribute.
 
-    for _cycle in range(2):
-        backend.enable(pipeline)
-        assert backend.enabled
-        for _iteration in range(2):
-            image = pipeline.image_encoder(x)
-            encoded = pipeline.text_encoder(image)
-            if strategy is OffloadStrategy.MODEL_LEVEL:
-                _assert_device(pipeline.transformer, torch.device("cpu") if dit_selected else device)
-                _assert_device(pipeline.text_encoder, device)
-            else:
-                if encoder_selected:
-                    for blocks in (pipeline.text_encoder.blocks, pipeline.text_encoder.tail):
-                        _assert_ring_residency(blocks, device)
-                else:
-                    _assert_device(pipeline.text_encoder, device)
-            denoised = pipeline.transformer(encoded)
-            if strategy is OffloadStrategy.MODEL_LEVEL:
-                _assert_device(pipeline.text_encoder, torch.device("cpu") if encoder_selected else device)
-                _assert_device(pipeline.image_encoder, torch.device("cpu") if components is None else device)
-                _assert_device(pipeline.transformer, device)
-            elif dit_selected:
-                _assert_ring_residency((*pipeline.transformer.blocks, *pipeline.transformer.tail), device)
-            else:
-                _assert_device(pipeline.transformer, device)
-            _assert_device(pipeline.vae, device)
-            _assert_device(pipeline.resident, device)
-            actual = pipeline.resident(pipeline.vae(denoised))
-            torch.testing.assert_close(actual, expected)
-
-        hook_refs = [
-            weakref.ref(hook)
-            for module in pipeline.modules()
-            if (registry := getattr(module, "_hook_registry", None)) is not None
-            for name in ("sequential_offload", "layerwise_offload")
-            if (hook := registry.get_hook(name)) is not None
-        ]
-        del hook  # Assignment expressions keep the last hook alive.
-        backend.disable()
-        gc.collect()
-        assert all(ref() is None for ref in hook_refs)
-        assert not backend.enabled
-        _assert_no_offload_hooks(pipeline)
-        assert [id(parameter) for parameter in pipeline.parameters()] == parameter_ids
-        for name, value in pipeline.state_dict().items():
-            torch.testing.assert_close(value.cpu(), original[name])
-        backend.disable()  # Idempotent cleanup must leave usable storage.
-        pipeline.to(device)
-        torch.testing.assert_close(pipeline(x), expected)
-
-
-@pytest.mark.parametrize("strategy", [OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE])
-def test_invalid_later_component_does_not_mutate_pipeline(execution_device, strategy):
+    An attribute aliasing a streamed block must stay with its ring: copying it
+    to the device makes the ring record the device as that block's home and
+    strands those weights there after teardown.
+    """
     pipeline = _Pipeline()
-    # The first encoder is valid. Reject the second before any placement/hook.
-    pipeline._offload_plan = OffloadPlan(
-        block_attrs={"transformer": ("blocks", "tail")},
-        encoder_block_attrs={"text_encoder": ("blocks", "tail")},
-        encoder_component_types={"image_encoder": "unsupported"},
-    )
-    original = {name: value.clone() for name, value in pipeline.state_dict().items()}
-    backend_type = ModelLevelOffloadBackend if strategy is OffloadStrategy.MODEL_LEVEL else LayerWiseOffloadBackend
-    backend = backend_type(
-        OffloadConfig(strategy=strategy, components=frozenset({"dit", "text_encoder"}), pin_cpu_memory=False),
-        execution_device,
-    )
-    with pytest.raises(ValueError, match="unknown component"):
-        backend.enable(pipeline)
-    assert not backend.enabled
-    _assert_no_offload_hooks(pipeline)
-    _assert_device(pipeline, torch.device("cpu"))
-    for name, value in pipeline.state_dict().items():
-        torch.testing.assert_close(value, original[name])
+    pipeline.transformer.proj.weight = pipeline.transformer.blocks[1].weight
+    original = pipeline.transformer.proj.weight.clone()
+    backend = _backend(_config(OffloadStrategy.LAYER_WISE, frozenset({"dit"})), execution_device)
+
+    backend.enable(pipeline)
+    try:
+        assert pipeline.transformer.proj.weight is pipeline.transformer.blocks[1].weight
+        assert pipeline.transformer.proj.weight.device == CPU
+        # Non-block state around the alias is still placed.
+        assert pipeline.transformer.proj.bias.device == execution_device
+        assert pipeline.transformer.bias.device == execution_device
+    finally:
+        backend.disable()
+
+    assert pipeline.transformer.proj.weight.device == CPU
+    torch.testing.assert_close(pipeline.transformer.proj.weight, original)
 
 
-@pytest.mark.parametrize("strategy", [OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE])
+@pytest.mark.parametrize("strategy", STRATEGIES)
 @torch.inference_mode()
-def test_backends_use_resolved_selection_and_blocks(execution_device, strategy, monkeypatch):
+def test_backends_execute_the_resolved_plan_alone(execution_device, strategy, monkeypatch):
     pipeline = _Pipeline().to(execution_device)
     x = torch.randn(2, 4, device=execution_device)
     expected = pipeline(x)
-    config = OffloadConfig(strategy=strategy, components=frozenset({"text_encoder"}), pin_cpu_memory=False)
+    config = _config(strategy, frozenset({"dit", "text_encoder"}))
     resolved = resolve_offload_plan(pipeline, config)
 
     def forbidden_read(*args, **kwargs):
         pytest.fail("Backend reinterpreted topology after plan resolution")
 
-    # Once resolved, neither declaration paths nor selector helpers are an
-    # input to backend execution. Keep ordinary transport options available.
+    # Once resolved, neither declarations nor selector helpers are an input to
+    # backend execution. Transport options stay readable.
     monkeypatch.setattr(config, "offloads", forbidden_read)
     monkeypatch.setattr(config, "should_offload_encoder", forbidden_read)
     monkeypatch.setattr(pipeline, "_offload_plan", None)
-    for module in (pipeline.transformer, pipeline.text_encoder):
-        monkeypatch.setattr(module, "_layerwise_offload_blocks_attrs", ["missing"], raising=False)
     backend_module = sequential_backend if strategy is OffloadStrategy.MODEL_LEVEL else layerwise_backend
     monkeypatch.setattr(backend_module, "resolve_offload_plan", lambda *_: resolved)
-    backend_type = ModelLevelOffloadBackend if strategy is OffloadStrategy.MODEL_LEVEL else LayerWiseOffloadBackend
-    backend = backend_type(config, execution_device)
+
+    backend = _backend(config, execution_device)
     try:
         backend.enable(pipeline)
         torch.testing.assert_close(pipeline(x), expected)
