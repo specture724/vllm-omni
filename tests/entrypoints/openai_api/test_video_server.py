@@ -128,6 +128,22 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+@pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
+def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", extra_params={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+    )
+    try:
+        with pytest.raises(HTTPException, match="preencode_batch_frames") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-batch"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 

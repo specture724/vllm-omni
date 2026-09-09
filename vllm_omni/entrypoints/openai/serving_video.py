@@ -20,6 +20,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -403,6 +404,11 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
+            if request.extra_params.get("preencode_mp4") and "preencode_batch_frames" in request.extra_params:
+                try:
+                    normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
 

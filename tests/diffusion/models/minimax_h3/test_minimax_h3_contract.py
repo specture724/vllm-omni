@@ -146,7 +146,8 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
         ({"video_codec_options": None}, None),
     ],
 )
-def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expected):
+@pytest.mark.parametrize("batch_extra, batch_frames", [({}, 17), ({"preencode_batch_frames": 5}, 5)])
+def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expected, batch_extra, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -172,7 +173,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
         fps=24,
         num_frames=124,
         num_inference_steps=50,
-        extra_args={"task": "t2va", "aspect_ratio": "16:9", "preencode_mp4": True, **codec_extra},
+        extra_args={"task": "t2va", "aspect_ratio": "16:9", "preencode_mp4": True, **codec_extra, **batch_extra},
     )
     batch = DiffusionRequestBatch(
         [OmniDiffusionRequest(prompt="test", sampling_params=sampling, request_id="codec-defaults")]
@@ -181,6 +182,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.forward(batch)
 
     assert pipeline.decode_to_mp4.call_args.kwargs["video_codec_options"] == expected
+    assert pipeline.decode_to_mp4.call_args.kwargs["batch_frames"] == batch_frames
 
 
 def test_video_codec_options_are_normalized_for_the_encoder():

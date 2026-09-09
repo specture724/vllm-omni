@@ -17,6 +17,13 @@ import numpy as np
 _CHUNKED_MP4_DONE = object()
 
 
+def normalize_preencode_batch_frames(value: Any) -> int:
+    """Validate the request's MP4 transfer/encoding batch threshold."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("preencode_batch_frames must be a positive integer")
+    return value
+
+
 def normalize_video_codec_options(value: Any) -> dict[str, str] | None:
     """Coerce a request's ``video_codec_options`` into PyAV's str->str contract.
 
