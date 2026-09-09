@@ -701,14 +701,27 @@ def _decode_mp4(data: bytes):
     return frames, samples
 
 
-def test_s2v_preencode_returns_playable_mp4_bytes_per_request() -> None:
+@pytest.mark.parametrize("batch_frames", [1, 1000])
+def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch_frames) -> None:
     """The clip loop hands finished clips to the encoder instead of concatenating."""
     pipeline = _make_s2v_preencode_pipeline()
     # Two clips, so the autoregressive motion feedback runs between pushes.
     pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
     audio_a = np.zeros(16000, dtype=np.float32)
     audio_b = np.full(16000, 0.5, dtype=np.float32)
-    batch = _make_s2v_preencode_batch(audio_a, audio_b, extra_args={"preencode_mp4": True})
+    batch = _make_s2v_preencode_batch(
+        audio_a, audio_b, extra_args={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+    )
+    from vllm_omni.diffusion.utils import chunked_video
+
+    transfers = []
+    quantize = chunked_video.chunk_to_uint8_frames
+
+    def capture(chunk, value_range):
+        transfers.append(chunk.shape[2])
+        return quantize(chunk, value_range)
+
+    monkeypatch.setattr(chunked_video, "chunk_to_uint8_frames", capture)
 
     with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
         platform.is_available.return_value = False
@@ -716,6 +729,7 @@ def test_s2v_preencode_returns_playable_mp4_bytes_per_request() -> None:
 
     assert len(outputs) == 2
     assert pipeline.vae.decode.call_count == 2, "both clips must reach the encoder"
+    assert len(transfers) == (2 if batch_frames == 1 else 1)
 
     decoded = []
     for request_output in outputs:

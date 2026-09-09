@@ -41,8 +41,8 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
-    WAN_DEFAULT_BATCH_FRAMES,
     resolve_wan_output_fps,
+    resolve_wan_preencode_batch_frames,
     resolve_wan_preencode_mp4,
     resolve_wan_video_codec_options,
     wan_preencoded_mp4_payload,
@@ -690,6 +690,7 @@ class Wan22Pipeline(
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
@@ -946,7 +947,7 @@ class Wan22Pipeline(
                     self.vae,
                     latents,
                     fps=resolve_wan_output_fps(common),
-                    batch_frames=WAN_DEFAULT_BATCH_FRAMES,
+                    batch_frames=preencode_batch_frames,
                     video_codec_options=resolve_wan_video_codec_options(common),
                 )
             else:
