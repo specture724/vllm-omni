@@ -91,6 +91,8 @@ class ResolvedOffloadPlan:
     # still interpret topology themselves.
     modules: PipelineModules
     declaration: OffloadPlan | None = None
+    # A legacy topology may require a complete no-op, including placement.
+    skip_reason: str | None = None
 
     @property
     def components(self) -> tuple[ResolvedComponent, ...]:
@@ -304,6 +306,11 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
         residents=tuple(residents),
         modules=modules,
         declaration=declaration,
+        skip_reason=(
+            "No DiT/transformer modules found for selected DiT layerwise offload"
+            if layerwise and dit_selected and not dits
+            else None
+        ),
     )
     _validate_unique_ownership(resolved)
     return resolved
