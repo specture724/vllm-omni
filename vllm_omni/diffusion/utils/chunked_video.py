@@ -30,6 +30,14 @@ def chunk_to_uint8_frames(chunk: torch.Tensor, value_range: tuple[float, float])
     checkpoint (see ``SupportsChunkedVAEDecode.chunk_value_range``). Quantizing
     on the accelerator means one transfer moves the final bytes rather than
     float frames.
+
+    That transfer is synchronous: ``.cpu()`` blocks inside the producer's chunk
+    callback, so what overlaps the remaining decode today is the CPU H.264
+    encode of earlier chunks, not this copy. Splitting device preparation,
+    device-to-host copy, and encode into three independently scheduled stages --
+    a pool of reusable pinned host slots with non-blocking copies on a dedicated
+    stream, leases released by the encoder -- fits behind this same callback
+    contract, but is not implemented here.
     """
     low, high = float(value_range[0]), float(value_range[1])
     if high <= low:
