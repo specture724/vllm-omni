@@ -2179,6 +2179,11 @@ class MiniMaxH3Pipeline(
         chunk is committed -- crop, quantization, transfer, encoding -- is the
         shared consumer's job; this method only supplies what is specific to
         H3: the audio waveform, the requested-size crop, and the fixed rate.
+
+        Every rank of a distributed VAE group drives the temporal collectives,
+        but only the output owner receives chunks, so a peer rank returns empty
+        bytes -- the pre-encoded counterpart of the empty tensor the full
+        decode leaves there.
         """
         from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4 as decode_chunks_to_mp4
 
@@ -2205,6 +2210,8 @@ class MiniMaxH3Pipeline(
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                 )
+        if not videos:
+            return b""
         if len(videos) != 1:
             raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
         return videos[0]
