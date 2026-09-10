@@ -82,6 +82,10 @@ singular-name compatibility path).
 An undeclared DiT submodule joins the plan only when it is large enough that
 keeping it resident would defeat streaming; its block container is then found
 by scanning well-known attribute names, which warns once per submodule class.
+Size is computed from parameter shapes and dtypes, including meta parameters,
+so resolving before mmap loading preserves the same residency decision.
+Block ownership validation includes nested components: a block shared with a
+parent, sibling, or encoder is rejected before any hooks or storage are changed.
 A submodule with no block container must implement the `load_to_device` /
 `offload_to_cpu` lifecycle, and the resolver rejects it before any component of
 the pipeline is placed or hooked.

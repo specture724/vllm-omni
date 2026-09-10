@@ -1236,6 +1236,78 @@ class _MmapPostLoadPipeline(nn.Module):
 
 
 class TestMmapWeightLoading:
+    @pytest.mark.parametrize("initial_device", ["cpu", "meta"])
+    @pytest.mark.parametrize("use_allgather", [False, True])
+    def test_mmap_keeps_undeclared_nested_blocks_streamed(
+        self, tmp_path, patched_offload_runtime, monkeypatch, initial_device, use_allgather
+    ):
+        class Refiner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+            def forward(self, x):
+                for block in self.layers:
+                    x = block(x)
+                return x
+
+        class Transformer(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+                self.refiner = Refiner()
+
+            def forward(self, x):
+                x = self.refiner(x)
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        pipeline = nn.Module()
+        pipeline.transformer = Transformer()
+        weights = {name: param.detach().clone() for name, param in pipeline.named_parameters()}
+        x = torch.randn(1, 2)
+        with torch.no_grad():
+            expected = pipeline.transformer(x)
+        checkpoint_file = tmp_path / "model.safetensors"
+        save_file(weights, str(checkpoint_file))
+        # Exercise the real mmap path with a small model instead of allocating
+        # the 1 GiB needed to trigger the production compatibility threshold.
+        monkeypatch.setattr(plan_resolver, "_NESTED_OFFLOAD_THRESHOLD_MB", 0)
+        if initial_device == "meta":
+            pipeline.transformer.to_empty(device="meta")
+        plan = HostWeightPlan(
+            backing_kind="checkpoint_mmap",
+            bindings={name: TensorBinding(checkpoint_key=name, file_path=str(checkpoint_file)) for name in weights},
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=use_allgather,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+
+        for _ in range(2):
+            try:
+                backend.enable(pipeline)
+                assert len(backend._all_hook_groups) == 2
+                with torch.no_grad():
+                    torch.testing.assert_close(pipeline.transformer(x), expected)
+            finally:
+                backend.disable()
+            for name, parameter in pipeline.named_parameters():
+                assert not parameter.is_meta
+                torch.testing.assert_close(parameter, weights[name])
+            for module in pipeline.modules():
+                registry = getattr(module, "_hook_registry", None)
+                if registry is not None:
+                    assert registry.get_hook("distributed_layerwise_offload") is None
+
     def test_runs_model_post_load_hook(self, tmp_path, patched_offload_runtime):
         pipeline = _MmapPostLoadPipeline()
         weights = {name: torch.ones(param.shape, dtype=torch.bfloat16) for name, param in pipeline.named_parameters()}
@@ -1714,6 +1786,45 @@ class TestOffloadPlan:
         backend.disable()
         for name, parameter in pipeline.named_parameters():
             torch.testing.assert_close(parameter, expected_parameters[name])
+
+    @pytest.mark.parametrize("shared_owner", ["parent", "encoder", "sibling"])
+    def test_nested_duplicate_ownership_is_rejected_before_any_hook(self, patched_offload_runtime, shared_owner):
+        class Pipeline(nn.Module):
+            _offload_plan = OffloadPlan(
+                offload_submodules={"refiner": "blocks", "other_refiner": "blocks"},
+                encoder_block_attrs={"text_encoder": ("encoder.block",)},
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=2)
+                self.transformer.refiner = _SingleBlockModel(num_blocks=2)
+                self.transformer.other_refiner = _SingleBlockModel(num_blocks=2)
+                self.text_encoder = _PlainEncoder()
+                owners = {
+                    "parent": self.transformer.blocks,
+                    "encoder": self.text_encoder.encoder.block,
+                    "sibling": self.transformer.other_refiner.blocks,
+                }
+                self.transformer.refiner.blocks = owners[shared_owner]
+
+        pipeline = Pipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False),
+            torch.device("cpu"),
+        )
+        storage = {name: parameter.data_ptr() for name, parameter in pipeline.named_parameters()}
+        try:
+            with pytest.raises(ValueError, match="claimed by both"):
+                backend.enable(pipeline)
+            assert not backend.enabled
+            assert not backend._all_hook_groups
+            assert {name: parameter.data_ptr() for name, parameter in pipeline.named_parameters()} == storage
+            assert not getattr(pipeline.text_encoder, "_omni_layerwise_enabled", False)
+            for module in pipeline.modules():
+                assert getattr(module, "_hook_registry", None) is None
+        finally:
+            backend.disable()
 
     def test_unstageable_submodule_is_rejected_before_any_hook(self, patched_offload_runtime):
         """Plan-dependent rejection happens before earlier components are hooked."""

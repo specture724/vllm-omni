@@ -190,15 +190,12 @@ def _resolve_dit_children(
 
 
 def _module_size_mb(module: nn.Module) -> float:
-    """Materialized parameter bytes, in MiB. Meta tensors hold no storage."""
-    return (
-        sum(
-            parameter.nelement() * parameter.element_size()
-            for parameter in module.parameters()
-            if not getattr(parameter, "is_meta", False)
-        )
-        / 1048576
-    )
+    """Expected parameter bytes in MiB, including not-yet-loaded meta tensors.
+
+    Resolution precedes mmap materialization, so residency must depend on the
+    tensor metadata rather than whether the loader has allocated storage yet.
+    """
+    return sum(parameter.nelement() * parameter.element_size() for parameter in module.parameters()) / 1048576
 
 
 def _resolve_dit_stacks(
@@ -413,7 +410,10 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
 def _validate_unique_ownership(resolved: ResolvedOffloadPlan) -> None:
     """Reject topologies where two components would hook the same blocks."""
     owner_by_block: dict[int, str] = {}
-    for component in resolved.components:
+    pending = list(reversed(resolved.components))
+    while pending:
+        component = pending.pop()
+        pending.extend(reversed(component.children))
         for block in (block for stack in component.stacks for block in stack.blocks):
             owner = owner_by_block.setdefault(id(block), component.path)
             if owner != component.path:
