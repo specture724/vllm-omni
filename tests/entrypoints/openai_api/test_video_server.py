@@ -154,8 +154,11 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 
     handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    # Resolved frame count differs from anything the request asked for, so the
+    # metadata has to come from the encoded stream rather than request defaults.
+    preencoded = _make_test_video_bytes((32, 24), num_frames=7)
     artifacts = VideoGenerationArtifacts(
-        videos=[b"preencoded-mp4"],
+        videos=[preencoded],
         audios=[None],
         actions=[None],
         audio_sample_rate=24000,
@@ -169,11 +172,16 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     try:
         result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
         assert result == (
-            b"preencoded-mp4",
+            preencoded,
             {"decode": 0.5},
             123.0,
             None,
-            {"fps": 24.0, "metrics": {"generation_time": 1.25}},
+            {
+                "fps": 24.0,
+                "num_frames": 7,
+                "duration_s": 7 / 24.0,
+                "metrics": {"generation_time": 1.25},
+            },
         )
         encoder.assert_not_called()
     finally:

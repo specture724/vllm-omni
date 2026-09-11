@@ -20,7 +20,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames
+from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -101,7 +101,12 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     if not artifacts.videos:
         return metadata
 
-    num_frames = count_video_frames(artifacts.videos[0])
+    video = artifacts.videos[0]
+    # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        num_frames = count_mp4_frames(bytes(video))
+    else:
+        num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
         metadata["num_frames"] = num_frames
         if artifacts.output_fps > 0:

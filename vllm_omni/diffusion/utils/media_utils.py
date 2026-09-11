@@ -254,6 +254,18 @@ class FragmentedMP4Muxer:
         return chunk
 
 
+def count_mp4_frames(video_bytes: bytes) -> int | None:
+    """Read an MP4's frame count from its sample table, without decoding it."""
+    if not video_bytes:
+        return None
+    try:
+        with cast(Any, av.open(io.BytesIO(video_bytes), format="mp4")) as container:
+            frames = int(container.streams.video[0].frames)
+    except Exception:
+        return None
+    return frames or None
+
+
 def finalize_streaming_video_bytes(
     video_bytes: bytes,
     *,
