@@ -122,7 +122,9 @@ def test_output_fps_mirrors_the_serving_fallback():
 def test_codec_options_reach_the_encoder_as_strings():
     params = SimpleNamespace(extra_args={"video_codec_options": {"preset": "ultrafast", "threads": 0}})
     assert resolve_wan_video_codec_options(params) == {"preset": "ultrafast", "threads": "0"}
-    assert resolve_wan_video_codec_options(SimpleNamespace(extra_args={})) is None
+    assert resolve_wan_video_codec_options(SimpleNamespace(extra_args={})) == {"preset": "ultrafast", "threads": "0"}
+    assert resolve_wan_video_codec_options(SimpleNamespace(extra_args={"video_codec_options": None})) is None
+    assert resolve_wan_video_codec_options(SimpleNamespace(extra_args={"video_codec_options": {}})) == {}
 
 
 def test_preencoded_payload_passes_bytes_through_and_ignores_tensors():
