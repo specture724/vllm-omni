@@ -12,6 +12,10 @@ from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_fram
 # so the bytes the worker encodes carry the rate the response advertises.
 WAN_DEFAULT_OUTPUT_FPS = 24
 
+# Keep worker-side encoding consistent with the one-shot serving encoder when
+# a request does not choose codec options explicitly.
+WAN_DEFAULT_VIDEO_CODEC_OPTIONS = {"preset": "ultrafast", "threads": "0"}
+
 # Wan publishes one latent frame group per callback, which is far finer than one
 # host transfer is worth. 17 frames matches MiniMax-H3's native clip size.
 WAN_DEFAULT_BATCH_FRAMES = 17
@@ -61,9 +65,13 @@ def resolve_wan_preencode_batch_frames(sampling_params: Any, *, default: int = W
 
 
 def resolve_wan_video_codec_options(sampling_params: Any) -> dict[str, str] | None:
-    """Read the request's encoder options for the worker-side encoder."""
+    """Read the request's encoder options, preserving serving defaults.
+
+    An absent key inherits the one-shot serving encoder's defaults. Explicit
+    ``None`` and an empty mapping remain distinct caller choices.
+    """
     extra_args = getattr(sampling_params, "extra_args", None) or {}
-    return normalize_video_codec_options(extra_args.get("video_codec_options"))
+    return normalize_video_codec_options(extra_args.get("video_codec_options", WAN_DEFAULT_VIDEO_CODEC_OPTIONS))
 
 
 def resolve_wan_output_fps(sampling_params: Any) -> int:
