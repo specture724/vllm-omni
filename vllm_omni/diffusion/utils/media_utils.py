@@ -108,9 +108,10 @@ class ChunkedMP4Encoder:
         self._state_lock = threading.Lock()
 
         def run() -> None:
+            frames = self._frames()
             try:
                 self._result = mux_av_video_audio_bytes(
-                    self._frames(),
+                    frames,
                     width=self.width,
                     height=self.height,
                     audio_waveform=audio_waveform,
@@ -123,6 +124,11 @@ class ChunkedMP4Encoder:
                 )
             except BaseException as exc:
                 self._error = exc
+                # Closing is what runs the generator's cleanup and releases the
+                # chunk it was mid-way through. Waiting for collection would
+                # never get there: the traceback just stored on this encoder
+                # keeps the abandoned generator alive for the process's life.
+                frames.close()
                 self._drain_until_done()
 
         self._thread = threading.Thread(target=run, name="chunked-mp4", daemon=True)

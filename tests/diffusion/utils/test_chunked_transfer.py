@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 
+import numpy as np
 import pytest
 import torch
 
@@ -103,6 +104,27 @@ def test_abort_wakes_a_transfer_waiting_for_a_slot():
     # Later transfers stay failed rather than silently resuming.
     with pytest.raises(RuntimeError, match="encoder died"):
         ring.transfer(_frames(), readers=1)
+
+
+def test_encoder_releases_the_chunk_it_was_reading_when_muxing_fails(monkeypatch):
+    """A failed mux abandons the frame generator, which still owns a lent slot."""
+    from vllm_omni.diffusion.utils import media_utils
+
+    released: list[int] = []
+
+    def exploding_mux(frames, **kwargs):
+        # Read into the chunk, so the generator is suspended inside it.
+        next(iter(frames))
+        raise RuntimeError("mux failed")
+
+    monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", exploding_mux)
+    encoder = media_utils.ChunkedMP4Encoder(width=6, height=4, fps=24)
+    encoder.push(np.zeros((2, 4, 6, 3), dtype=np.uint8), on_consumed=lambda: released.append(1))
+
+    with pytest.raises(RuntimeError, match="mux failed"):
+        encoder.finish()
+
+    assert released == [1], "the abandoned generator must not keep holding its chunk"
 
 
 class _RecordingEncoder:
