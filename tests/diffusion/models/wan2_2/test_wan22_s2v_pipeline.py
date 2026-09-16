@@ -671,6 +671,7 @@ def _make_s2v_preencode_pipeline() -> Wan22S2VPipeline:
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
     pipeline.scheduler = MagicMock(timesteps=torch.tensor([1.0]))
+    pipeline._flow_shift = 3.0
     pipeline.vae_scale_factor_spatial = 8
     pipeline.resolution_divisor = 16
     pipeline.motion_frames = 7
