@@ -858,6 +858,22 @@ def test_s2v_preencode_skips_encoding_on_a_vae_patch_parallel_peer(monkeypatch) 
     assert [request_output.output for request_output in outputs] == [[], []]
 
 
+@pytest.mark.parametrize("output_type", ["pil", "pt", "latent"])
+def test_s2v_preencode_rejects_request_output_types_it_cannot_serve(output_type) -> None:
+    """Pre-encoding returns MP4 bytes, so a request asking for frames must fail."""
+    pipeline = _make_s2v_preencode_pipeline()
+    batch = _make_s2v_preencode_batch(
+        np.zeros(16000, dtype=np.float32),
+        np.ones(16000, dtype=np.float32),
+        extra_args={"preencode_mp4": True},
+    )
+    for request in batch.requests:
+        request.sampling_params.output_type = output_type
+
+    with pytest.raises(ValueError, match="output_type"):
+        pipeline.forward(batch)
+
+
 def test_s2v_preencode_keeps_the_full_decode_path_untouched() -> None:
     """Without the flag the loop still returns the (video, audio, rate) tuple."""
     pipeline = _make_s2v_preencode_pipeline()

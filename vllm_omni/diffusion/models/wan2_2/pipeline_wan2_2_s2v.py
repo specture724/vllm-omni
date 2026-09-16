@@ -1191,7 +1191,12 @@ class Wan22S2VPipeline(
         )
         num_steps = common.num_inference_steps or num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
-        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type or "np")
+        # The request's output_type is what serving honours downstream; the keyword
+        # argument only carries a default for direct callers. Reading it here is what
+        # lets pre-encoding reject pil, pt, and latent instead of returning MP4 bytes
+        # to a caller that asked for frames.
+        output_type = common.output_type or output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
         preencode_batch_frames = resolve_wan_preencode_batch_frames(common, default=1) if preencode_mp4 else 1
 
         if common.guidance_scale_provided:
