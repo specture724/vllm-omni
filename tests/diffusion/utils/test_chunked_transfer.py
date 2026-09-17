@@ -204,6 +204,37 @@ def test_session_abort_releases_every_slot_still_in_flight(recording_encoders):
     assert session.ring.slots_in_use == 0
 
 
+def test_session_gets_its_slot_back_after_a_real_encoder_failure():
+    """A real libx264 error must not strand the producer on the slot it lent."""
+    session = ChunkedVideoMP4Session(
+        value_range=(0.0, 1.0),
+        fps=24,
+        transfer_slots=1,
+        video_codec_options={"preset": "invalid-preset"},
+    )
+    failures: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            for _ in range(4):
+                session.push(torch.zeros(1, 3, 1, 16, 16))
+            session.finish()
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    producer.join(timeout=30)
+    # With one slot, a lease the failed encoder never released leaves the
+    # producer waiting on the ring forever instead of seeing the codec error.
+    assert not producer.is_alive(), "the producer stalled on a slot the failed encoder kept"
+    assert len(failures) == 1
+
+    session.abort()
+    assert session.ring is not None
+    assert session.ring.slots_in_use == 0
+
+
 @hardware_test(res={"cuda": ["H100", "B200"]})
 def test_device_chunks_land_intact_through_the_pinned_ring():
     """On an accelerator the copy is deferred, so its event must order the read."""
