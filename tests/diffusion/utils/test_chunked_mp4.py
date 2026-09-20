@@ -2,12 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import hashlib
+import io
+import shutil
 
 import av
 import numpy as np
 import pytest
 
-from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder, mux_av_video_audio_bytes
+from vllm_omni.diffusion.utils.media_utils import (
+    ChunkedMP4Encoder,
+    mux_av_video_audio_bytes,
+    mux_video_audio_ffmpeg_bytes,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -89,6 +95,21 @@ def test_chunked_mp4_close_returns_encoded_bytes() -> None:
     assert result == encoder.finish() == encoder.close()
     with av.open(io.BytesIO(result)) as container:
         assert len(list(container.decode(video=0))) == len(_frames())
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_ffmpeg_mux_encodes_video_and_audio() -> None:
+    result = mux_video_audio_ffmpeg_bytes(
+        _frames(),
+        np.zeros((2, 320), dtype=np.float32),
+        fps=24,
+        audio_sample_rate=32000,
+        video_codec_options={"threads": "1"},
+    )
+
+    with av.open(io.BytesIO(result)) as container:
+        assert len(list(container.decode(video=0))) == len(_frames())
+        assert len(container.streams.audio) == 1
 
 
 def test_chunked_mp4_failure_during_push(monkeypatch) -> None:

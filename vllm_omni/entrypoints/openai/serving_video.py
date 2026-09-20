@@ -475,10 +475,12 @@ class OmniOpenAIServingVideo:
         )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        video_encoder_backend = "pyav"
         if request.extra_params is not None and isinstance(request.extra_params, dict):
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+            video_encoder_backend = request.extra_params.get("video_encoder_backend", video_encoder_backend)
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
@@ -488,6 +490,7 @@ class OmniOpenAIServingVideo:
                         fps=artifacts.output_fps,
                         video_codec_options=video_codec_options,
                         frame_converter=self._video_frame_converter,
+                        **({"backend": video_encoder_backend} if video_encoder_backend != "pyav" else {}),
                     )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
@@ -497,6 +500,7 @@ class OmniOpenAIServingVideo:
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
                         frame_converter=self._video_frame_converter,
+                        **({"backend": video_encoder_backend} if video_encoder_backend != "pyav" else {}),
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -538,10 +542,12 @@ class OmniOpenAIServingVideo:
         audio = artifacts.audios[0]
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        video_encoder_backend = "pyav"
         if request.extra_params is not None and isinstance(request.extra_params, dict):
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+            video_encoder_backend = request.extra_params.get("video_encoder_backend", video_encoder_backend)
         action = artifacts.actions[0]
         video_metadata = _video_metadata_from_artifacts(artifacts)
         if action is not None and isinstance(artifacts.videos[0], dict):
@@ -555,6 +561,7 @@ class OmniOpenAIServingVideo:
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
             video_codec_options=video_codec_options,
             frame_converter=self._video_frame_converter,
+            **({"backend": video_encoder_backend} if video_encoder_backend != "pyav" else {}),
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
