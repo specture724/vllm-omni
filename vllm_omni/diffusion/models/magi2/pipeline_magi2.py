@@ -45,9 +45,10 @@ from vllm_omni.diffusion.models.interface import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan, PinnedModuleStager
 from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
     OffloadStrategy,
     offload_streams_blocks,
-    resolve_offload_strategy,
+    resolve_offload,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -303,7 +304,8 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError(f"MAGI-2 tensor_parallel_size={tp_size} does not divide: " + ", ".join(invalid_tp_dimensions))
 
     configured_world_size = dp_size * cfg_size * tp_size * sp_size
-    strategy = resolve_offload_strategy(od_config)
+    resolved_offload = resolve_offload(od_config)
+    strategy = resolved_offload.strategy
     layerwise_offload = strategy is OffloadStrategy.LAYER_WISE
     distributed_offload = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
     if strategy is OffloadStrategy.MODEL_LEVEL:
@@ -333,7 +335,6 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
             f"expected vae_patch_parallel_size=1 or {configured_world_size}, got {vae_pp_size}."
         )
 
-    dlo_allgather = bool(getattr(od_config, "dlo_use_allgather", True))
     if cfg_size > 1 and dp_size > 1:
         raise ValueError("MAGI-2 CFG parallelism is not yet combined with DLO data parallelism")
     if distributed_offload and getattr(parallel, "use_hsdp", False):
@@ -342,7 +343,7 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError("MAGI-2 data parallelism currently requires distributed layerwise offload")
     if dp_size > 1 and tp_size > 1:
         raise ValueError("MAGI-2 DLO data-parallel replicas currently require tensor_parallel_size=1")
-    if distributed_offload and dlo_allgather:
+    if distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT):
         if dp_size <= 1:
             raise ValueError(
                 "MAGI-2 DLO AllGather requires data_parallel_size > 1. SP ranks "
@@ -586,8 +587,10 @@ class Magi2Pipeline(
         from .modeling_magi2 import Magi2PreviewTransformer
 
         MAGI2_PREVIEW_CONFIG.validate()
-        mmap_dlo = resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and bool(
-            getattr(od_config, "dlo_use_allgather", True)
+        resolved_offload = resolve_offload(od_config)
+        mmap_dlo = (
+            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            and resolved_offload.uses_allgather(DIT_COMPONENT)
         )
         if mmap_dlo:
             # AllGather DLO binds checkpoint tensors as mmap views and copies
