@@ -451,6 +451,12 @@ class OmniOpenAIServingVideo:
                     normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
                 except ValueError as exc:
                     raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+            video_encoder_backend = request.extra_params.get("video_encoder_backend", "pyav")
+            if video_encoder_backend not in ("pyav", "ffmpeg"):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"Unsupported video encoder backend: {video_encoder_backend}",
+                )
             if (
                 request.extra_params.get("preencode_mp4")
                 and request.extra_params.get("video_encoder_backend") == "ffmpeg"

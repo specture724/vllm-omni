@@ -182,6 +182,19 @@ def test_preencode_rejects_ffmpeg_backend_before_generation():
         handler.shutdown()
 
 
+def test_rejects_invalid_video_encoder_backend_before_generation():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"video_encoder_backend": "bogus"})
+    try:
+        with pytest.raises(HTTPException, match="Unsupported video encoder backend") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-encoder"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 
