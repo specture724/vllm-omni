@@ -499,6 +499,8 @@ offload 策略 = Unit + Trigger + Transport
 
 新旧两种写法同时出现且冲突时报错，并给出迁移提示。
 
+`legacy` 下，被 HSDP 管理的组件可以做整组件 offload 或 `rank-local` 逐层 offload。`unified` 下这两种组合在规划阶段报错，报错信息提示在 HSDP 和 offload 之间二选一。
+
 ### 8.5 不支持的组合
 
 `unified` 下，以下组合在参数解析或规划阶段报错，并说明原因：
@@ -528,7 +530,7 @@ offload 策略 = Unit + Trigger + Transport
 ## 9. 上线方式
 
 1. 新栈作为一套独立的代码加入主干，与现有的三个后端、现有加载路径并存。总开关默认是 `legacy`。
-2. 上线门槛：现有每个有端到端测试或每晚例行测试的“模型 × offload 策略”组合，在 `unified` 下输出一致，Host 和加速卡的内存峰值不高于 `legacy`。
+2. 上线门槛：现有每个有端到端测试或每晚例行测试的“模型 × offload 策略”组合，在 `unified` 下输出一致，Host 和加速卡的内存峰值不高于 `legacy`。被 HSDP 管理的组件做 offload 的组合在 `unified` 下不再支持，不在门槛之内。
 3. 门槛全部达到后，默认值翻转为 `unified`。
 4. 翻转后的一个版本保留 `legacy` 作为回退。
 5. 再下一个版本删除 `legacy`：三个现有后端、现有的非 HSDP 加载路径（包括其中对 Host Weight Runtime 的接入）、模型里的 offload 专用声明和生命周期代码。

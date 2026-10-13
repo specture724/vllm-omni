@@ -95,7 +95,7 @@ offload 策略 = Unit + Trigger + Transport
 - 总开关：`--diffusion-weight-stack {legacy,unified}`，默认 `legacy`。`unified` 同时启用新加载流程、HWM 和新 Offloader。
 - offload 策略：四个预设 `none`、`module`、`layerwise`、`distributed-layerwise`，或按角色给出的自定义配置。
 - `unified` 下不支持的组合在参数解析或规划阶段报错。
-- 上线门槛：现有每个有测试的“模型 × offload 策略”组合在 `unified` 下输出一致，内存峰值不高于 `legacy`。
+- 上线门槛：现有每个有测试的“模型 × offload 策略”组合在 `unified` 下输出一致，内存峰值不高于 `legacy`。HSDP 管理的组件做 offload 的组合在 `unified` 下不再支持，不在门槛之内。
 - 门槛达到后默认值翻转为 `unified`；`legacy` 保留一个版本，之后删除。
 
 ## 9. 核心不变量
