@@ -79,16 +79,16 @@ Checkpoint ──读取、融合、变换──▶ Loader ──写入──▶ 
 offload 策略 = Unit + Trigger + Transport
 ```
 
-- **Unit**：整组件、一个重复块、组件声明里一个命名组，或开头若干块组成的常驻层组。
-- **Trigger**：块环（一块共享的缓冲区，按后继表边算当前块边准备下一块），或使用触发（某个组件被使用时装入，并让别的组件让出）。
+- **Unit**：整组件、一个重复块、组件声明里一个命名组、开头若干块组成的常驻层组，或 layer 组件里重复块以外的一个直接子模块。
+- **Trigger**：块环（`rank-local` 和 `allgather` 的流式 Unit 各用一块缓冲区、一张后继表，边算当前块边准备下一块），或使用触发（某个组件被使用时装入，并让别的组件让出）。
 - **Transport**：本 rank 直接 H2D，或分片 H2D 后 AllGather。
 
-重复块按通用规则自动发现，模型可以在组件声明里用 `repeated_blocks` 覆盖。没被选中的 VAE 常驻加速卡；使用 DiT 时其他被选中的组件让出，编码器之间不互相让出。
+重复块按通用规则自动发现，模型可以在组件声明里用 `repeated_blocks` 覆盖。没被选中的 VAE 常驻加速卡、不装钩子。使用 DiT 时其他被选中的组件让出；使用编码器时 DiT 和被选中的 VAE 让出；使用被选中的 VAE 时 DiT 和其他被选中的 VAE 让出；编码器之间不互相让出。
 
 模型里没有 offload 专用的代码。模型只提供组件声明和一组封闭的、带类型的结构字段（`repeated_blocks`、`unit_groups`、`shard_group`、`fixed_adapters`），驻留、设备和搬运全部由 Offloader 决定。
 
-- **动态 LoRA**：包装在只建结构时完成，LoRA 槽位在启动时分配并常驻加速卡；提交后切换 adapter 只拷数据。
-- **睡眠模式**：Offloader 的临时槽位在睡眠时直接释放；常驻加速卡的权重由睡眠模式搬出搬回；host 存储不受影响；唤醒后地址不变。
+- **动态 LoRA**：包装在只建结构时完成，LoRA 槽位在启动时分配并常驻加速卡；提交后切换适配器只拷数据。
+- **睡眠模式**：块环缓冲区和分片槽位在睡眠时直接释放；常驻加速卡的权重由睡眠模式搬出搬回；host 存储不受影响；唤醒后地址不变。
 - **CUDA graph 与编译**：模型自己捕获的 CUDA graph 和 cudagraph 编译模式只用于全部常驻加速卡的组件，其他组件走 eager 或 `default` 编译。
 
 ## 7. 清理与恢复
@@ -103,10 +103,10 @@ offload 策略 = Unit + Trigger + Transport
 - 总开关：`--diffusion-weight-stack {legacy,unified}`，默认 `legacy`。`unified` 同时启用新加载流程、HWM 和新 Offloader。
 - offload 策略：`--diffusion-offload` 的四个预设 `none`、`module`、`layerwise`、`distributed-layerwise`，或 `--diffusion-offload-policy` 按角色或组件名给出的自定义配置。旧开关和旧的 `--diffusion-offload-config` 由兼容层翻译；要让 VAE 由使用触发管理，在自定义配置里选中它。
 - host 策略：`--pin-cpu-memory` / `--no-pin-cpu-memory`，`--diffusion-host-registration-limit-gib`。
-- 动态 LoRA 需要在启动时给出 `max_lora_rank`。
+- 动态 LoRA 需要在启动时给出 `--diffusion-max-lora-rank`；`lora_backend=peft` 并给了 `--lora-path` 时可以不给，槽位取这个适配器的 rank，运行期更大的 rank 被拒绝。
 - `unified` 下不支持的组合在参数解析或规划阶段报错。
-- 并存期间，构造期自己读张量的 pipeline 只在读张量的调用点分成 legacy、unified 两支，legacy 一支是原语句；每个迁移家族有以 legacy 为基准的逐张量对比测试。
-- 上线门槛：现有每个有测试的“模型 × offload 策略”组合在 `unified` 下输出一致，内存峰值不高于 `legacy`。HSDP 管理的组件做 offload 的组合在 `unified` 下不再支持，不在门槛之内。
+- 并存期间，构造期自己读张量的 pipeline 只在读张量的调用点分成 legacy、unified 两支，legacy 一支是原语句；每个迁移家族有以 legacy 为基准的逐张量对比测试。在 `unified` 下会弄坏被管理权重的模型代码按共存期必改清单逐项改，每一项只改变 `unified` 下的行为。
+- 上线门槛：现有每个有测试的“模型 × offload 策略”组合在 `unified` 下输出一致，内存峰值不高于 `legacy`。以下组合不在门槛之内，写进迁移说明：HSDP 管理的组件做 offload（`unified` 不支持）；MiniMax H3 在 SM120 上不加参数的 AdaLN offload（`unified` 不做与硬件相关的隐式 offload，recipe 写明 `units`）；Qwen-Image-2.1 配 `--enable-cpu-offload` 时解码的 CUDA graph（DiT 按整组件 offload，解码走 eager）；MiniMax H3、Wan2.2-S2V、MAGI-2、JoyImage、LingBot-Video 用旧开关时的显存峰值（旧开关从不选 `vae`，recipe 改用选中 `vae` 的自定义配置）；`unified` 在预检拒绝或融合结果与 `legacy` 不同的适配器；同一台机器上两个部署跑同一个模型时的 Host 占用（不同部署不共享）。
 - 门槛达到、所有注册的 pipeline 都能在只建结构下构造之后，默认值翻转为 `unified`；`legacy` 保留一个版本，之后删除。
 
 ## 9. 核心不变量
@@ -122,10 +122,10 @@ offload 策略 = Unit + Trigger + Transport
 
 ## 10. 最小验收标准
 
-1. 同一个部署在一台机器上的 worker 数、副本数增加，Host 上的权重占用不增加。
+1. 同一个部署在一台机器上的 worker 数、副本数、stage 数增加，Host 上的权重占用不增加。
 2. 同一台机器上两个部署跑同一个模型，彼此不共享、不连接，一个部署退出不影响另一个。
 3. 权重大于单机 Host 内存时，多台机器共同部署，冷启动的占用不超出上限。
 4. 权重大于 `/dev/shm` 的大小时正常加载。
-5. 对任意 worker 执行 `kill -9` 后，机器上不残留任何共享内存。
+5. 对一个 worker 执行 `kill -9` 后，它所在副本的全部 worker 退出，其他副本照常服务、映射不受影响；对一个部署的全部 worker 执行 `kill -9` 后，机器上不残留这个部署的共享内存。
 6. 新栈的最终权重与完整加载的基线逐张量一致，输出一致。
 7. 总开关为 `legacy` 时，现有行为完全不变。

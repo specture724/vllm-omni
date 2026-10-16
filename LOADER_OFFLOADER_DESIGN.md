@@ -16,8 +16,8 @@
 6. **一个 worker 退出时，它所在副本的全部 worker 一起终止**：其他副本照常服务，已绑定的共享内存不受影响。服务重启后，每个副本从 checkpoint 构建。
 7. **新栈与现有实现并存，由一个总开关切换**：并存期间现有实现的行为和构造代码不变；达到上线门槛后翻转默认值，随后删除现有实现。
 8. **模型里没有 offload 专用的代码**：模型只提供组件声明和一组封闭的、带类型的结构字段；驻留、设备和搬运全部由 Offloader 决定。
-9. **动态 LoRA 是叠加层**：包装在只建结构时完成，LoRA 槽位在启动时分配并常驻加速卡；提交后切换 adapter 只拷数据，不改结构。
-10. **睡眠模式与 Offloader 按显存类别分工**：Offloader 的临时槽位在睡眠时直接释放，常驻加速卡的权重由睡眠模式搬出搬回，host 存储不受影响。
+9. **动态 LoRA 是叠加层**：包装在只建结构时完成，LoRA 槽位在启动时分配并常驻加速卡；提交后切换适配器只拷数据，不改结构。
+10. **睡眠模式与 Offloader 按显存类别分工**：块环缓冲区和分片槽位在睡眠时直接释放，常驻加速卡的权重由睡眠模式搬出搬回，host 存储不受影响。
 11. **地址会变的权重不进 CUDA graph**：模型自己捕获的 CUDA graph 和编译的 cudagraph 模式只用于全部常驻加速卡的组件。
 
 Loader、HWM、Offloader 连同把它们串起来的启动流程，下文统称新栈。
@@ -34,7 +34,7 @@ Loader、HWM、Offloader 连同把它们串起来的启动流程，下文统称�
 | 多台小内存机器共同部署一个模型 | 每个 rank 只持有 1/N，冷启动的占用也有上限 |
 | 加速卡显存不足 | 权重按需在 Host 和加速卡之间搬运 |
 | 部署退出后不留内存垃圾 | 正常退出、`kill -9`、OOM 三种情况下内存都被回收 |
-| 不破坏现有部署 | 总开关关闭时现有行为完全不变 |
+| 不破坏现有部署 | 总开关为 `legacy` 时现有行为完全不变 |
 | 机制通用 | 没有针对单个模型的加载或 offload 代码 |
 
 ### 1.2 范围之外
@@ -53,18 +53,18 @@ Loader、HWM、Offloader 连同把它们串起来的启动流程，下文统称�
 
 | 名词 | 含义 |
 |---|---|
-| 部署 | 一个编排进程（`Omni`、`AsyncOmni` 里的 `StageRuntime`）从启动到关闭的一次运行，包括它直接启动的全部副本，以及在它的 `OmniMasterServer` 上注册的 headless 副本 |
-| 部署标识 | 编排进程每次启动时生成的 128 位随机数，下发到这个部署的每个扩散 worker。不同部署的标识不同，同一个部署的两次启动也不同 |
+| 部署 | 一个编排进程（`Omni`、`AsyncOmni` 里的 `StageRuntime`，分布式模式下是它的子类 `DistStageRuntime`）从启动到关闭的一次运行，包括它直接启动的全部副本，以及在 `DistStageRuntime` 的 `OmniMasterServer` 上注册的 headless 副本 |
+| 部署标识 | 编排进程每次启动时生成的 128 位随机数，下发到这个部署的每个扩散 worker。不同部署的标识不同；同一套配置先后启动两次是两个部署，标识也不同 |
 | stage | vllm-omni 里承担一个模型阶段的逻辑单元，由一个或多个副本组成 |
 | 副本 | 一个 stage 的一份独立运行的实例，有自己的执行器、worker 进程和 torch.distributed 进程组。数量由 `num_replicas` 或 `--omni-dp-size-local` 决定，headless 副本可以在运行期加入 |
 | rank | 一个 worker 进程在分布式进程组里的编号，一个 rank 对应一块加速卡 |
-| DP / SP / TP | 三种并行方式：数据并行（多个副本各自处理请求）、序列并行（一个请求的序列切给多个 rank）、张量并行（每个 rank 持有参数的一部分） |
+| DP / SP / TP | 三种并行方式：数据并行（一个副本内按 `data_parallel_size` 分成的几组 rank 各自处理不同的请求；多个副本之间不算 DP）、序列并行（一个请求的序列切给多个 rank）、张量并行（每个 rank 持有参数的一部分） |
 | HSDP | 一种把参数本身分片放在各 rank 的加速卡上、使用前拼接的并行方式 |
 | 组件 | Loader 声明的、带名字和角色的模型部分，例如 DiT、文本编码器、VAE |
 | 组件声明的字段 | 组件声明里一组封闭的、带类型的结构字段：`repeated_blocks`、`unit_groups`、`shard_group`、`fixed_adapters` |
-| 重复块 | 组件里结构相同、依次执行的一组层，例如 DiT 的每一个 block |
+| 重复块 | 组件里结构相同、依次执行的一组层，例如 DiT 的每一个块 |
 | 规则表 | 每个类一张的数据表：类型、保持 fp32 的条目、改名合并、加载时忽略的键 |
-| 适配器 | 融合进基础权重或作为固定叠加的 LoRA 类增量。用户给出的叫融合适配器，模型自带的叫固定适配器 |
+| 适配器 | LoRA 类增量。用户给出、在 checkpoint 读取器里融合进基础权重的叫融合适配器；模型在 `fixed_adapters` 里自带的叫固定适配器；作为动态 LoRA 写进叠加层槽位的叫动态适配器 |
 | 内容身份 | 判断同一个部署里两个 worker 需要的某个组件的最终权重是否完全相同的依据 |
 | 最终清单 | 加载完成后每个张量的名字、形状、类型、在存储里的位置，以及哪些张量共用同一段存储 |
 | host 存储 | HWM 分配的、存放最终权重字节的 Host 内存 |
@@ -73,7 +73,7 @@ Loader、HWM、Offloader 连同把它们串起来的启动流程，下文统称�
 | 共享集合 | 部署标识相同，本机键、内容身份、规划指纹也都相同的一组 worker，共用一份共享内存 |
 | 写入进程、等待者 | 写入进程是一个共享集合在一台机器上构建并封存共享内存、之后一直给后来者提供文件描述符的 worker；其余 worker 是等待者 |
 | rank 分片 | 一个重复块的全部字节拉平后按 rank 等分，某个 rank 持有的那一段 |
-| Unit | Offloader 一起驻留、一起搬运的一组权重：整组件、一个重复块、一个命名组，或一组常驻层 |
+| Unit | Offloader 一起驻留、一起搬运的一组权重：整组件、一个重复块、一个命名组、一组常驻层，或 layer 组件里重复块以外的一个直接子模块 |
 | Trigger | 决定某个 Unit 什么时候装上加速卡、什么时候让出 |
 | Transport | 一个 Unit 怎么从 Host 到加速卡 |
 | `fully_resident` | 组件全部常驻加速卡、地址到关闭前不变、不由 HSDP 管理时为真；由 `commit()` 填写 |
@@ -106,7 +106,7 @@ Loader、HWM、Offloader 连同把它们串起来的启动流程，下文统称�
 
 1. Loader 只通过接口调用 HWM 和 Offloader，不 import 它们的具体实现。
 2. Offloader 不 import Loader 和 safetensors 读取器，不调用模型的任何加载后钩子。
-3. HWM 不解释 checkpoint 的 key，不做改名、切分、合并、量化或收尾。
+3. HWM 不解释 checkpoint 的键名，不做改名、切分、合并、量化或收尾。
 4. 模型只向 Loader 提供组件声明和通用结构信息，不读 offload 配置或 host 配置，不 import Offloader，不按名字读 offload 钩子，不调用运行期的生命周期方法。
 5. 启动状态不挂在 pipeline 对象上传递。
 
@@ -150,7 +150,7 @@ class MemoryRange:
 
 - `Topology`：部署标识，以及按 rank 排列的 `LocalRecord`。副本内所有 rank 拿到同一份。`plan()` 的单机容量检查、`share_plan()`、`admit()` 都用它。
 - `SharePlan`：本副本内每个共享集合在每台机器上的成员、代表（rank 最小者）和套接字名。
-- `Election`：每个共享集合的写入进程在本副本还是在别处；在别处时，它是否已封存、还有多少字节没写入。还记录代表参选时读到的本机可用内存。
+- `Election`：每个共享集合的写入进程在本副本还是在别处；在别处时，它是否已封存、还有多少字节没写入。还记录代表参选时读到的本机可用内存。本 rank 是写入进程时，`Election` 持有监听套接字和监听线程，`allocate()` 时移交给 `HostStorage`；在这之前失败时由 Runner 关闭。
 - `ranges(unit)` 正好覆盖这个 Unit 在本进程里的字节，只在 `seal()` 之后（共享存储）或写入完成、页归还之后（私有存储、rank 分片）有效。
 
 阶段、所有权的转移和失败时的行为是规范性的。
@@ -167,8 +167,8 @@ class MemoryRange:
 7.  HWM.allocate()：为需要 Host 驻留的张量分配存储
 8.  Offloader.prepare_materialization()：在第一次写模型之前，
     拿齐所有占容量的运行期资源，返回启动事务（4.5 第 2 点）
-9.  Loader 写入：把参数绑定到已分配的存储，load_weights 从 checkpoint 读取器
-    逐个张量写；适配器在读取器里融合，在线量化逐层进行
+9.  Loader 写入：把参数绑定到已分配的存储，各来源的写入入口（5.3）从 checkpoint
+    读取器逐个张量写；适配器在读取器里融合，在线量化逐层进行
 10. Loader 收尾：核对写入，host 存储定稿，共享存储交接和只读绑定，调用 eval()（5.4）
 11. 启动事务 commit()：校验最终清单，内存登记，填写 fully_resident，装上钩子，
     资源整体移交 OffloadRuntime（4.5 第 3 点）
@@ -206,6 +206,7 @@ STRUCTURE_READY       结构建好
 0. **拓扑收集**：`init_distributed_environment` 之后、`plan()` 之前。各 rank 交出 `HWM.local_record()`，0 号 rank 另外交出部署标识（6.3）。所有 rank 得到同一份 `Topology`。
 1. **核对、选举、准入**：Loader 预检之后、`allocate()` 之前。
    - 各 rank 交出 Unit、内容身份、布局、Transport、规划的指纹。只核对参与集合通信的部分：AllGather 组里的 Unit、它们的内容身份和布局。`rank-local` 的 Unit 和只在本 rank 上声明的组件不参与核对（5.1）。
+   - AllGather 组由收集到的各 rank 组件内容身份确定（6.4）。本副本全部 rank，包括没有声明这个组件的 rank，按组件名排序、以相同顺序创建这些进程组。组里只剩一个 rank 时在这里报错。
    - `share_plan()` 在每个 rank 上算出相同的共享集合和代表。
    - 代表调用 `elect()`，参选结果再收集一次。
    - `admit()` 在每个 rank 上得出相同的结论；超出容量时所有 rank 同时报错。这时还没有分配 host 存储，也没有锁页。
@@ -231,7 +232,7 @@ pipeline 的构造函数里，每个带权重的部分声明一次。声明按�
 
 **完整性**。规划时，pipeline 下的每个参数和持久 buffer 都必须恰好属于一个组件，否则规划阶段报错并列出路径。只想常驻、不参与 offload 的部分显式声明为 `other`。同一个模块挂在两个属性上（别名）时，按模块身份去重。
 
-**按 rank 声明**。声明可以按 rank 不同，没有张量的组件视为不存在。例如 MAGI-2 只在输出 rank 上声明文本编码器和三个 codec，MiniMax H3 的文本编码器只在它自己的 TP 组里的 rank 上声明。
+**按 rank 声明**。声明可以按 rank 不同，没有张量的组件视为不存在。例如 MAGI-2 只在输出 rank 上声明文本编码器、图像 VAE 和音频解码器，TurboVAE 视频解码器在 `vae_patch_parallel_size` 大于 1 时每个 rank 都声明；MiniMax H3 的文本编码器只在它自己的 TP 组里的 rank 上声明。
 
 **带类型字段**。字段是一个封闭的集合，只描述模型是什么，不描述怎么 offload；是否 offload、用哪种方式，由策略决定（7.1）。每个字段都有一个通用的使用方，进入规划指纹，由期望表测试覆盖。新的需求要加新字段，经过设计评审，不开放任意键。
 
@@ -242,7 +243,7 @@ pipeline 的构造函数里，每个带权重的部分声明一次。声明按�
 | `shard_group` | TP、EP 以外切分这个组件权重的进程组 | 内容身份（5.5）、AllGather 分组（6.4） |
 | `fixed_adapters` | 模型自带的固定适配器：名字、来源、目标层、`apply`（`fuse` 或 `overlay`） | Loader（5.7） |
 
-MiniMax H3 的声明里用到全部四类：
+MiniMax H3 的声明里用到其中三类（`fixed_adapters` 的例子是 5.7 的 LTX2 相位适配器和 LongCat-Video-Avatar 的 DMD LoRA）：
 
 ```python
 text_encoder = Component(
@@ -269,12 +270,12 @@ Loader 在这个上下文里调用 pipeline 的构造函数：
 
 - 参数在 `register_parameter` 时转到 meta 设备上，与外层的 `torch.device` 上下文无关。参数的子类和 `weight_loader` 等属性保留。buffer 照常在 CPU 上创建。
 - 构造期间不做设备移动：`Module.to()`、`.cuda()` 对参数和 buffer 只应用类型和内存格式。
-- vLLM 风格的组件用配置构造函数。transformers 的类按 `create_transformers_model`（`vllm_omni/diffusion/models/utils.py`）的方式构造，上下文里跳过 `init_parameters`。diffusers 的类用 `from_config`。
+- vLLM 风格的组件用配置构造函数。transformers 的类按 `create_transformers_model`（`vllm_omni/diffusion/models/utils.py`）的方式构造，上下文里跳过 `init_parameters`；`create_transformers_model_with_vllm_linears` 同样跳过 `init_parameters_preserving_vllm_linear`。diffusers 的类用 `from_config`。
 - Hugging Face 组件经过 HF 组件入口（见下文“两个栈的构造代码”）：读配置，用 `from_config` 在 meta 上建结构，登记权重来源（路径、子目录、版本）和这个类的规则表。
-- 读取陷阱从进入构造上下文一直开到收尾结束，拦截张量数据的读取并报错：`get_tensor` 和切片取值、`load_file`、`torch.load`、传入真实张量的 `load_state_dict`、`from_single_file`、非 Hugging Face 类自定义的 `from_pretrained`。只读 safetensors 头部是允许的，有的模型靠头部推出结构。Loader 自己的 checkpoint 读取器不受影响。陷阱抛出异常时，同时把违例记在上下文里：即使模型代码用 `try/except` 吞掉了异常，构造或收尾结束时照样失败。
+- 读取陷阱从进入构造上下文一直开到收尾结束。构造期间拦截张量数据的读取并报错：`get_tensor` 和切片取值、`load_file`、`torch.load`、传入真实张量的 `load_state_dict`、`from_single_file`、非 Hugging Face 类自定义的 `from_pretrained`。写入和收尾期间只拦截文件读取：`get_tensor` 和切片取值、`load_file`、`torch.load`、`from_single_file`、非 Hugging Face 类自定义的 `from_pretrained`；写入入口对已绑定存储的模块调用 `load_state_dict` 属于写入，不拦截。只读 safetensors 头部是允许的，有的模型靠头部推出结构。Loader 自己的 checkpoint 读取器不受影响。陷阱抛出异常时，同时把违例记在上下文里：即使模型代码用 `try/except` 吞掉了异常，构造或收尾结束时照样失败。
 - 构造结束后执行 `empty_cache`。构造期间的分配不进睡眠模式的 `weights` 池，只有 Loader 分配的常驻存储进池。
 
-构造之后检查：所有参数都在 meta 上；参数、buffer 和模块属性里没有残留的 meta 张量，残留说明构造期间用权重数值做了计算。
+构造之后检查：所有参数都在 meta 上；除了经 `declare_weights` 登记了来源的非持久 buffer，buffer 和模块属性里没有 meta 张量。出现别的 meta 张量，说明构造期间用权重数值做了计算。
 
 **类型在只建结构时就定下来**。每个张量的最终类型先取构造出的参数类型（构造函数显式给的，或 stage 的类型），再按规则表覆盖。Loader 在规划之前把最终类型落到 meta 参数上，保留 `weight_loader` 等属性。规划、HWM 布局和预期清单看到的都是最终类型。
 
@@ -300,9 +301,9 @@ Loader 在这个上下文里调用 pipeline 的构造函数：
 
 **HSDP**。被 HSDP 管理的组件同样只建结构。物化时只为 meta 参数分配 CPU 存储，不用 `to_empty`，因为它会连 buffer 一起重新分配，清掉构造期间按配置算出的 RoPE 表等。之后照常 `load_weights` 并分片，不经过 HWM。
 
-**`load_format="diffusers"`** 按 `model_index.json` 声明组件：每个带权重的组件用 `from_config` 只建结构，由 Loader 写入，走同一条流程。diffusers 的 pipeline 对象只负责编排前向和去噪循环，不加载权重，也不调用 diffusers 自带的 offload。分词器、调度器和纯配置不经过 Loader。
+**`load_format="diffusers"`** 按 `model_index.json` 声明组件：每个带权重的组件用 `from_config` 只建结构，由 Loader 写入，走同一条流程。diffusers 的 pipeline 对象只负责编排前向和去噪循环，不加载权重，也不调用 diffusers 自带的 offload。分词器、调度器和纯配置不经过 Loader。`unified` 不调用 diffusers 适配器的 `load_weights()`，也不经过 `build_component`；`legacy` 下适配器在 `load_weights()` 里整条 `from_pretrained` 的代码不改。
 
-**`load_format="custom_pipeline"`** 与注册的 pipeline 规则相同。它的首次加载在 `re_init_pipeline` 里，`unified` 的整个启动流程（包括 4.5 的全组确认）都在其中运行。再次调用时，先 `close()` 并关闭本进程的 host 存储映射，再完整走一遍启动流程，所有 rank 一起调用。
+**`load_format="custom_pipeline"`** 与注册的 pipeline 规则相同。它的首次加载在 `re_init_pipeline` 里，`unified` 的整个启动流程（包括 4.5 的全组确认）都在其中运行。再次调用时，先 `close()` 并关闭本进程的 host 存储映射，再完整走一遍启动流程，包括 6.3 的选举，所有 rank 一起调用。
 
 **加载设备**。`unified` 下没有“加载设备”：每个参数的存储由规划决定（5.3）。
 
@@ -314,7 +315,8 @@ def build_component(*, legacy: Callable[[], T], unified: Callable[[], T]) -> T: 
 def declare_weights(module: nn.Module, *, sources, rules=None, writer=None) -> None: ...
 ```
 
-- 上下文外，`build_component` 只调用 `legacy()`；上下文里，只调用 `unified()`。分发和读取陷阱看同一个进程级状态。模型不读总开关。
+- `legacy` 下，`build_component` 只调用 `legacy()`。`unified` 下，构造上下文里只调用 `unified()`；Loader 关闭上下文之后再调用 `build_component`、`declare_weights` 或 HF 组件入口直接报错，写明调用位置。按需构造的组件在 `unified` 一支里于构造函数中建出。
+- 分发和读取陷阱看同一个进程级状态。除共存期必改清单里的分支（umbrella RFC Job 1，随 `legacy` 删除）以外，模型不读总开关。
 - `legacy` 是原来那几条语句原样移进的局部函数，参数、顺序和它调用的函数都不变。
 - `unified` 只用配置建结构，返回与 `legacy` 同一个类的实例，模块树相同。它对建出的每个带权重的模块调用一次 `declare_weights`，登记权重来源、规则表和写入入口。在上下文外调用 `declare_weights` 直接报错。
 - `unified` 调用 legacy 的路径解析、配置解析和校验函数，不复制它们；只有读张量、拼 state dict 的部分另写，放在家族目录下的 `unified_build.py`。需要时可以给原有的类加新方法，原有方法不改。
@@ -336,7 +338,7 @@ HF 组件有两个入口，内部走同一个分发：
 
 - offload 的查询函数报告“不做 offload”；
 - 构造期间的 `.to()` 只改类型和内存格式；
-- 模型自己的分阶段和驻留代码按共存期必改清单处理（9）。
+- 模型自己的分阶段和驻留代码按共存期必改清单处理（umbrella RFC Job 1）。
 
 共用的 `load_weights` 在 `unified` 下不改结构，由收尾第 4 步的存储绑定检查兜底。
 
@@ -367,17 +369,17 @@ Loader 按固定顺序做一次：
    - 带 `is_checkpoint_required` 的参数都已写到，量化方法声明可以缺少的张量放过；
    - 从写入开始到这一步，除了第 2 步声明要替换的参数，每个参数和持久 buffer 都仍然绑定在写入前分配的存储上，类型和形状不变。量化层按量化方法声明的输出张量核对。
 
-   这一步只在写入进程上做。瘦路径下，本 rank 范围之外的张量仍按名字经过 `load_weights`，写入是空操作，但记为已写。
+   这一步在每个 worker 上做，只核对本 worker 自己写入的张量；共享存储里的张量由写入进程核对。瘦路径下，本 rank 范围之外的张量仍按名字经过 `load_weights`，写入是空操作，但记为已写。
 5. 把第 2 步里被替换的参数拷进 host 存储，生成最终清单，host 存储定稿。
 6. 共享存储的交接和只读绑定（6.3）。
-7. 在每个 worker（包括等待者）上调用 pipeline 的 `eval()`。这是模型侧唯一的收尾入口：它只能读权重，可以建立不属于权重的运行期状态，例如派生缓存；不能改参数和持久 buffer。
+7. 在每个 worker（包括等待者）上调用 pipeline 的 `eval()`。这是模型侧唯一的收尾入口：它只能读权重，可以建立不属于权重的运行期状态，例如派生缓存；不能改参数和持久 buffer。分片后端 Unit 的权重在本 rank 上只有一段，`eval()` 不能读它们；需要这些权重的派生状态在第一次使用时建立。
 8. 交给启动事务 `commit()`。
 
 新栈不调用模型的任何加载后钩子：`post_load_weights`、`validate_loaded_weights`、`validate_restored_host_weights` 都不调用。模型在自己 `load_weights` 里做的检查照常运行。
 
 第 5 步之后字节不再变化。提交之后，基础权重的字节、布局、共用关系都不可变，由 7.3 的提交后守卫保证。融合进基础权重的适配器或量化方式要改变时，关闭运行时，重新走一次启动流程。动态 LoRA 不改基础权重，不受此限。
 
-同机共享时的等待者从共享内存直接绑定：第 1 步是绑定，不做第 2、4、5 步。
+同机共享时，等待者照常执行第 1 步的写入：写进共享存储的张量对它是空操作，其余张量（常驻加速卡的、私有内存的、rank 分片的）照常写，集合通信与写入进程的顺序相同。共享存储里的张量不做第 4、5 步，在第 6 步的 `seal()` 里接收只读文件描述符、核对并绑定。同机共享要求没有第 2 步的工作（6.3）。
 
 ### 5.5 内容身份与最终清单
 
@@ -389,7 +391,7 @@ Loader 按固定顺序做一次：
 - 会改变字节或形状的并行坐标：TP 的大小和编号；启用专家并行时加 EP 的大小和编号；组件声明了 `shard_group` 时加它的大小和编号；
 - 融合的适配器和固定适配器的标识：路径或仓库、版本、格式。
 
-它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址和文件路径，也不比较 checkpoint 或适配器文件的字节内容。
+它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址、文件路径和部署标识，也不比较 checkpoint 或适配器文件的字节内容。
 
 最终清单由 Loader 在收尾第 5 步生成，是同机共享时按名字绑定的唯一依据。
 
@@ -397,13 +399,13 @@ Loader 按固定顺序做一次：
 
 动态 LoRA 是叠加在基础权重之上的叠加层，不修改基础权重。它的结构在启动时定死，提交之后只拷数据。
 
-**启用**。启动配置给出 `max_lora_rank` 才启用动态 LoRA。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
+**启用**。启动配置给出 `max_lora_rank` 时启用动态 LoRA，槽位按它分配。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
 
 **包装在只建结构时完成**。
 
 - Loader 在只建结构阶段把目标层包成 LoRA 层。目标层由组件声明里的 DiT 和 pipeline 声明的 LoRA 组件决定。
 - 包装只改结构，不分配真实数据。
-- 包装后原来的参数路径多一级 `base_layer`。Loader 用一条通用规则把 `x.weight` 和 `x.base_layer.weight` 对应起来；checkpoint 映射、内容身份、最终清单都使用包装前的名字。是否启用动态 LoRA、加载了哪个 adapter，都不影响同机共享。
+- 包装后原来的参数路径多一级 `base_layer`。Loader 用一条通用规则把 `x.weight` 和 `x.base_layer.weight` 对应起来；checkpoint 映射、内容身份、最终清单都使用包装前的名字。是否启用动态 LoRA、加载了哪个动态适配器，都不影响同机共享。
 - 规划看到的是包装后的最终结构：包装层整体属于原来那一层所在的 Unit，钩子装在包装层上。
 
 **叠加层槽位**。
@@ -414,8 +416,8 @@ Loader 按固定顺序做一次：
 
 **运行期**。
 
-- `add_lora` 把 adapter 读进 CPU 缓存，条数由 `max_cpu_loras` 限定。CPU 缓存归动态 LoRA 管理器，不经过 HWM。
-- 激活一个 adapter 就是把它的 A/B 拷进槽位，rank 小于槽位时补零。rank 大于槽位的 adapter 被拒绝，报错提示调大配置。
+- `add_lora` 把动态适配器读进 CPU 缓存，条数由 `max_cpu_loras` 限定。CPU 缓存归动态 LoRA 管理器，不经过 HWM。
+- 激活一个动态适配器就是把它的 A/B 拷进槽位，rank 小于槽位时补零。rank 大于槽位的适配器被拒绝，报错提示调大配置。
 - 包装层的前向是 `base(x) + scale · B(A(x))`。基础权重在哪由 Offloader 决定，包装层不关心。
 - 动态 LoRA 管理器不读 offload 配置。动态 LoRA 可以叠在融合了适配器的基础权重上。
 
@@ -464,7 +466,7 @@ Loader 按固定顺序做一次：
 | 分片 H2D 后 AllGather | 分片后端 | 自己的 rank 分片 |
 | 不做 offload，常驻加速卡 | 不经过 HWM | 无 |
 
-`allocate()` 的 `layout` 来自 Offloader 的规划和 Loader 的预期清单：有哪些张量、各多大、属于哪个 Unit。`share_plan` 来自 4.5 第 1 点，说明本 worker 是写入进程、等待者，还是使用私有内存。
+`allocate()` 的 `layout` 来自 Offloader 的规划和 Loader 的预期清单：有哪些张量、各多大、属于哪个 Unit。`share_plan` 和 `elections` 来自 4.5 第 1 点：前者给出共享集合、代表和套接字名，后者说明本 worker 是写入进程、等待者，还是使用私有内存。
 
 ### 6.2 与并行方式的关系
 
@@ -485,7 +487,8 @@ Loader 按固定顺序做一次：
 - 部署标识相同；
 - 本机键相同，也就是在同一台机器的同一个容器里，并且是同一个系统用户；
 - 整套权重的内容身份和规划指纹相同；
-- 写入之前就能确定每个张量的最终形状和类型。
+- 写入之前就能确定每个张量的最终形状和类型；
+- 收尾第 2 步为空：没有需要整个模型参与、会改字节的收尾工作。
 
 不满足条件的 worker 使用进程私有内存，各自加载。不同部署的部署标识不同，即使权重完全相同也不共享、不互相连接。
 
@@ -495,7 +498,7 @@ Loader 按固定顺序做一次：
 - 本地副本：编排进程建好每个副本的 `OmniDiffusionConfig` 之后、启动这个副本的进程之前，写入 `od_config.deployment_id`。
 - headless 副本：`OmniMasterServer` 在注册回复里带上部署标识，headless 启动器在启动副本进程之前把它写进 `od_config`。运行期才注册的副本拿到同一个值。
 - `deployment_id` 是 `init=False` 的内部字段，不能从配置或命令行设置，不进内容身份。它随 `od_config` 到达每个 worker：子进程由 spawn 启动时序列化 `od_config`；Ray 执行器把它作为 `init_worker` 的参数；单进程执行器和 inline 时用的是同一个对象。
-- `od_config` 里没有部署标识时（整个 `StageRuntime` 只有一个扩散副本），0 号 rank 在 4.5 第 0 点随机生成一个只在本副本内有效的标识，共享只发生在本副本内。这时副本只有一个 worker 的话，使用进程私有内存。
+- `od_config` 不是由 `StageRuntime` 下发时（例如直接用 `OmniDiffusionConfig.from_kwargs` 构造配置的工具和测试），里面没有部署标识，0 号 rank 在 4.5 第 0 点随机生成一个只在本副本内有效的标识，共享只发生在本副本内。这时副本只有一个 worker 的话，使用进程私有内存。
 
 **本机键**。每个 worker 在 `local_record()` 里读取五项：
 
@@ -509,7 +512,7 @@ Loader 按固定顺序做一次：
 
 任何一项读不到时，这个 worker 不参与共享。挂载命名空间不在其中，文件描述符跨挂载命名空间也能用。用宿主网络的容器共用网络命名空间、彼此能看到抽象套接字，但内存 cgroup 和 PID 命名空间不同，算出的套接字名不同，不会交接。
 
-**规划指纹**只由配置和拓扑决定，不依赖每块卡当时的空闲显存。否则同一块卡上依次启动的副本会算出不同的规划，不再共享。
+**规划指纹**只由配置和并行布局决定，不依赖 `LocalRecord` 里的 pid 和本机可用内存，也不依赖每块卡当时的空闲显存。否则同一块卡上依次启动的副本会算出不同的规划，不再共享。
 
 **内存文件**。共享的存储是没有文件名的内存文件，由 `memfd_create`（`MFD_CLOEXEC | MFD_ALLOW_SEALING`）创建：
 
@@ -532,22 +535,22 @@ Loader 按固定顺序做一次：
 1. `share_plan()` 在副本内把属于同一个共享集合、又在同一台机器上的 rank 分成一组，rank 最小的是这组的代表。
 2. 代表调用 `elect()`：创建一个 `AF_UNIX`、`SOCK_SEQPACKET`、带 `SOCK_CLOEXEC` 的套接字，绑定这个名字。绑定是原子的：
    - **绑定成功**：代表就是这个部署在这台机器上这个共享集合的写入进程，立即开始监听。本组其余 rank 是等待者。
-   - **名字已被占用**：写入进程在别的副本里。代表连接它，问到它是否已封存、还有多少字节没写入。本组全部 rank 都是等待者。连接被拒绝时短暂重试；名字在重试时空出，就重新参选。
+   - **名字已被占用**：写入进程在别的副本里。代表连接它，用 `SO_PEERCRED` 核对对方的 uid 等于自己的有效 uid，再问到它是否已封存、还有多少字节没写入。本组全部 rank 都是等待者。uid 不一致时按“其他错误”处理。连接被拒绝时短暂重试；名字在重试时空出，就重新参选。
    - **其他错误**：本组不共享，使用私有内存。
 3. 参选结果在副本的进程组里收集一次（4.5 第 1 点），每个 rank 由此知道自己的角色。启动日志写明角色、写入进程的 pid 和套接字名。
 
 **交接**。
 
-1. 写入进程在 `allocate()` 里创建内存文件，以可写方式映射。
+1. 写入进程在 `allocate()` 里创建内存文件，以可写方式映射，并对可写映射调用 `madvise(MADV_DONTFORK)`。
 2. 写入进程的监听线程从选举成功一直运行到它的 `HostStorage.close()`。每个连接先校验，没通过的直接关闭、不计数：`SO_PEERCRED` 拿到的 uid 等于自己的有效 uid；对方发来的协议版本、部署标识、共享指纹、预期清单摘要都与自己的一致。
 3. 4.5 第 2 点之后，其余等待者连接写入进程，代表沿用选举时的连接。写入进程还没封存时，连接一直保持到封存；已经封存时，立即交出文件描述符。
 4. **写入**：所有 rank 执行同一遍写入，张量顺序和集合通信与写入进程相同。写进共享存储的张量对等待者是空操作。常驻加速卡的部分、不经过 HWM 的组件，各自照常写。
-5. **定稿**：写入进程在 `seal()` 里撤掉可写映射，给内存文件加上封存：不许写、不许加长、不许缩短、不许再改封存。此后任何进程都不能修改它。
-6. **交出**：写入进程经 `/proc/self/fd/N` 以只读方式重新打开内存文件，用 `socket.send_fds` 把只读的文件描述符和最终清单摘要发给每个已连接的等待者。之后才连上来的等待者立即拿到。一条消息放不下全部文件描述符时分多条发。
-7. **绑定**：所有 worker，包括写入进程，都用只读文件描述符建 `MAP_SHARED`、`PROT_READ` 映射，由 HWM 解析 safetensors 头部、按名字逐个绑定，走同一段代码。等待者绑定前核对封存位、文件大小和清单摘要。
+5. **定稿**：写入进程在 `seal()` 里经 `/proc/self/fd/N` 以只读方式重新打开内存文件，用这个只读文件描述符建 `MAP_SHARED`、`PROT_READ` 映射，由 HWM 解析 safetensors 头部，按最终清单把全部张量（包括共用存储的别名）重新绑定到只读映射上，然后撤掉可写映射；还有张量引用可写映射时启动失败。之后给内存文件加上封存：不许写、不许加长、不许缩短、不许再改封存。加封存失败时启动失败。此后任何进程都不能修改它。
+6. **交出**：写入进程用 `socket.send_fds` 把只读的文件描述符和最终清单摘要发给每个已连接的等待者。之后才连上来的等待者立即拿到。一条消息放不下全部文件描述符时分多条发。
+7. **绑定**：等待者用 `SO_PEERCRED` 和 `fstat` 核对对方和文件的 uid 等于自己的有效 uid，再核对封存位、文件大小和清单摘要，然后用只读文件描述符建 `MAP_SHARED`、`PROT_READ` 映射，按名字逐个绑定，与写入进程第 5 步走同一段代码。
 8. 等待者映射之后关闭文件描述符。写入进程保留只读文件描述符和监听套接字，直到 `close()`。
 
-**只读映射**。这种映射不是写时复制映射：长期只读的内存登记直接锁住共享页，不产生副本；任何对共享权重的写入都会触发段错误。只用只读文件描述符，也让“封存后不能建立可写共享映射”在所有内核版本上一致。
+**只读映射**。这种映射不是写时复制映射：长期只读的内存登记直接锁住共享页，不产生副本；任何对共享权重的写入都会触发段错误。所有映射都用只读打开的文件描述符建立：在 6.7 之前的内核上，对加了 `F_SEAL_WRITE` 的内存文件，用可写打开的描述符建 `MAP_SHARED` 映射，即使只读也会被拒绝。
 
 **顺序**。`seal()` 之前，本副本收尾里的集合通信全部完成，`seal()` 里不做集合通信。写入进程封存并交出之前不等待任何套接字；等待者到 `seal()` 里才阻塞接收。因此副本之间的等待不会和副本内的集合通信互相卡住；几个副本互为对方某个共享集合的等待者时，也不会死锁。
 
@@ -561,10 +564,11 @@ Loader 按固定顺序做一次：
 |---|---|
 | 写入进程在封存之前退出或报错 | 已连接的等待者在连接上收到结束信号，所在副本启动失败。报错给出写入进程的 pid 和它所在的 stage |
 | 写入进程在封存之后退出 | 已绑定的 worker 不受影响。之后加入的 worker 重新选举 |
+| 写入进程在封存之后、本组等待者都拿到文件描述符之前退出 | 已经收到文件描述符的等待者照常绑定；还没收到的等待者所在副本启动失败，不在启动中途改变角色 |
 | 等待者失败 | 写入进程只关闭这个连接，继续构建和监听。副本内的失败由 4.5 和执行器的进程监控处理 |
 | 写入进程停住不动 | 等待者一直等到 stage 的启动超时 |
 
-本地扩散副本依次启动，第一个副本的代表是写入进程，封存前的失败本来就让整个部署启动失败。只有 head 的本地副本和同机的 headless 副本、或两个 headless 启动器并发启动时，封存前的失败才会传到另一个启动单元。
+本地扩散副本依次启动，第一个副本的代表是写入进程，它在封存前失败时整个部署启动失败。只有 head 的本地副本和同机的 headless 副本、或两个 headless 启动器并发启动时，一个启动单元里写入进程在封存前的失败才会让另一个启动单元启动失败。
 
 **执行器与部署形态**。
 
@@ -578,7 +582,7 @@ Loader 按固定顺序做一次：
 
 **布局**。每个重复块的全部字节按类型分组拉平，按 rank 等分成 N 段，不足的部分补零；rank r 持有第 r 段。运行期每个 rank 把自己那段 H2D，再用 `all_gather_into_tensor` 拼成完整的块。
 
-**分组**。AllGather 组按组件确定：一个 stage 副本里这个组件内容身份相同的全部 rank。TP 编号相同的 DP、SP、CFG 并行 rank 都在同一组，TP 为 1、没有 `shard_group` 时就是整个副本。组件声明了 `shard_group` 时，组内的 rank 还要在切分组里编号相同；组里只剩一个 rank 时规划阶段报错。一个组可以跨多台机器，每台机器持有“本机 rank 数 / N”的权重。内存大的机器放更多的 rank。
+**分组**。AllGather 组按组件确定：一个 stage 副本里这个组件内容身份相同的全部 rank。TP 编号相同的 DP、SP、CFG 并行 rank 都在同一组，TP 为 1、没有 `shard_group` 时就是整个副本。组件声明了 `shard_group` 时，组内的 rank 还要在切分组里编号相同。组的成员和创建方式见 4.5 第 1 点；组里只剩一个 rank 时在那里报错。一个组可以跨多台机器，每台机器持有“本机 rank 数 / N”的权重。内存大的机器放更多的 rank。
 
 **存储**。每个 rank 的分片是它自己的私有内存，用匿名 mmap 分配。
 
@@ -619,7 +623,7 @@ Loader 按固定顺序做一次：
 - 单进程执行器把 worker 放在编排进程里时，私有内存、共享映射、监听套接字、内存登记、加速卡资源都由 `close()` 释放，不靠进程退出。
 - 一个 worker 退出时，它所在副本的全部 worker 一起终止，多进程执行器和 Ray 执行器都是这样。其他副本照常服务。
 - 服务重启后，每个副本从 checkpoint 构建，部署标识重新生成。
-- fork：内存文件用 `MFD_CLOEXEC` 创建，监听套接字带 `SOCK_CLOEXEC`；共享映射建立后调用 `madvise(MADV_DONTFORK)`；HWM 用 `os.register_at_fork(after_in_child=...)` 在子进程里关闭继承来的文件描述符和监听套接字。worker 之后产生的 Python 子进程因此不会延长共享内存的寿命，也不会占住套接字名。
+- fork：内存文件用 `MFD_CLOEXEC` 创建，监听套接字带 `SOCK_CLOEXEC`；写入期间的可写映射和之后的只读映射建立后都调用 `madvise(MADV_DONTFORK)`；HWM 用 `os.register_at_fork(after_in_child=...)` 在子进程里关闭继承来的内存文件描述符、监听套接字和已接受的等待者连接。worker 之后产生的 Python 子进程因此不会延长共享内存的寿命，也不会占住套接字名。
 
 ---
 
@@ -662,7 +666,7 @@ offload 策略 = Unit + Trigger + Transport
 
 **重复块发现**是规划里的纯函数，只看模块树，不读任何模型属性：
 
-- **候选列表**：`nn.ModuleList`（含子类），带基础权重的元素至少 2 个，Python 类型相同，并且这个类型自己定义了 `forward`。不带权重的元素不参与判断。`ModuleDict`、`ModuleList`、`ParameterList` 这类容器不能成为 Unit，它们的元素从不经过 `__call__`，钩子永远不会触发。
+- **候选列表**：`nn.ModuleList`（含子类），带基础权重的元素至少 2 个，Python 类型相同，并且这个类型自己定义了 `forward`。不带权重的元素不参与判断。`ModuleDict`、`ModuleList`、`ParameterList` 这类容器本身不能成为 Unit：容器自己从不经过 `__call__`，装在容器上的钩子永远不会触发。
 - **合格**：组件里所有候选元素的最大值记为 B，属于另一个组件的子树不计入。候选列表的最大元素不小于 B/4 就合格。元素大小按本 rank 的最终字节数计算，已计入 TP 切分和量化，与块环、HWM 布局用同一个估算。
 - **最外层**：从组件根按注册顺序往下走，遇到合格列表就记为一组，不再进入它的元素。其他模块继续往下，包括自定义的可迭代模块。属于另一个组件的子树不进入。
 - 每组里每个带权重的元素是一个 Unit。
@@ -682,11 +686,12 @@ offload 策略 = Unit + Trigger + Transport
 
 **块环**。
 
-- 每个 worker 一块缓冲区，所有流式 Unit 共用，大小是最大的两个流式 Unit 之和。相邻的两个 Unit 一个放在开头，一个放在末尾。
-- 后继表：每个 Unit 的后继初始为组件内注册顺序的下一个，最后一个接回第一个。进入一个 Unit 时预取它的后继。
-- 预测错时（缓存跳块、切换 DiT 等），进入的 Unit 不在缓冲区里就同步装入，并把上一个 Unit 的后继改成它。
+- 块环按 Transport 分成两个：`rank-local` 的流式 Unit 和 `allgather` 的流式 Unit 各用一块缓冲区、一张后继表，互不读写。没有某一类 Unit 时不分配那一块。
+- 每块缓冲区的大小是这一类里最大的两个流式 Unit 的占用之和。占用按装入后的实际布局计算：`allgather` 的 Unit 按补零后的 N × 分片大小，每个张量按类型对齐，整个 Unit 向上取整到 256 字节。相邻的两个 Unit 一个放在开头，一个放在末尾。
+- 后继表：每个 Unit 的后继初始为组件内注册顺序的下一个。`rank-local` 表里最后一个接回第一个；`allgather` 表里最后一个没有后继。进入一个 Unit 时预取它的后继。
+- 预测错时（缓存跳块、切换 DiT 等），进入的 Unit 不在缓冲区里就同步装入，并把同一张表里上一个 Unit 的后继改成它。
 - 一个流式 Unit 的前向还没结束又进入另一个流式 Unit 时，直接报错。
-- `allgather` 的 Unit 不跨前向保留：每次前向的第一个块在进入时拼接，之后按后继表预取。是否拼接只取决于各 rank 相同的进入顺序，本 rank 的 `rank-local` Unit 覆盖了缓冲区也不会打乱集合通信。每次拼接带上 Unit 编号，在加速卡上断言。
+- `allgather` 的 Unit 不跨前向保留：每次前向的第一个块在进入时拼接，之后按后继表预取。`allgather` 的后继表只按 `allgather` Unit 的进入顺序更新，所以是否拼接只取决于各 rank 相同的进入顺序。每次拼接带上 Unit 编号，在加速卡上断言。
 - 编译边界只包住块的计算，不包住钩子。
 
 **钩子的位置**。
@@ -723,13 +728,13 @@ offload 策略 = Unit + Trigger + Transport
 
 **内存登记**。
 
-- 输入是 `HostStorage.ranges(unit)` 给出的 `MemoryRange`。Offloader 只依赖这个接口。区间按映射向外对齐到页、合并之后再登记。
+- 输入是 `HostStorage.ranges(unit)` 给出的 `MemoryRange`，Offloader 只依赖这个接口。同一个映射里所有决定登记的 Unit，区间先向外对齐到页，再合并成互不重叠的区间逐个登记；一个合并区间登记失败时，落在它里面的 Unit 都改走暂存区。撤销登记按合并区间进行。
 - `read_only` 为真（共享存储）时做只读登记，为假（私有存储、rank 分片）时做普通登记。
 - 登记后用平台接口确认这段内存被认作锁页，确认不了就当作登记失败，否则异步拷贝会悄悄退化成同步。
 - 平台层提供 `host_registration_support() -> (writable, read_only)`。CUDA 查询设备属性，其他平台返回不支持，这些平台的 Unit 走暂存区。
 - 时机：`prepare_materialization()` 查询平台能力，在上限内逐个 Unit 决定登记还是走暂存区。`commit()` 时登记：共享存储在封存并只读绑定之后，私有存储和分片在写入、页归还之后；登记后做锁页确认。某个 Unit 登记失败时改走暂存区并记警告。
 - 上限按每个 worker 计算，统计对齐、合并之后的字节数。超出时按流式块、常驻层组、整组件 Unit 的顺序登记，其余走暂存区。一个 Unit 要么整个登记，要么整个走暂存区，结果写进启动日志。
-- 暂存区（2 × 256 MiB）计入 Host 容量准入，只有存在走暂存区的 Unit 时才分配。暂存区分配失败，或撤销登记失败时，提交失败。
+- 暂存区（2 × 256 MiB）：本 worker 有 Host 驻留的 Unit 时，Host 容量准入总是计入它；计划里有走暂存区的 Unit 时由 `prepare_materialization()` 分配；`commit()` 里登记失败、暂存区还没分配时，在这时分配。暂存区分配失败，或撤销登记失败时，提交失败。
 
 ### 7.5 资源、单次执行与关闭
 
@@ -741,10 +746,17 @@ offload 策略 = Unit + Trigger + Transport
 `prepare_materialization()` 还拿齐：内存登记的计划、需要时的暂存区、流、事件、集合通信的工作区；并做加速卡的容量准入：
 
 ```text
-常驻部分 + 叠加层槽位 + 最大的整组件 Unit 或常驻层组 + 块环缓冲区 + 分片槽位 ≤ 可用显存
+常驻部分 + 叠加层槽位 + 块环缓冲区 + 分片槽位
+  + max(写入期间的瞬时占用, 服务期间同时驻留的使用触发 Unit)
+  ≤ 可用显存
 ```
 
+- 写入期间的瞬时占用：最大的单个适配器 Δ；在线量化时，一层量化前的数据。
+- 服务期间同时驻留的使用触发 Unit：按 7.3 的让出关系，取两者中较大的：最大的一个 `dit` 组件的使用触发 Unit 之和；全部被选中的编码器组件的使用触发 Unit 之和，加上最大的一个被选中 `vae` 的使用触发 Unit 之和。使用触发 Unit 指整组件 Unit、常驻层组，以及 layer 组件里重复块以外的使用触发 Unit。
+
 装入时显存不足，按下面的异常规则处理。提交时叠加层槽位交给动态 LoRA 管理器，其余交给 `OffloadRuntime`。每个 rank 的显存峰值是上式左边加上正在使用的激活。
+
+`OffloadRuntime` 提供前向使用的梯度模式：有块环 Unit 时是 `no_grad`，否则是 `inference_mode`。runner 不读 offload 策略；HSDP 下 runner 照旧用 `no_grad`。
 
 一个 `OffloadRuntime` 同一时刻只允许一次前向，可以是一个请求批次；重入或并发的前向被拒绝。出异常时先等拷贝和集合通信做完再回到空闲。集合通信的顺序不再可信时，运行时标记为不可用。
 
@@ -790,13 +802,20 @@ offload 策略 = Unit + Trigger + Transport
 | 模型自己搬运组件、自己维护锁页副本、自己在使用前后装卸 | 组件声明加使用触发（5.1、7.3） |
 | 按 offload 策略关掉快路径或改变结构 | 结构和字节只由模型配置和并行方式决定，不随 offload 策略变化 |
 | 模型自带的权重 offload（MiniMax H3 的 AdaLN 投影） | 组件声明的 `unit_groups`，策略的 `units` 按名字选择 |
-| 按 offload 组合拒绝 | 现有后端的限制随新栈消失；集合通信顺序、容量、内容身份由通用规则表达（6.4、8.5）；只是没验证过的组合写进支持矩阵 |
+| 按 offload 组合拒绝 | 现有后端的限制随新栈消失；集合通信顺序、容量、内容身份由通用规则表达（6.4、8.5）；没有正确性问题、只是还没验证的组合不报错，写进支持矩阵 |
 | offload 专用声明（`_layerwise_offload_blocks_attrs`、`OffloadPlan`、常驻路径） | 组件声明、重复块发现、`repeated_blocks`、`unit_groups` |
 | 模型自己的 CUDA graph 按名字读钩子决定能否捕获 | `fully_resident`（7.8） |
 
-不属于 offload 机制、但在新栈下要改的模型代码有三类：构造期间读张量（5.2）、自己捕获 CUDA graph 或选择 cudagraph 编译模式（7.8）、在 `.to()` 之外改参数类型（7.3）。
+不属于 offload 机制、但在新栈下要改的模型代码主要有以下几类，逐项清单是共存期必改清单（umbrella RFC Job 1）：
 
-依赖规则由静态测试保证：`models/`、`lora/`、`cache/` 不 import Offloader，也不按字符串名读 offload 钩子。
+- 构造期间读张量（5.2）；
+- 加载后改绑参数存储（5.3）；
+- 用参数的设备判断执行设备；
+- 以存储地址或设备为键的缓存（7.8）；
+- 自己捕获 CUDA graph 或选择 cudagraph 编译模式（7.8）：AuK、SenseNova-U1、OmniVoice、Qwen-Image-2.1 改为经通用函数读 `fully_resident`；Ming-Image、DreamZero、InternVLA-A1 的 cudagraph 编译模式改走通用的编译函数；
+- 在 `.to()` 之外改参数类型（7.3）。
+
+依赖规则由静态测试保证：`models/`、`lora/`、`cache/` 不 import Offloader，也不按字符串名读 offload 钩子。共存期间，现有的 28 个模型文件和 `lora/manager.py` 对 `vllm_omni.diffusion.offloader` 的 import、SeaCache 按字符串名读钩子，列入冻结的白名单；删除 `legacy` 时清空。
 
 ### 7.8 CUDA graph 与编译
 
@@ -884,17 +903,17 @@ offload 策略 = Unit + Trigger + Transport
 
 | 旧开关 | 翻译 |
 |---|---|
-| `--enable-cpu-offload` | `module`，选中现有实现发现的全部 DiT 和编码器 |
+| `--enable-cpu-offload` | `module`，选中现有实现发现的全部 DiT 和编码器，编码器名单里属于 `vae` 角色的除外 |
 | `--enable-layerwise-offload` | `dit` 用 `layer`、`rank-local`；有重复块的 `text_encoder` 也用 `layer`、`rank-local` |
 | `--enable-distributed-layerwise-offload` | `dit` 用 `layer`、`allgather`；有重复块的 `text_encoder` 用 `layer`、`rank-local` |
 | `--dlo-no-use-allgather` | `dit` 用 `rank-local` |
-| `--dlo-resident-layers` | 与 `--enable-distributed-layerwise-offload` 同时出现时，翻译成 `dit` 的 `resident_layers` |
+| `--dlo-resident-layers` | 与 `--enable-distributed-layerwise-offload` 同时出现、并且现有实现为这个模型声明了常驻路径（MiniMax H3、Kandinsky6）时，翻译成 `dit` 的 `resident_layers`；其他模型忽略并记一次警告，与现有行为一致 |
 | `--diffusion-offload-config` / `diffusion_offload_config` | `mode` 照搬；`components` 列表里的角色按 `mode` 选中；`layer_options` 里每个组件的 `weight_transfer`、`resident_layers` 照搬；`pin_memory` 翻成 `pin_cpu_memory` |
 
 - 没有重复块的编码器不做 offload，与现有行为一致。
-- 现有实现的编码器名单里的名字，在组件声明里按用途给角色：`mllm`、`connectors` 是 `text_encoder`；`vision_model`、`gen_image_condition_refiner`、`conditioning` 是 `image_encoder`。
+- 现有实现的编码器名单里的名字，在组件声明里按用途给角色：`mllm`、`connectors` 是 `text_encoder`；`vision_model`、`gen_image_condition_refiner`、`conditioning` 是 `image_encoder`；JoyImage 名单里的 `vae` 是 `vae`。
 - 旧开关从不选 `vae`。翻译测试对每个 pipeline 断言：翻译后选中的组件等于现有实现发现的 DiT 和编码器，`vae` 角色的组件除外。
-- MiniMax H3、Wan2.2-S2V、MAGI-2、JoyImage、LingBot-Video 的现有代码自己在 VAE 使用前后挪走 DiT 或常驻层，翻译后的显存峰值高于现有实现。翻译测试对这五个模型豁免并写明原因；它们的 recipe 使用选中 `vae` 的自定义配置；用旧开关启动这些模型时，启动日志提示改用自定义配置。LingBot-Video 的请求参数 `offload_vae_during_denoise` 在 `unified` 下忽略并记一次警告。
+- MiniMax H3、Wan2.2-S2V、MAGI-2、JoyImage 的现有代码自己在 VAE 使用前后挪走 DiT 或常驻层；LingBot-Video 按请求参数 `offload_vae_during_denoise` 在去噪期间把 VAE 挪到 CPU。这五个模型在 `unified` 下不选 `vae` 时，显存峰值高于现有实现。翻译测试对这五个模型豁免并写明原因；它们的 recipe 使用选中 `vae` 的自定义配置；用旧开关启动这些模型时，启动日志提示改用自定义配置。`offload_vae_during_denoise` 在 `unified` 下忽略并记一次警告。
 
 `unified` 下以下旧设置报错，并给出迁移提示：
 
@@ -911,7 +930,7 @@ offload 策略 = Unit + Trigger + Transport
 
 ### 8.5 不支持的组合
 
-`unified` 下，以下组合在参数解析或规划阶段报错，并说明原因：
+`unified` 下，以下组合报错，并说明原因：
 
 | 组合 | 报错阶段 |
 |---|---|
@@ -919,17 +938,18 @@ offload 策略 = Unit + Trigger + Transport
 | 自定义配置选择 `other` 角色 | 参数解析 |
 | 旧的登记上限、Host Weight Runtime 参数、`pin_memory` 冲突（8.4） | 参数解析 |
 | DP 或 CFG 并行大于 1 且使用 `allgather` 时启用缓存加速 | 参数解析 |
-| 缓存后端不在 SP 组上同步跳块的决定（Cache-DiT 在确认之前按不同步处理），且启用了块环 | 参数解析 |
+| 缓存后端不在 SP 组上同步跳块的决定（Cache-DiT 按不同步处理），且使用 `allgather` | 参数解析 |
 | DP 大于 1 且文本编码器使用 `allgather` 时启用 prompt embedding 缓存 | 参数解析 |
 | HSDP 预分片配 LoRA 或量化 | 参数解析 |
 | 被 HSDP 管理的组件被选中做 offload | 规划 |
 | 选中按 `layer` 处理的组件找不到重复块；`units` 的名字不存在 | 规划 |
-| 分片后端下，重复块以外的组件单机放不下；`shard_group` 的组里只剩一个 rank | 规划 |
+| 分片后端下，重复块以外的组件单机放不下 | 规划 |
+| AllGather 组里只剩一个 rank | 全组确认 |
 | 有张量不属于任何组件 | 规划 |
 | 融合适配器的键在已加载的组件上对不上；融合时 `lora_scale` 不等于 1；对已量化的 checkpoint 融合 | Loader 预检 |
 | pipeline 还没有迁移到只建结构（5.2） | 构造 |
 
-环境变量 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` 在构建配置时折进配置并冻结，worker 不再读它，组合检查只在参数解析时做一次。
+环境变量 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` 在构建配置时折进配置并冻结，worker 不读它，组合检查只在参数解析时做一次。
 
 ### 8.6 校验分层
 
@@ -939,7 +959,7 @@ offload 策略 = Unit + Trigger + Transport
 | 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量 |
 | Offloader 规划 | 组件完整、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
 | Loader 预检 | 来源可读、内容身份、冷启动路径、适配器的键 |
-| 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、单机 Host 容量 |
+| 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、AllGather 组的成员、单机 Host 容量 |
 | `prepare_materialization()` | 加速卡和 Host 的运行期资源准入、内存登记或暂存区的计划、多 rank 的全组确认 |
 
 每一层都在自己那一步的第一次不可逆修改之前完成。
@@ -958,10 +978,10 @@ offload 策略 = Unit + Trigger + Transport
 ## 9. 上线方式
 
 1. 新栈作为一套独立的代码加入主干，与现有的三个后端、现有加载路径并存。总开关默认是 `legacy`。
-2. 并存期间，`legacy` 的行为不变。`unified` 下，`offloader/config.py` 里供模型查询的函数一律报告“不做 offload”，模型里读这些函数的分支自动不生效。少数在 `unified` 下会弄坏被管理权重的模型代码列在共存期必改清单里（umbrella RFC Job 1），改成直接判断总开关，随 `legacy` 一起删除。提交后的守卫让漏掉的地方在第一次使用时报错，不会静默出错。
+2. 并存期间，`legacy` 的行为不变。`unified` 下，`offloader/config.py` 里供模型查询的函数一律报告“不做 offload”，模型里读这些函数的分支自动不生效。少数在 `unified` 下会弄坏被管理权重的模型代码列在共存期必改清单里（umbrella RFC Job 1），按清单逐项改：每一项只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变；按总开关或构造上下文分出的 legacy 一支随 `legacy` 一起删除。提交后的守卫让漏掉的地方在第一次使用时报错，不会静默出错。
 3. 上线门槛：现有每个有端到端测试或每晚例行测试的“模型 × offload 策略”组合，在 `unified` 下输出一致，Host 和加速卡的内存峰值不高于 `legacy`。
-   - 对比基准：现有实现里结构或类型随 offload 变化的组合（Flux2-Klein TP 大于 1 配 offload、DreamZero 的 VAE 类型），以 `legacy` 不做 offload 的输出为基准。按空闲显存选择分块大小的 VAE，对比时固定分块。
-   - 不在门槛之内、写进迁移说明的组合：被 HSDP 管理的组件做 offload；MiniMax H3 在 SM120 上不加参数的 AdaLN offload（`unified` 下由 recipe 写明 `units`）；Qwen-Image-2.1 配 `--enable-cpu-offload` 时的 decode graph（`unified` 下 DiT 真正 offload，decode 走 eager，显存更低、decode 更慢）；8.4 列出的五个模型用旧开关时的显存峰值；同一台机器上的两个部署跑同一个模型时的 Host 占用（`legacy` 的 `rank-local` 逐层 offload 直接映射 checkpoint，页缓存跨部署共用；`unified` 下不同部署各占一份）。
+   - 对比基准：现有实现里结构或类型随 offload 变化的组合（Flux2-Klein TP 大于 1 配 offload、DreamZero 的 VAE 类型），以 `legacy` 不做 offload 的输出为基准。按空闲显存选择分块大小的 VAE，对比时固定分块。融合适配器的组合逐张量对比融合结果；`legacy` 下结果本来就不对的组合（蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1）以“完整加载、融合、再量化”的参考结果为基准。
+   - 不在门槛之内、写进迁移说明的组合：被 HSDP 管理的组件做 offload；MiniMax H3 在 SM120 上不加参数的 AdaLN offload（`unified` 下由 recipe 写明 `units`）；Qwen-Image-2.1 配 `--enable-cpu-offload` 时解码的 CUDA graph（`unified` 下 DiT 按整组件 offload，解码走 eager：显存更低，解码更慢）；8.4 列出的五个模型用旧开关时的显存峰值；适配器的键在已加载的组件上对不上、或融合时 `lora_scale` 不等于 1 的部署（`unified` 在预检报错），以及 `legacy` 静默丢掉增量、`unified` 融合进去的适配器；同一台机器上的两个部署跑同一个模型时的 Host 占用（`legacy` 的分布式逐层后端配 `--dlo-no-use-allgather` 时直接映射 checkpoint，页缓存跨部署共用；`unified` 下不同部署各占一份）。
 4. 门槛全部达到，并且满足下面三条之后，默认值翻转为 `unified`：
    - 主干里注册的每个 pipeline 都能在只建结构的上下文里构造，支持矩阵里没有 `unified` 不支持的 pipeline；
    - 每个迁移家族的逐张量对比测试通过，对比例外表里的每一条都已列入门槛例外；
@@ -1001,14 +1021,15 @@ offload 策略 = Unit + Trigger + Transport
 - `_maybe_fuse_distilled_lora`、pipeline 上会融合权重的 `load_lora_weights`、worker 里的第二个蒸馏 LoRA 融合点，以及 LoRA 管理器里读 offload 策略的代码；
 - 每个 `build_component` 调用的 legacy 一支；调用改成直接调用 unified 一支，`build_component` 本身删除；
 - 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 generator、decoder 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留；`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删；
-- HF 组件入口里加载带权重组件的 legacy 一支，以及 `create_transformers_model` 里的 `init_parameters`；
+- HF 组件入口里加载带权重组件的 legacy 一支，以及 `create_transformers_model` 里的 `init_parameters`、`create_transformers_model_with_vllm_linears` 里的 `init_parameters_preserving_vllm_linear`；
 - 只服务于 legacy 的 `load_weights` 主体：自己读文件的、空操作的、替没有写入的组件声明“已加载”的；
+- 规则表取代的运行期改类型代码：LingBot-Video 和 InternVLA-A1 的 `.to()` 覆写、π0.5 的 `_set_inference_dtype`、LTX2 vocoder 的 `.float()` 往返；LTX2 在 `eval()` 里物化相位适配器的代码；MiniMax H3 pipeline 对 FastH3、VDN 的流包装；SeaCache 读分布式逐层 offload 钩子的代码；
 - 指纹清单和指纹测试。
 
 删除前的保证：
 
-- 每个现有的块声明都有一个测试，证明自动发现或 `repeated_blocks` 的结果与它一致，期望表写明多出或缺少的原因。
-- 只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类先补进 `_repeated_blocks`：`FluxSingleTransformerBlock`、`VaceWanTransformerBlock`、`MotionerAttentionBlock`、`MiniMaxH3TokenRefinerBlock`。一个测试对比删除前后被编译的模块集合。
+- 每个注册的扩散 pipeline 按测试覆盖的并行拓扑和量化配置分别在 meta 上构造，断言：现有声明里的块全部被发现；发现的组与期望表逐项一致，期望表写明多出或缺少的原因；容器本身不成为 Unit。用了 `repeated_blocks` 的组件同时记录自动发现的结果和覆盖的原因。每个模型另做一次 `layer` 冒烟测试。
+- 只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类先补进 `_repeated_blocks`：`FluxSingleTransformerBlock`、`VaceWanTransformerBlock`、`MotionerAttentionBlock`、`MiniMaxH3TokenRefinerBlock`、`BooguImageDoubleStreamTransformerBlock`，以及 SDXL 的 `SDXLDownBlock2D`、`SDXLCrossAttnDownBlock2D`、`SDXLUpBlock2D`、`SDXLCrossAttnUpBlock2D`。一个测试对比删除前后被编译的模块集合。
 - MAGI-2 的内存窗口由 recipe 里的配置给出：`dit` 选 `module`、`rank-local`。
 - 逐张量对比测试的 legacy 结果已存成逐张量的哈希（第 6 步）。
 
@@ -1047,14 +1068,16 @@ offload 策略 = Unit + Trigger + Transport
   = 本副本担任写入进程的共享集合，各一份 W
   + 本副本使用私有内存的 worker，各一份 W
   + 本副本在这台机器上的 rank 分片
+  + 这些 rank 分片的冷启动额外占用（瘦路径：释放阈值 + 最大的单个张量；先全量后裁剪：一份 W）
   + 暂存区
-  + 写入进程的瞬时占用
+  + 写入进程和使用私有内存的 worker 各自的瞬时占用
 
 可用内存
-  = 代表参选时读到的值：内存 cgroup 有限额时为“限额 − 已用 + 可回收的文件页”，
-    没有限额时为 MemAvailable；同一台机器上取各代表读到的最小值
+  = 同一台机器上，各 rank 在 local_record() 里读到的值、各代表参选时读到的值中的最小值
   − 写入进程在别处、还没写完的共享集合尚未写入的字节
 ```
+
+每次读到的值：从本进程所在的内存 cgroup 到可见的最上层，逐级计算 `memory.max − memory.current + inactive_file + active_file`，取最小值。文件页取 `memory.stat` 的 `inactive_file`、`active_file`，不用 `file`，后者含内存文件和 tmpfs 的页。各级都没有限额时为 MemAvailable。
 
 写入进程在别处的共享集合不计 W。新增占用超过可用内存时，本副本所有 rank 同时报错。同一台机器上并发启动的副本各自做准入：共享集合的 W 由选举保证只计一次；各副本私有的部分并发时可能合计超出，这时在写入阶段因内存不足而失败。本地扩散副本依次启动，不受这种情况影响。
 
@@ -1070,11 +1093,12 @@ offload 策略 = Unit + Trigger + Transport
 | 组件声明、内容身份、最终清单 | Loader |
 | 拓扑、共享计划 | Runner，仅在启动期间 |
 | host 存储（私有内存、共享内存的本进程映射、rank 分片） | HWM 分配；启动事务持有，提交后转给 `OffloadRuntime` |
-| 共享存储的监听套接字（写入进程） | HWM，到写入进程的 `close()` 为止 |
-| 内存登记、暂存区 | 在 `commit()` 里建立，转给 `OffloadRuntime` |
-| 叠加层槽位 | 启动事务 → 动态 LoRA 管理器 |
-| adapter 的 CPU 缓存 | 动态 LoRA 管理器 |
-| 加速卡槽位、流、事件、集合通信工作区、钩子 | 启动事务 → `OffloadRuntime` |
+| 共享存储的监听套接字和监听线程（写入进程） | `elect()` 返回的 `Election` 持有，`allocate()` 时移交 `HostStorage`，到写入进程的 `close()` 为止；在这之前失败时由 Runner 关闭 |
+| 内存登记 | 在 `commit()` 里建立，转给 `OffloadRuntime` |
+| 暂存区 | 计划里有走暂存区的 Unit 时在 `prepare_materialization()` 里分配；`commit()` 里登记失败、暂存区还没分配时在这时分配；转给 `OffloadRuntime` |
+| 叠加层槽位 | 启动事务持有，提交后转给动态 LoRA 管理器 |
+| 动态适配器的 CPU 缓存 | 动态 LoRA 管理器 |
+| 加速卡槽位、流、事件、集合通信工作区、钩子 | 启动事务持有，提交后转给 `OffloadRuntime` |
 
 同一个句柄在资源图里只登记一次。Offloader 借用 host 存储，只关闭自己的映射。
 
@@ -1096,7 +1120,7 @@ offload 策略 = Unit + Trigger + Transport
 12. 集合通信失败后，这一组不再继续，这个副本的全部 worker 终止。
 13. 提交后模块结构不变；切换动态 LoRA 只改叠加层槽位里的数据。
 14. 模型自己捕获的 CUDA graph 只读取 `fully_resident` 组件的权重。
-15. 睡眠时不备份的只有 Offloader 的临时槽位；唤醒后常驻部分和固定槽位的加速卡地址不变。
+15. 睡眠时不备份的只有块环缓冲区和分片槽位；唤醒后常驻部分和固定槽位的加速卡地址不变。
 
 ---
 
@@ -1104,10 +1128,10 @@ offload 策略 = Unit + Trigger + Transport
 
 | 风险 | 影响 | 处理 |
 |---|---|---|
-| NUMA：共享内存文件的物理页落在写入进程所在的 NUMA 节点上 | 另一个 socket 上的加速卡只能跨 socket 做 H2D；按部署共享后，影响到这台机器上所有副本。现有实现每个 worker 的锁页副本都在本地节点 | 在双路 8 卡机器上实测。把 NUMA 节点放进本机键、每个节点一份，作为以后的选项 |
-| 非 CUDA 平台（ROCm、NPU、XPU、MUSA）先不支持内存登记 | 每个流式块每一步都先 CPU 拷贝再经暂存区 H2D，比现有实现的锁页副本慢。门槛不比性能 | ROCm 的可写登记加一个验证测试后作为第一个放开的平台 |
-| 内存登记的驱动开销 | 驱动的内核内存约 2–4 MiB/GiB（推断） | 实测 |
-| Cache-DiT 是否在 SP 组上同步跳块，仓库里找不到同步代码 | 不同步时 AllGather 错位 | 确认之前按不同步处理（8.5） |
+| NUMA：共享内存文件的物理页落在写入进程所在的 NUMA 节点上 | 另一路 CPU 上的加速卡只能跨路做 H2D；一个部署在这台机器上的所有副本共用这份存储，都受影响。现有实现每个 worker 的锁页副本都在本地节点 | 门槛矩阵包含双路 8 卡机器，记录跨路 H2D 的带宽 |
+| 非 CUDA 平台（ROCm、NPU、XPU、MUSA）不做内存登记 | 每个流式块每一步都先 CPU 拷贝再经暂存区 H2D，比现有实现的锁页副本慢；门槛不比较性能 | 支持矩阵写明这些平台走暂存区；ROCm 的可写登记有验证测试后放开 |
+| 内存登记的驱动开销 | 驱动按登记量占用内核内存，约 2～4 MiB/GiB | 门槛测试记录登记前后的内核内存占用 |
+| Cache-DiT 按不在 SP 组上同步跳块处理 | 与 `allgather` 同时启用时各 rank 执行的块不一致，AllGather 错位 | 参数解析阶段拒绝这个组合（8.5） |
 | diffusers pipeline 在 `__call__` 里改组件类型 | 被管理的组件撞上提交后的守卫 | 规则表固定类型（5.2），冒烟测试覆盖 |
 | 封存前的失败跨启动单元传递 | head 的本地副本和同机 headless 副本、或两个 headless 启动器并发启动时，一方的写入进程在封存前失败，另一方启动失败 | 启动日志写明角色、写入进程 pid 和套接字名；测试覆盖两种角色 |
 | 写入进程退出后有新副本加入 | 新的写入进程再建一份 W，内存紧的机器上替换副本准入失败 | 写进迁移说明 |
