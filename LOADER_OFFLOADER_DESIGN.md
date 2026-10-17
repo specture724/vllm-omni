@@ -169,7 +169,7 @@ class MemoryRange:
     拿齐所有占容量的运行期资源，返回启动事务（4.5 第 2 点）
 9.  Loader 写入：把参数绑定到已分配的存储，各来源的写入入口（5.3）从 checkpoint
     读取器逐个张量写；适配器在读取器里融合，在线量化逐层进行
-10. Loader 收尾：核对写入，host 存储定稿，共享存储交接和只读绑定，调用 eval()（5.4）
+10. Loader 收尾：核对写入，seal() 里 host 存储定稿、共享存储交接和只读绑定，调用 eval()（5.4）
 11. 启动事务 commit()：校验最终清单，内存登记，填写 fully_resident，装上钩子，
     资源整体移交 OffloadRuntime（4.5 第 3 点）
 12. 编译设置（7.8）
@@ -208,7 +208,7 @@ STRUCTURE_READY       结构建好
    - 各 rank 交出 Unit、内容身份、布局、Transport、规划的指纹。只核对参与集合通信的部分：AllGather 组里的 Unit、它们的内容身份和布局。`rank-local` 的 Unit 和只在本 rank 上声明的组件不参与核对（5.1）。
    - AllGather 组由收集到的各 rank 组件内容身份确定（6.4）。本副本全部 rank，包括没有声明这个组件的 rank，按组件名排序、以相同顺序创建这些进程组。组里只剩一个 rank 时在这里报错。
    - `share_plan()` 在每个 rank 上算出相同的共享集合和代表。
-   - 代表调用 `elect()`，参选结果再收集一次。
+   - 每个 rank 都调用 `elect()`：代表参选，不是代表的 rank 返回空的参选结果；参选结果再收集一次。
    - `admit()` 在每个 rank 上得出相同的结论；超出容量时所有 rank 同时报错。这时还没有分配 host 存储，也没有锁页。
 2. **`prepare_materialization()` 之后**：所有 rank 都就绪才返回启动事务。之后等待者连接写入进程。
 3. **`commit()` 时**：所有 rank 都完成收尾和绑定，才一起激活。
@@ -224,7 +224,7 @@ STRUCTURE_READY       结构建好
 pipeline 的构造函数里，每个带权重的部分声明一次。声明按实例、在配置解析之后生成：同一个类在不同配置下可以有不同的组件，例如 LTX2 只在对应的 profile 下声明 `diffusion_decoder`、`latent_upsampler`。一条声明包含：
 
 - 稳定的组件名和角色。角色是 `dit`、`text_encoder`、`image_encoder`、`audio_encoder`、`vae`、`other` 之一。
-- 组件在 pipeline 里的路径。路径可以是一个子模块，也可以是几个子模块的列表；路径嵌套时，内层从外层划出。例如 Cosmos3 的 `text_encoder` 是 `transformer.language_model`，`dit` 是 `transformer` 去掉 `language_model`；MiniMax H3 视频 VAE 的编码半和解码半各是一个 `vae` 组件。
+- 组件在 pipeline 里的路径。路径可以是一个子模块，也可以是几个子模块的列表；路径嵌套时，内层从外层划出。例如 Cosmos3 的 `text_encoder` 是 `transformer.language_model`，`dit` 是 `transformer` 去掉 `language_model`，这样的划分必须由 pipeline 显式声明；MiniMax H3 视频 VAE 的编码半和解码半各是一个 `vae` 组件。
 - 只用配置、不用权重数值的结构构造方法。
 - 权重来源。
 - checkpoint 里的形式和内存里的形式不一样时，一张规则表（见 5.2）。
@@ -293,7 +293,7 @@ Loader 在这个上下文里调用 pipeline 的构造函数：
 
 - 每张表配一个测试，逐张量对比它和 `from_pretrained` 的结果，固定 transformers 和 diffusers 的版本。
 - 运行时 Loader 只读入库的表，不读类上的 `_keep_in_fp32_modules`。这个属性是否生效随库的版本和类型变化。
-- 保持 fp32 的层，量化方法必须是“不量化”，否则规划阶段报错。
+- 保持 fp32 的层，量化方法必须是“不量化”，否则构造阶段报错：最终类型和量化方法在构造时已经确定。
 - `config.json` 自带 `quantization_config` 的 Hugging Face 组件报错，`from_config` 不会套用 Hugging Face 的量化器。
 - 会在 `__call__` 里改组件类型的 diffusers pipeline（例如 SDXL fp16 的 `upcast_vae()`），由规则表把这类组件固定为运行时的类型。
 
@@ -370,8 +370,8 @@ Loader 按固定顺序做一次：
    - 从写入开始到这一步，除了第 2 步声明要替换的参数，每个参数和持久 buffer 都仍然绑定在写入前分配的存储上，类型和形状不变。量化层按量化方法声明的输出张量核对。
 
    这一步在每个 worker 上做，只核对本 worker 自己写入的张量；共享存储里的张量由写入进程核对。瘦路径下，本 rank 范围之外的张量仍按名字经过 `load_weights`，写入是空操作，但记为已写。
-5. 把第 2 步里被替换的参数拷进 host 存储，生成最终清单，host 存储定稿。
-6. 共享存储的交接和只读绑定（6.3）。
+5. 把第 2 步里被替换的参数拷进 host 存储，生成最终清单。
+6. 调用 host 存储的 `seal()`：各个后端的 host 存储在这里定稿；共享存储在这里交接并做只读绑定（6.3）。
 7. 在每个 worker（包括等待者）上调用 pipeline 的 `eval()`。这是模型侧唯一的收尾入口：它只能读权重，可以建立不属于权重的运行期状态，例如派生缓存；不能改参数和持久 buffer。分片后端 Unit 的权重在本 rank 上只有一段，`eval()` 不能读它们；需要这些权重的派生状态在第一次使用时建立。
 8. 交给启动事务 `commit()`。
 
@@ -389,9 +389,9 @@ Loader 按固定顺序做一次：
 
 - 模型的标识和版本、组件边界、运行期表示（类型、量化方式）、Loader 规则表的版本；
 - 会改变字节或形状的并行坐标：TP 的大小和编号；启用专家并行时加 EP 的大小和编号；组件声明了 `shard_group` 时加它的大小和编号；
-- 融合的适配器和固定适配器的标识：路径或仓库、版本、格式。
+- 融合的适配器和固定适配器的标识：用户给出的路径或仓库、版本、格式。
 
-它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址、文件路径和部署标识，也不比较 checkpoint 或适配器文件的字节内容。
+它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址、解析出的本地缓存文件路径和部署标识，也不比较 checkpoint 或适配器文件的字节内容。
 
 最终清单由 Loader 在收尾第 5 步生成，是同机共享时按名字绑定的唯一依据。
 
@@ -785,7 +785,7 @@ offload 策略 = Unit + Trigger + Transport
 | 整组件 Unit 和常驻层组 | 进入睡眠前让出 | 下一次使用时装入 |
 | host 存储 | 不受影响 | 不受影响 |
 
-- 常驻的部分在睡眠模式的 `weights` 池；块环缓冲区和分片槽位在一个睡眠时只释放、不备份的池里。两个池都在 `prepare_materialization()` 里、写模型之前分配。
+- 常驻的部分在睡眠模式的 `weights` 池；块环缓冲区和分片槽位在一个睡眠时只释放、不备份的池里。块环缓冲区、分片槽位和叠加层槽位在 `prepare_materialization()` 里、写模型之前分配；常驻加速卡的权重和 buffer 由 Loader 在写入和收尾时分配在 `weights` 池里。启动驱动本身不进入任何池。
 - 唤醒后常驻部分和固定槽位的地址不变，编译结果和只读取全部常驻组件的 CUDA graph 继续有效。
 - 进入睡眠前，`OffloadRuntime` 等拷贝和集合通信做完，让出所有整组件 Unit 和常驻层组，清空块环。唤醒后的第一次前向按正常流程装入。
 - 睡眠期间的前向被拒绝。
@@ -956,7 +956,7 @@ offload 策略 = Unit + Trigger + Transport
 | 阶段 | 校验内容 |
 |---|---|
 | 参数解析 | 类型、未知字段、互斥项、新旧冲突、不支持的组合 |
-| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量 |
+| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量、保持 fp32 的层不量化 |
 | Offloader 规划 | 组件完整、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
 | Loader 预检 | 来源可读、内容身份、冷启动路径、适配器的键 |
 | 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、AllGather 组的成员、单机 Host 容量 |

@@ -203,7 +203,7 @@ class MemoryRange:
     拿齐所有占容量的运行期资源，返回启动事务
 9.  Loader 写入：把参数绑定到已分配的存储，各来源的写入入口从 checkpoint 读取器
     逐个张量写；适配器在读取器里融合，在线量化逐层进行
-10. Loader 收尾：核对写入，host 存储定稿，共享存储交接和只读绑定，调用 eval()
+10. Loader 收尾：核对写入，seal() 里 host 存储定稿、共享存储交接和只读绑定，调用 eval()
 11. 启动事务 commit()：校验最终清单，内存登记，填写 fully_resident，装上钩子，
     资源整体移交 OffloadRuntime
 12. 编译设置
@@ -241,7 +241,7 @@ STRUCTURE_READY       结构建好
    - 各 rank 交出 Unit、内容身份、布局、Transport、规划的指纹。只核对参与集合通信的部分：AllGather 组里的 Unit、它们的内容身份和布局。`rank-local` 的 Unit 和只在本 rank 上声明的组件不参与核对。
    - AllGather 组由收集到的各 rank 组件内容身份确定。本副本全部 rank，包括没有声明这个组件的 rank，按组件名排序、以相同顺序创建这些进程组。组里只剩一个 rank 时在这里报错。
    - `share_plan()` 在每个 rank 上算出相同的共享集合和代表。
-   - 代表调用 `elect()`，参选结果再收集一次。
+   - 每个 rank 都调用 `elect()`：代表参选，不是代表的 rank 返回空的参选结果；参选结果再收集一次。
    - `admit()` 在每个 rank 上得出相同的结论；超出容量时所有 rank 同时报错。这时还没有分配 host 存储，也没有锁页。
 2. **`prepare_materialization()` 之后**：所有 rank 都就绪才返回启动事务。之后等待者连接写入进程。
 3. **`commit()` 时**：所有 rank 都完成收尾和绑定，才一起激活。
@@ -340,8 +340,8 @@ Loader 按固定顺序做一次：
 2. 做需要整个模型参与的、会改字节的工作，例如会改参数的校准。
 3. 建立共用存储的关系。
 4. 按写入跟踪核对：必需的参数都已写到；从写入开始到这一步，除了第 2 步声明要替换的参数，每个参数和持久 buffer 都仍然绑定在写入前分配的存储上，类型和形状不变。这一步在每个 worker 上做，只核对本 worker 自己写入的张量；共享存储里的张量由写入进程核对。
-5. 把第 2 步里被替换的参数拷进 host 存储，生成最终清单，host 存储定稿。
-6. 共享存储的交接和只读绑定。
+5. 把第 2 步里被替换的参数拷进 host 存储，生成最终清单。
+6. 调用 host 存储的 `seal()`：各个后端的 host 存储在这里定稿；共享存储在这里交接并做只读绑定。
 7. 在每个 worker 上调用 pipeline 的 `eval()`。这是模型侧唯一的收尾入口：它只能读权重，可以建立不属于权重的运行期状态，不能改参数和持久 buffer。分片后端 Unit 的权重在本 rank 上只有一段，`eval()` 不能读它们；需要这些权重的派生状态在第一次使用时建立。
 8. 交给启动事务 `commit()`。
 
@@ -355,9 +355,9 @@ Loader 按固定顺序做一次：
 
 内容身份在一个部署内部使用：判断同一台机器上的两个 worker 需要的最终权重是否完全相同，按组件确定 AllGather 组，以及多个 rank 在全组确认时核对彼此是否一致。它按组件计算。
 
-它由配置和本 worker 的坐标算出：模型的标识和版本、组件边界、运行期表示（类型、量化方式）、Loader 规则表的版本；会改变字节或形状的并行坐标（TP 的大小和编号；启用专家并行时加 EP；组件声明了 `shard_group` 时加它的大小和编号）；融合的适配器和固定适配器的标识。
+它由配置和本 worker 的坐标算出：模型的标识和版本、组件边界、运行期表示（类型、量化方式）、Loader 规则表的版本；会改变字节或形状的并行坐标（TP 的大小和编号；启用专家并行时加 EP；组件声明了 `shard_group` 时加它的大小和编号）；融合的适配器和固定适配器的标识（用户给出的路径或仓库、版本、格式）。
 
-它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址、文件路径和部署标识。
+它不包含 offload 策略、叠加层、不改变字节的 DP 编号、设备地址、解析出的本地缓存文件路径和部署标识。
 
 ### 叠加层：动态 LoRA
 
@@ -646,7 +646,7 @@ offload 策略 = Unit + Trigger + Transport
 | 整组件 Unit 和常驻层组 | 进入睡眠前让出 | 下一次使用时装入 |
 | host 存储 | 不受影响 | 不受影响 |
 
-- 常驻的部分在睡眠模式的 `weights` 池；块环缓冲区和分片槽位在一个睡眠时只释放、不备份的池里。两个池都在 `prepare_materialization()` 里、写模型之前分配。
+- 常驻的部分在睡眠模式的 `weights` 池；块环缓冲区和分片槽位在一个睡眠时只释放、不备份的池里。块环缓冲区、分片槽位和叠加层槽位在 `prepare_materialization()` 里、写模型之前分配；常驻加速卡的权重和 buffer 由 Loader 在写入和收尾时分配在 `weights` 池里。启动驱动本身不进入任何池。
 - 唤醒后常驻部分和固定槽位的地址不变，编译结果和只读取全部常驻组件的 CUDA graph 继续有效。
 - 进入睡眠前，`OffloadRuntime` 等拷贝和集合通信做完，让出所有整组件 Unit 和常驻层组，清空块环。唤醒后的第一次前向按正常流程装入。
 - 睡眠期间的前向被拒绝。
@@ -859,7 +859,7 @@ offload 策略 = Unit + Trigger + Transport
 | 阶段 | 校验内容 |
 |---|---|
 | 参数解析 | 类型、未知字段、互斥项、新旧冲突、不支持的组合 |
-| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量 |
+| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量、保持 fp32 的层不量化 |
 | Offloader 规划 | 组件完整、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
 | Loader 预检 | 来源可读、内容身份、冷启动路径、适配器的键 |
 | 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、AllGather 组的成员、单机 Host 容量 |
@@ -978,6 +978,7 @@ offload 策略 = Unit + Trigger + Transport
 | Cosmos3 混合精度的 NVFP4 查找表 | 按加载后权重的设备放置，只做一次 | `unified` 下按调用时权重的设备取，或按设备缓存；`legacy` 下不变 |
 | LTX2 vocoder 在 mps、xpu、cpu 上运行时 `.float()` 往返 | 撞上提交后的守卫 | `unified` 下由规则表在这些平台上保持 fp32、经 stage 类型舍入，跳过往返；`legacy` 下不变 |
 | LoRA 管理器提交后才包装 PEFT 层；worker 提交后融合蒸馏 LoRA | 提交后改结构、改基础权重 | `unified` 下包装挪到只建结构（2f），融合挪到 checkpoint 读取器（2c）；`legacy` 下不变 |
+| diffusers 适配器的 `DiffusersAdapterPipeline` 在构造函数里调用 `_raise_unsupported_features`，`diffusion_offload_config` 不是 `None` 时报 `NotImplementedError` | 旧的 `--diffusion-offload-config` 在 `unified` 下由兼容层翻译成策略，这项拒绝让 diffusers 格式在 `unified` 下无法用 offload 启动 | 只在 `legacy` 下执行；`unified` 下 offload 由策略和 Offloader 承担（2f） |
 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad` | `unified` 下没有分布式逐层后端 | `unified` 下这一项改读 `OffloadRuntime` 给出的梯度模式，runner 不读 offload 策略；HSDP 下照旧用 `no_grad`；`legacy` 下不变 |
 
 ### Job 2：Loader
