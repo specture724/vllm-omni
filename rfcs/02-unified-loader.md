@@ -537,6 +537,7 @@ checkpoint 适配器 get_checkpoint_adapter 选中的格式转换（例如 Model
 ```
 
 - 格式和并行方式的选择规则与 `DiffusersPipelineLoader._get_weights_iterator` 相同：torchao 序列化的 checkpoint 按 torch 格式读；`enable_multithread_weight_load` 为真时，safetensors 文件用线程池按 `num_weight_load_threads` 并行打开，文件按 `_natural_sort_key` 排序。含在线量化层的组件不开线程池，按键名的自然顺序产出，以减少同时存在的量化前临时张量（风险表）。
+- 规划给这个组件选了瘦路径（04 的冷启动路径）时，读取器同样不开线程池，按 Unit 的顺序产出：加前缀之后的 checkpoint 张量名按最长的 Unit 模块路径前缀归到 Unit，按 `PlacementPlan` 里分片 Unit 的顺序逐个 Unit 产出，Unit 内按键名的自然顺序，归不到 Unit 的键最后产出。每个 Unit 的每个类型组最多两个边界张量，所以同一时刻没写完的边界张量不超过两个，瘦路径的冷启动额外占用不超过释放阈值加最大的两个张量（总体设计 6.4，[03](./03-host-storage.md) 第 9.2 节）。
 - 读取器产出的是延迟张量（7.3）；融合和规则表转换都作用在延迟张量上，真正的读取发生在写进最终存储的那一刻。
 
 #### 7.3 延迟张量
@@ -569,6 +570,7 @@ buffer：module._buffers[name] = t；别名指向同一个对象
 - 写入入口按 5.3、5.6 的规则选出，每个入口在 `WriteTracker` 的 `TorchDispatchMode` 里调用。这个模式拦截 `copy_`、`index_copy_`、`index_put_`、`fill_`、`zero_`、`masked_fill_`、`scatter_` 等原地写操作，按目标的 `untyped_storage()._cdata` 和偏移找到所属的 `TensorDecl`，累加写入的元素数。目标是 meta 张量时同样计数，所以瘦路径和等待者的空操作“记为已写”。
 - 绑定之后，Loader 包装每个参数的 `weight_loader`（总体设计 5.3）：没有 `weight_loader` 的参数以 `default_weight_loader` 为原函数，`getattr(param, "weight_loader", default_weight_loader)` 的结果因此不变。包装函数在调用原函数之前通知 `WriteTracker` 当前参数，原函数返回之后检查这个参数所在的量化层是否已经写完（7.6）。TP 切分、合并参数、模型自己的映射仍由原函数完成。
 - 一个张量的累计数超过它的元素数时报 `WriteError`，写明张量名：每个最终张量只做一次有语义的写入。
+- 一个张量的累计写入元素数第一次达到它的元素数时（目标为 meta 张量时同样计数），`WriteTracker` 在写入线程里调用一次 `storage.note_written(name)`，`name` 是规范名。只对 `transaction.target(name)` 不为 `None` 的张量调用，包括量化方法声明的输出张量；这个调用不做集合通信。分片后端的瘦路径据此按已写字节数同步归还范围之外的页（[03](./03-host-storage.md) 第 9.2 节）。
 - 写入跟踪覆盖每条流的全部写入，包括不经过 `weight_loader` 的 `writer`、`load_state_dict` 和 buffer 的写入。
 
 #### 7.6 逐层在线量化
@@ -957,7 +959,7 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
 | `weight_stack.loader.create_loader(ctx)`、`Preflight`、`ExpectedManifest`、`FinalManifest` | 01 | 签名见设计第 1 节和第 10 节；`Preflight.content_identities` 是组件名到摘要的映射，直接填进 `RankFingerprints.content_identities`。 |
-| `Loader.write()` 的绑定规则 | 03、04 | 每个张量调用一次 `transaction.target(name)`，名字是预期清单的规范名；返回张量的形状、类型、步长必须与清单一致；返回 meta 张量表示写入是空操作。 |
+| `Loader.write()` 的绑定规则 | 03、04 | 每个张量调用一次 `transaction.target(name)`，名字是预期清单的规范名；返回张量的形状、类型、步长必须与清单一致；返回 meta 张量表示写入是空操作。每个 Host 驻留张量全部写完时调用一次 `storage.note_written(name)`（7.5）。 |
 | `Loader.finalize()` | 01、03 | 第 6 步之前完成收尾里的全部集合通信，第 6 步调用一次 `storage.seal(final_manifest)`；`final_manifest.live()` 给出要重新绑定的模型张量。 |
 | `ComponentCatalog` 及其方法 | 04 | `plan()` 第一步调用 `require_complete()`，组件不完整或保持 fp32 的层配了量化时报 `PlanningError`；`plan()` 经 `set_discovered_blocks()` 记录自动发现的重复块；`commit()` 调用 `set_fully_resident()` 和 `bind_overlay_slot()`；`write_transient` 计入加速卡准入；`shapes_final`、`finalize_replaced` 用于冷启动路径和共享条件。 |
 | `ExpectedManifest` | 03 | `layout(plan, expected_manifest)` 的输入；`digest(names)` 是交接时核对的预期清单摘要。 |

@@ -258,6 +258,7 @@ class HostStorage(Protocol):
     def ranges(self, unit: Unit) -> list[MemoryRange]: ...
     def seal(self, final_manifest: FinalManifest) -> None: ...
     def connect_writer(self) -> None: ...
+    def note_written(self, tensor_key: str) -> None: ...                                      # 写入阶段一个张量全部写完后由 Loader 调用；不做集合通信
     def close(self) -> None: ...                                                              # 幂等
 ```
 
@@ -286,6 +287,7 @@ class HostStorage(Protocol):
 | `HostWeightManager.admit()` | 纯函数，只读 `elections.records`。 |
 | `HostWeightManager.allocate()` | 成功时接管 `elections.local` 的监听套接字和监听线程。失败时 `Election` 仍归调用方。 |
 | `HostStorage.connect_writer()` | 第 2 点之后调用：等待者连接写入进程，代表沿用选举时的连接；本 rank 不是等待者时什么都不做。 |
+| `HostStorage.note_written()` | 写入阶段由 Loader 在一个 Host 驻留张量全部写完之后调用一次，在写入线程里同步执行，不做集合通信；分片后端的瘦路径据此同步归还范围之外的页（03 第 9.2 节），其他后端只做名字检查；`seal()` 之后调用报 `LifecycleError`。 |
 | `HostStorage.close()` | 只释放本进程的映射；写入进程同时关闭监听套接字和文件描述符。 |
 
 `Election` 必须提供 `record() -> ElectionRecord`（可以 pickle 的参选结果）和可以多次调用的 `close()`。`PlacementPlan` 必须提供 `collective_signature() -> Mapping[str, str]`（即 `RankFingerprints.collective`）和 `bind_groups(groups: AllGatherGroups) -> None`。`HostLayout` 必须提供 `plan_fingerprint` 和 `bind_groups(groups: AllGatherGroups) -> None`。`bind_groups` 发现组的大小与规划的假设不同时报 `GroupConfirmationError`。
@@ -1050,7 +1052,7 @@ commit              point3_commit     compile_setup     close
 | `group.py` 的 `AllGatherGroups` | 03、04 使用。 | 第 1 点之后经 `bind_groups()` 交给 `HostLayout` 和 `PlacementPlan`。 |
 | `MemoryPools` | 02、04 使用。 | 驱动不进入任何睡眠池。02 在 `weights()` 里分配常驻加速卡的张量，包括收尾里新建的；04 在 `prepare_materialization()` 里于 `slots()` 分配块环缓冲区和分片槽位，于 `weights()` 分配叠加层槽位。 |
 | 登记表 `tests/diffusion/weight_stack/coexistence/` | 02、03、04、05 使用。 | 承担必改行或自己分发点的 PR 在 `sites/` 下新增位置文件，自己的分发点用 `NEW_ROW` 声明；不修改 `registry.py` 和白名单。 |
-| 测试替身 `tests/diffusion/weight_stack/fakes.py` | 02、03、04 使用。 | 各自的测试用替身替换另外两个模块，经 `run_unified_startup(ctx, factory)` 走完整的启动流程。 |
+| 测试替身 `tests/diffusion/weight_stack/fakes.py` | 02、03、04 使用。 | 各自的测试用替身替换另外两个模块，经 `run_unified_startup(ctx, factory)` 走完整的启动流程。替身的 host 存储实现 `note_written()`，什么都不做。 |
 
 ### 本 RFC 依赖的约定
 
