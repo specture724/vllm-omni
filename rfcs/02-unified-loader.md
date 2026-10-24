@@ -4,7 +4,7 @@
 >
 > 范围：`vllm_omni/diffusion/weight_stack/loader/`、`vllm_omni/diffusion/weight_stack/components.py`、`vllm_omni/diffusion/model_loader/construct.py`、`vllm_omni/diffusion/model_loader/hub_prefetch.py`，19 个构造期读张量的家族目录，以及共存期必改清单里由本 RFC 承担的各行。
 >
-> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_stack/interfaces.py`、`weight_stack/errors.py`、启动驱动、共存期登记表（`tests/diffusion/weight_stack/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan`、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
+> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_stack/interfaces.py`、`weight_stack/errors.py`、启动驱动、`StartupContext.memory_pools`、共存期登记表（`tests/diffusion/weight_stack/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan` 给出的冷启动路径和每个张量的 Transport、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
 
 ## 摘要
 
@@ -19,7 +19,7 @@
 - 动态 LoRA 和 `overlay` 固定适配器的叠加层包装，动态 LoRA 管理器在 `unified` 下的运行期；
 - `load_format="diffusers"`、`load_format="custom_pipeline"`、HSDP 组件的物化；
 - 共存期的逐张量对比框架、对比例外表、legacy 一支的指纹清单；
-- 19 个构造期读张量家族的迁移，以及共存期必改清单里由本 RFC 承担的 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。
+- 19 个构造期读张量家族的迁移，构造函数里直接调用 `X.from_pretrained` 的 pipeline 改用 `hf_component`，以及共存期必改清单里由本 RFC 承担的 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。
 
 本 RFC 的每一个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变，不修改已有测试文件。
 
@@ -46,7 +46,7 @@ umbrella 的“背景与问题”已经给出总体原因，这里只列本 RFC 
 ```text
 启动步骤（总体设计 4.2）   调用                                              结束时的状态
 2   只建结构               loader.build_structure()，返回 (model, catalog)    STRUCTURE_READY
-4   Offloader.plan()       plan 只读 catalog                                 PLANNED
+4   Offloader.plan()       plan 读 catalog，只经 set_discovered_blocks 写   PLANNED
 5   Loader 预检            loader.preflight(catalog, plan)，返回 Preflight    SOURCES_PREPARED
 9   Loader 写入            loader.write(model, storage, transaction)         WEIGHTS_READY
 10  Loader 收尾            loader.finalize(model, storage)，返回 FinalManifest FINALIZED
@@ -64,7 +64,7 @@ class Preflight:
     adapters: tuple[ResolvedAdapter, ...]                 # 融合适配器和固定适配器（第 8 节）
 ```
 
-- `write()` 里每个张量的写入目标取 `transaction.target(tensor_key)`，`tensor_key` 是预期清单里的规范名。返回张量时绑定到它；返回 `None` 时这个张量常驻加速卡，Loader 在执行设备上、在 `ctx.memory_pools.weights()` 里分配，因此进入睡眠时备份的池。收尾里新建或替换的常驻加速卡张量同样在这个池里分配。写入期间的临时张量（量化前的参数、适配器的 Δ、`on_execution_device` 变换的中间结果）不进任何睡眠池。驱动自己不进入睡眠池。
+- `write()` 里每个张量的写入目标取 `transaction.target(tensor_key)`，`tensor_key` 是预期清单里的规范名。返回张量时绑定到它；返回 `None` 时这个张量常驻加速卡，Loader 在执行设备上、在 `ctx.memory_pools.weights()` 里分配，因此进入睡眠时备份的池。收尾里新建或替换的常驻加速卡张量（第 2 步的替换、第 1 步 HSDP 分片后的本地分片，第 9、13 节）同样由 Loader 在这个池里分配。只建结构期间的分配和写入期间的临时张量（量化前的参数、适配器的 Δ、`on_execution_device` 变换的中间结果）不进任何睡眠池。驱动自己不进入睡眠池（01 的 6.2）。
 - `finalize()` 执行总体设计 5.4 的第 1 到第 7 步（第 9 节），第 6 步调用 `storage.seal(final_manifest)`。
 - `close()` 关闭构造上下文、读取陷阱、checkpoint 读取器的文件句柄和临时张量。组件目录在 `close()` 之后仍然可以查询。
 - Loader 从 HWM 和 Offloader 一侧只 import `weight_stack.interfaces`，不 import 它们的实现；在 `weight_stack` 里另外只 import `errors`、`components` 和 `startup`（只用 `WeightStack` 和 `process_weight_stack`）。复用 legacy 的来源解析时在函数内 import `model_loader.diffusers_loader`（7.1）。
@@ -141,7 +141,7 @@ pipeline 没有调用 `declare_components` 时，Loader 在构造结束后从现
 
 #### 2.4 完整性检查
 
-构造结束、最终类型落到 meta 参数之后，Loader 遍历 pipeline 下的每个参数、每个持久 buffer 和每个登记过来源的非持久 buffer（加上 2.3 第一条并入的根），算出没有归属的路径和归属多于一个的路径，记在 `ComponentCatalog.ownership_violations` 里。总体设计 5.1 和 8.5 规定这项错误在规划阶段报出：04 的 `plan()` 第一步调用 `catalog.require_complete()`，结果非空时报 `PlanningError`，列出全部路径。只想常驻、不参与 offload 的部分显式声明为 `other`。
+构造结束、最终类型落到 meta 参数之后，Loader 遍历 pipeline 下的每个参数、每个持久 buffer 和每个登记过来源的非持久 buffer（加上 2.3 第一条并入的根），算出没有归属的路径和归属多于一个的路径，记在 `ComponentCatalog.ownership_violations` 里。总体设计 5.1、5.2 和 8.5 规定这类错误在规划阶段报出，所以 Loader 在构造阶段只记录、不报错：04 的 `plan()` 第一步调用 `catalog.require_complete()`，`ownership_violations` 或 6.2 的 `dtype_violations` 非空时报 `PlanningError`，列出全部路径。只想常驻、不参与 offload 的部分显式声明为 `other`。
 
 #### 2.5 按 rank 声明
 
@@ -204,12 +204,15 @@ class OverlaySlotDecl:
 class ComponentCatalog:
     entries: Mapping[str, CatalogEntry]          # 按组件名排序
     overlay_slots: tuple[OverlaySlotDecl, ...]   # 动态 LoRA 槽位（11.4），不属于任何组件
+    wrapped_layers: tuple[str, ...]              # 动态 LoRA 包装层的规范路径（11.2），供管理器使用
     dynamic_lora: DynamicLoraSpec | None         # 11.1；None 表示不启用
     write_transient: TransientNeed               # 写入期间加速卡上的瞬时需求，04 计入加速卡准入
     ownership_violations: tuple[str, ...]        # 2.4
-    def require_complete(self) -> None: ...      # 有违例时报 PlanningError
+    dtype_violations: tuple[str, ...]            # 6.2：保持 fp32 的层配了量化方法
+    def require_complete(self) -> None: ...      # 两类违例任一非空时报 PlanningError
     def owner(self, tensor_name: str) -> str: ...
     def module_owner(self, module_path: str) -> str: ...
+    def set_discovered_blocks(self, component: str, paths: tuple[str, ...]) -> None: ...   # 04 的 plan() 记录自动发现的重复块
     def bind_overlay_slot(self, name: str, tensor: torch.Tensor) -> None: ...
     def set_fully_resident(self, component: str, value: bool) -> None: ...
 ```
@@ -217,12 +220,12 @@ class ComponentCatalog:
 - `tensors` 是最终张量表：参数、持久 buffer、登记过来源的数据张量、量化方法声明的输出张量（7.6）、`overlay` 固定适配器的 A/B（8.5）。量化层量化前的参数不在表里，它们只在写入期间以临时张量的形式存在于加速卡上。
 - `kind="buffer"` 只指持久 buffer。没有登记来源的非持久 buffer（例如按配置算出的 RoPE 表）不在表里，它们跟随所在模块由 Offloader 放置。
 - `bind_overlay_slot` 只给 04 用：04 在 `prepare_materialization()` 里分配槽位，在 `commit()` 里调用它把槽位装进包装层，然后交给动态 LoRA 管理器。每个槽位只能绑定一次，形状和类型必须与声明一致。
-- `set_fully_resident` 只给 04 的 `commit()` 用，每个组件只能调用一次，之后属性只读。
+- `set_discovered_blocks` 只给 04 的 `plan()` 用，每个组件最多调用一次；`set_fully_resident` 只给 04 的 `commit()` 用，每个组件只能调用一次，之后属性只读。这三个方法是目录上仅有的写操作，重复调用报 `LifecycleError`。
 - `shapes_final`、`finalize_replaced` 和 `write_transient` 都在只建结构结束时算出，规划据此选择共享条件和冷启动路径（03、04），不需要等到预检。`write_transient` 是上限：`adapter_delta_bytes` 取所有要融合适配器的组件里最大的单个张量按计算类型的字节数，`quant_layer_bytes` 取量化层里量化前参数之和的最大值。
 
 #### 2.8 查询接口
 
-`weight_stack/components.py` 提供以下只读函数，供 `torch.compile` 的目标选择、缓存加速、动态 LoRA、模型注册表、序列并行钩子和 VAE 快路径使用（第 15 节）。目录挂在 pipeline 的私有属性 `_weight_stack_catalog` 上，由 `build_structure()` 设置，模型代码不直接读这个属性。前三个函数和 `fully_resident` 带一个 `legacy` 参数：`legacy` 下函数只调用它并返回结果，使用方现有的判断原样移进这个局部函数，`legacy` 下行为不变。
+`weight_stack/components.py` 提供以下只读函数，供 `torch.compile` 的目标选择、缓存加速、动态 LoRA、模型注册表、序列并行钩子和 VAE 快路径使用（第 15 节）。目录不挂在 pipeline 对象上（总体设计 3.2 第 5 条）：`build_structure()` 把它登记在 `components.py` 的进程级弱引用表里，以 pipeline 对象为键，pipeline 被回收时条目随之消失；`custom_pipeline` 重新初始化时，新 pipeline 登记新的目录。前三个函数和 `fully_resident` 带一个 `legacy` 参数：`legacy` 下函数只调用它并返回结果，使用方现有的判断原样移进这个局部函数，`legacy` 下行为不变。
 
 ```python
 def component_paths(pipeline, role: Role, *, legacy: Callable[[], Sequence[str]]) -> tuple[str, ...]: ...
@@ -236,7 +239,7 @@ def weight_generation(pipeline) -> int: ...
 def bump_weight_generation(pipeline) -> None: ...
 ```
 
-- `unified` 下前三个函数读目录：`component_paths` 返回这个角色的组件的规范根路径；`lora_target_paths` 返回 `dit` 组件和 `_lora_components` 的根路径；`repeated_block_paths` 返回组件声明的 `repeated_blocks`，没有声明时返回 04 记在目录上的自动发现结果。
+- `unified` 下前三个函数读目录：`component_paths` 返回这个角色的组件的规范根路径；`lora_target_paths` 返回 `dit` 组件和 `_lora_components` 的根路径；`repeated_block_paths` 返回组件声明的 `repeated_blocks`，没有声明时返回 04 经 `set_discovered_blocks()` 记录的自动发现结果。
 - `fully_resident` 是读这个属性的通用函数：`unified` 下读目录里 `commit()` 填好的值，`commit()` 之前调用报 `LifecycleError`；`legacy` 下执行模型现有的判断。
 - `execution_device()` 返回本 worker 的执行设备，与 `vllm_omni.diffusion.distributed.utils.get_local_device()` 相同。
 - `is_unified_stack()` 返回 01 的 `process_weight_stack() is WeightStack.UNIFIED`。模型代码只在共存期必改清单登记的位置调用它（01 的静态测试 T6 检查调用位置）。
@@ -246,7 +249,7 @@ def bump_weight_generation(pipeline) -> None: ...
 
 #### 3.1 进入、阶段与退出
 
-`StructureContext`（`weight_stack/loader/context.py`）是进程级的单例状态，与 01 的进程级总开关一起使用。同一时刻一个进程里最多有一个打开的上下文；单进程执行器把几个 worker 放在一个进程里时，它们的启动流程依次进行，第二个上下文在第一个关闭之前打开时报 `LifecycleError`。
+`StructureContext`（`weight_stack/loader/context.py`）是进程级的单例状态，与 01 的进程级总开关一起使用。同一时刻一个进程里最多有一个打开的上下文，第二个上下文在第一个关闭之前打开时报 `LifecycleError`，不排队等待：持有上下文的 worker 可能正在 `seal()` 里等待排队的那个 worker 作为写入进程完成封存，排队会死锁。单进程执行器把几个 worker 放在同一个进程里时，它们的 `unified` 启动必须依次进行。陷阱的补丁对进程里的所有线程生效，所以上下文打开期间，同一进程里的其他代码也不能读取 checkpoint。
 
 ```text
 build_structure() 开始     phase = CONSTRUCT   参数落到 meta、设备移动受限、读取陷阱拦截张量读取
@@ -291,10 +294,10 @@ loader.close()             上下文关闭          失败路径上同样撤除�
 5. 量化方法声明输出张量（7.6）
 6. 构造后检查：所有参数都在 meta 上；除 declare_weights 登记了来源的非持久 buffer 以外，buffer 和模块的普通属性里没有 meta 张量
 7. 核对读取陷阱的违例（第 4 节）
-8. 构建组件目录：最终张量表、完整性违例、shapes_final、finalize_replaced、write_transient
+8. 构建组件目录：最终张量表、完整性违例、类型违例（6.2）、shapes_final、finalize_replaced、write_transient
 ```
 
-- 第 6 步遍历每个模块的 `__dict__`，找出类型为 `torch.Tensor` 的普通属性和 `list`、`tuple`、`dict` 里一层深的张量。出现 meta 张量时报 `ConstructionError`，写明模块路径和属性名，说明构造期间用权重数值做了计算。
+- 第 6 步遍历每个模块的 `__dict__`，找出类型为 `torch.Tensor` 的普通属性和 `list`、`tuple`、`dict` 里一层深的张量。出现 meta 张量时报 `ConstructionError`，写明模块路径和属性名，说明构造期间用权重数值做了计算。第 3 步包装时 Loader 自己建出的 meta 张量（动态 LoRA 槽位、`overlay` 固定适配器的 A/B）记在目录上，不算违例。
 - 第 6、7 步的任何错误都在构造阶段报出，报错信息的 `fix` 是 `use --diffusion-weight-stack legacy`。
 
 ### 4. 读取陷阱
@@ -312,7 +315,7 @@ loader.close()             上下文关闭          失败路径上同样撤除�
 | 非 Hugging Face 类自定义的 `from_pretrained` | 由它内部的文件读取触发 | 同左 |
 
 - 放行的头部读取：`safe_open` 句柄的 `keys()`、`metadata()`、`get_slice(name).get_shape()`、`get_slice(name).get_dtype()`，以及 JSON 配置文件的读取。
-- 实现：陷阱用代理对象替换 `safetensors.safe_open`、`safetensors.torch.safe_open`、`safetensors.torch.load_file`、`safetensors.torch.load`、`torch.load`、`torch.serialization.load`，以及上面列出的类方法。模型模块常用 `from safetensors import safe_open` 把名字绑进自己的命名空间，所以陷阱在打开时扫描 `sys.modules` 里 `vllm_omni.` 开头的模块，把与原对象身份相同的全局名字换成代理，关闭时换回；上下文打开期间新 import 的 `vllm_omni.` 模块由一个 `sys.meta_path` 查找器在执行完模块代码后同样处理。
+- 实现：陷阱用代理对象替换 `safetensors.safe_open`、`safetensors.torch.safe_open`、`safetensors.torch.load_file`、`safetensors.torch.load`、`torch.load`、`torch.serialization.load`，以及上面列出的类方法。模型模块常用 `from safetensors import safe_open` 把名字绑进自己的命名空间，`vllm`、`diffusers` 的辅助函数也这样绑定，所以陷阱在打开时扫描 `sys.modules` 里除 `torch`、`safetensors` 两个包以外的全部模块，把与原对象身份相同的全局名字换成代理，关闭时换回；上下文打开期间新 import 的模块由一个 `sys.meta_path` 查找器在执行完模块代码后同样处理。
 - Loader 自己的 checkpoint 读取器不受影响：读取器只在 `trap.trusted()` 里调用读取函数，代理看到线程局部的信任标记时直接调用原函数。读取器的线程池在每个工作线程里进入 `trusted()`。
 - 违例记录：代理抛出 `ConstructionError` 或 `WriteError` 之前，把一条 `Violation(kind, call, where)` 记进陷阱。`where` 取调用栈上第一个不属于 `torch`、`safetensors`、`transformers`、`diffusers` 和 `weight_stack` 的帧，写成文件路径和函数名。即使模型代码用 `try/except` 吞掉了异常，`build_structure()` 第 7 步和 `finalize()` 结束时照样报错，列出全部违例。
 - `CONSTRUCT` 阶段违例的报错类型是 `ConstructionError`；`SEALED` 阶段是 `WriteError`（写入期间）或 `FinalizeError`（收尾期间）。
@@ -336,9 +339,7 @@ def build_component(*, legacy: Callable[[], T], unified: Callable[[], T]) -> T: 
 | `unified`，`phase` 为 `CONSTRUCT` | 只调用 `unified()`，返回它的结果。 |
 | `unified`，上下文没有打开或 `phase` 为 `SEALED` | 报 `LifecycleError`，写明调用位置（文件路径和函数名），说明组件必须在构造函数里建出。 |
 
-- `legacy` 是原来那几条语句原样移进的局部函数，参数、顺序和它调用的函数都不变。
-- `unified` 只用配置建结构，返回与 `legacy` 同一个类的实例，模块树相同；这一点由第 14 节的逐张量对比测试检查，`build_component` 在运行期不检查。
-- `unified` 对建出的每个带权重的模块调用一次 `declare_weights`。它调用 legacy 的路径解析、配置解析和校验函数，不复制它们；只有读张量、拼 state dict 的部分另写，放在家族目录下的 `unified_build.py`。需要时可以给原有的类加新方法，原有方法不改。
+- `legacy` 一支和 `unified` 一支的写法按总体设计 5.2“两个栈的构造代码”：`legacy` 是原语句原样移进的局部函数；`unified` 只用配置建结构，返回同一个类的实例和相同的模块树，对建出的每个带权重的模块调用一次 `declare_weights`，读张量、拼 state dict 的部分放在家族目录下的 `unified_build.py`。`unified` 调用 legacy 的路径解析、配置解析和校验函数，不复制它们；需要时可以给原有的类加新方法，原有方法不改。模块树相同由第 14 节的逐张量对比测试检查，`build_component` 在运行期不检查。
 - 按需构造的组件（例如 SANA-WM 在请求期才建的 VAE）在 `unified` 一支里于构造函数中建出。
 
 #### 5.3 `declare_weights`
@@ -393,8 +394,9 @@ class BufferSource:
 
 两个入口内部走同一个分发 `_hf_dispatch(cls, model, subfolder, kwargs)`：
 
-- `from_pretrained_with_prefetch(factory, model, *, subfolder, prefetch_list, local_files_only, max_attempts, **from_pretrained_kwargs)`（`vllm_omni/diffusion/model_loader/hub_prefetch.py`）：上下文外的代码不变。`phase` 为 `CONSTRUCT` 时，从绑定的类方法 `factory.__self__` 取出类，进入分发；`factory` 不是绑定的类方法时报 `ConstructionError`。
-- `hf_component(factory, *args, **kwargs)`（`construct.py`）：用在构造函数里直接调用 `X.from_pretrained(...)` 的地方。上下文外就是 `factory(*args, **kwargs)`，不附加预取和重试；`phase` 为 `CONSTRUCT` 时进入分发。`phase` 为 `SEALED` 时两个入口都报 `LifecycleError`。
+- `from_pretrained_with_prefetch(factory, model, *, subfolder, prefetch_list, local_files_only, max_attempts, **from_pretrained_kwargs)`（`vllm_omni/diffusion/model_loader/hub_prefetch.py`）：`legacy` 下的代码不变。`phase` 为 `CONSTRUCT` 时，从绑定的类方法 `factory.__self__` 取出类，进入分发；`factory` 不是绑定的类方法时报 `ConstructionError`。
+- `hf_component(factory, *args, **kwargs)`（`construct.py`）：用在构造函数里直接调用 `X.from_pretrained(...)` 的地方。`legacy` 下就是 `factory(*args, **kwargs)`，不附加预取和重试；`phase` 为 `CONSTRUCT` 时进入分发。
+- `unified` 下上下文没有打开（包括 Loader 关闭上下文之后）或 `phase` 为 `SEALED` 时，两个入口对带权重的类都报 `LifecycleError`，写明调用位置（总体设计 5.2）。
 - 分词器、processor、调度器、特征提取器和纯配置类（不是 `PreTrainedModel` 或 `ModelMixin` 的子类）直接通过，照常调用 `from_pretrained`。transformers 的 `AutoModel` 一类先按配置解析出模型类，再按模型类判断，Gr00t 的 `AutoModel.from_pretrained` 因此进入分发。
 
 分发的步骤：
@@ -468,7 +470,7 @@ class RuntimeDtype:
     platforms: tuple[str, ...] = ()                      # 空表示全部平台，例如 ("mps", "xpu", "cpu")
 ```
 
-`Conversion` 有三种：`rename(src_pattern, dst_pattern)`、`merge(srcs, dst, dim)`、`stack(src_pattern, dst, dim)`。`DtypeRule` 写明类型的来源：构造参数、`config.torch_dtype` 或固定类型。`Initializer` 写明参数名和初始化方式（`zeros`、`ones`、`constant`、`from_config` 加函数限定名）。`MemoryFormatRule` 写明目标模块的类型或路径、内存格式和生效条件；条件是 `od_config` 的键和取值加平台，例如 Wan VAE 的卷积在 `vae_fast_path` 为 `channels_last` 且平台是 CUDA 时用 channels-last 布局。
+`Conversion` 有三种：`rename(src_pattern, dst_pattern)`、`merge(srcs, dst, dim)`、`stack(src_pattern, dst, dim)`。`DtypeRule` 写明类型的来源：构造参数、`config.torch_dtype` 或固定类型。`Initializer` 写明参数名和初始化方式（`zeros`、`ones`、`constant`、`from_config` 加函数限定名）。`MemoryFormatRule` 写明目标模块的类型或路径、内存格式和生效条件；条件是 `od_config` 的键和取值，需要时再加平台，与 legacy 一支转换布局的条件相同。例如 Wan VAE 的卷积在 `vae_fast_path` 为 `channels_last` 时用 channels-last 布局，这一级别在 `install_wan_vae_fastpath` 里转换卷积权重的布局。
 
 #### 6.2 执行
 
@@ -476,7 +478,7 @@ class RuntimeDtype:
 - 写入时：读取器按 `ignore_on_load` 丢弃键，按 `conversions` 改名、合并、堆叠，再交给写入入口；`write_transforms` 在写进最终存储之前执行，`on_execution_device` 为真的变换在执行设备上做，结果再拷进最终存储；`keep_fp32` 的 `stage_rounded` 条目先转成 stage 类型再升到 fp32，与现有实现逐位一致。
 - 收尾时：`tied` 在第 3 步核对；`initializers` 在第 1 步给没有写入、规则表声明了初始化方式的参数写初值，记为已写。
 - 运行时 Loader 只读入库的表，不读类上的 `_keep_in_fp32_modules`。
-- `keep_fp32` 或 `runtime_dtype` 为 fp32 的层，量化方法必须是“不量化”，否则在构造阶段报 `ConstructionError`。规划需要的类型在构造阶段就已确定，这项检查因此早于总体设计 5.2 所说的规划阶段，报错写明层名和量化方法。
+- `keep_fp32` 或 `runtime_dtype` 为 fp32 的层，量化方法必须是“不量化”。Loader 在 3.5 第 8 步把不满足的层和它的量化方法记进 `ComponentCatalog.dtype_violations`，由 04 的 `plan()` 经 `require_complete()` 在规划阶段报 `PlanningError`（总体设计 5.2），报错写明层名和量化方法。
 - `runtime_dtype` 表达会在 `__call__` 里改组件类型的 diffusers pipeline（例如 SDXL fp16 的 `upcast_vae()`）和模型自己改类型的代码（MiniMax H3 视频 VAE 的 fp32、LTX2 vocoder 在 mps、xpu、cpu 上的 fp32），组件因此从写入起就是运行时的类型。
 
 #### 6.3 逐表测试
@@ -517,7 +519,7 @@ class ResolvedSource:
 
 - `weights_sources` 的来源（`DiffusersPipelineLoader.ComponentSource`）用 `DiffusersPipelineLoader._prepare_weights` 解析文件，与 legacy 一致；读取器在函数内 import `diffusers_loader`，用同一份 `LoadConfig` 和 `od_config` 构造一个只用于解析的实例。
 - `WeightSource`、`BufferSource` 和 HF 来源用 `prefetch_subfolders`（`hub_prefetch.py`）下载并校验缓存，再按 `files` 选择文件。
-- 预检读每个 safetensors 文件的头部，核对：来源可读；每个 `required` 的张量在某个来源的键里出现（按规则表改名之后）；形状与 meta 参数在 TP 切分之前的形状相容。不满足时报 `PreflightError`，写明组件、来源和键名。
+- 预检读每个 safetensors 文件的头部，核对来源可读。名字映射完全由 Loader 决定的来源（HF 来源和没有 `writer`、模块也没有 `load_weights` 的 `declare_weights` 来源）另外核对：每个 `required` 的张量在按规则表转换之后的键里出现。不满足时报 `PreflightError`，写明组件、来源和键名。经 pipeline 或模块 `load_weights`、`writer` 写入的张量，名字映射在模型代码里，预检不核对，是否写到由收尾第 4 步按写入跟踪核对（总体设计 5.4）。
 - 预检同时核对规划选定的冷启动路径：组件的 `shapes_final` 为假时，规划不能选瘦路径，否则报 `PreflightError`。
 
 #### 7.2 读取流水线
@@ -534,7 +536,7 @@ checkpoint 适配器 get_checkpoint_adapter 选中的格式转换（例如 Model
 写入入口          pipeline.load_weights、模块的 load_weights、writer 或 AutoWeightsLoader
 ```
 
-- 格式和并行方式的选择规则与 `DiffusersPipelineLoader._get_weights_iterator` 相同：torchao 序列化的 checkpoint 按 torch 格式读；`enable_multithread_weight_load` 为真时，safetensors 文件用线程池按 `num_weight_load_threads` 并行打开，文件按 `_natural_sort_key` 排序。
+- 格式和并行方式的选择规则与 `DiffusersPipelineLoader._get_weights_iterator` 相同：torchao 序列化的 checkpoint 按 torch 格式读；`enable_multithread_weight_load` 为真时，safetensors 文件用线程池按 `num_weight_load_threads` 并行打开，文件按 `_natural_sort_key` 排序。含在线量化层的组件不开线程池，按键名的自然顺序产出，以减少同时存在的量化前临时张量（风险表）。
 - 读取器产出的是延迟张量（7.3）；融合和规则表转换都作用在延迟张量上，真正的读取发生在写进最终存储的那一刻。
 
 #### 7.3 延迟张量
@@ -565,14 +567,15 @@ buffer：module._buffers[name] = t；别名指向同一个对象
 #### 7.5 写入入口与写入跟踪
 
 - 写入入口按 5.3、5.6 的规则选出，每个入口在 `WriteTracker` 的 `TorchDispatchMode` 里调用。这个模式拦截 `copy_`、`index_copy_`、`index_put_`、`fill_`、`zero_`、`masked_fill_`、`scatter_` 等原地写操作，按目标的 `untyped_storage()._cdata` 和偏移找到所属的 `TensorDecl`，累加写入的元素数。目标是 meta 张量时同样计数，所以瘦路径和等待者的空操作“记为已写”。
+- 绑定之后，Loader 包装每个参数的 `weight_loader`（总体设计 5.3）：没有 `weight_loader` 的参数以 `default_weight_loader` 为原函数，`getattr(param, "weight_loader", default_weight_loader)` 的结果因此不变。包装函数在调用原函数之前通知 `WriteTracker` 当前参数，原函数返回之后检查这个参数所在的量化层是否已经写完（7.6）。TP 切分、合并参数、模型自己的映射仍由原函数完成。
 - 一个张量的累计数超过它的元素数时报 `WriteError`，写明张量名：每个最终张量只做一次有语义的写入。
-- Loader 不改写参数的 `weight_loader` 本身；TP 切分、合并参数、模型自己的映射照常使用现有的 `weight_loader` 写法。
-- 写入跟踪覆盖每条流的全部写入，包括 `writer`、`AutoWeightsLoader` 和 `load_state_dict` 的写入。
+- 写入跟踪覆盖每条流的全部写入，包括不经过 `weight_loader` 的 `writer`、`load_state_dict` 和 buffer 的写入。
 
 #### 7.6 逐层在线量化
 
 - 构造结束时，Loader 对每个带 `quant_method` 的层调用 `quant_output_specs(layer)`（`weight_stack/loader/quant.py`），得到这一层量化后每个输出张量的名字、形状和类型，作为 `kind="quant_output"` 进入目录。没有登记输出声明的量化方法，在构造阶段报 `ConstructionError`。
-- 写入阶段，一层的第一次写入发生时，Loader 在执行设备上为这一层量化前的参数分配临时张量并绑定；写入跟踪发现这一层量化前的参数全部写完时，立即调用 `quant_method.process_weights_after_loading(layer)`，把每个输出张量拷进它的最终存储，把层的属性换成最终存储上的张量，然后释放临时张量。量化在加速卡上进行，结果直接写进最终存储。
+- 写入阶段，包装后的 `weight_loader` 第一次被这一层的参数调用时，Loader 在执行设备上为这一层量化前的参数分配临时张量并绑定，然后才调用原函数；量化层量化前的参数被不经过 `weight_loader` 的写入命中、而临时张量还没有分配时报 `WriteError`。包装函数返回时，写入跟踪发现这一层量化前的参数全部写完，Loader 立即调用 `quant_method.process_weights_after_loading(layer)`，把每个输出张量拷进它的最终存储，把层的属性换成最终存储上的张量，然后释放临时张量。量化在加速卡上进行，结果直接写进最终存储。
+- 输出目标全部是 meta 的量化层（等待者写进共享存储的层、瘦路径下完全落在本 rank 范围之外的层）：写入期间量化前的参数留在 meta 上，写入是空操作，不读 checkpoint；这一层写完时，Loader 分配不初始化的临时张量，照样调用 `process_weights_after_loading`，使层上不属于权重的运行期属性与写入进程相同，然后丢弃输出、释放临时张量。
 - 输出的形状或类型与声明不同时报 `WriteError`。
 - 离线量化的 checkpoint 同样经过这一步：`process_weights_after_loading` 改字节的方法（重新打包等）由它的输出声明给出最终张量。
 - 收尾第 1 步对还没写完的量化层报 `FinalizeError`，量化方法声明可以缺少的张量放过，规则与 `DiffusersPipelineLoader._is_expected_quantized_weight` 列出的后缀相同。
@@ -601,16 +604,14 @@ class AdapterFormat(Protocol):
 
 #### 8.2 融合
 
-- 读取器对每个 checkpoint 张量 `(name, W)`，有 `Δ[name]` 时产出 `(name, combine(W, Δ))`，所以之后的改名、TP 切分、合并参数、HSDP 分片和逐层在线量化看到的都是融合后的张量，TP 大于 1 时也正确。
-- Δ 在执行设备上计算，计算类型由格式规定：diffusers 格式用文件里的类型；kohya 格式先转成 fp32 再折叠 alpha。
-- `combine` 的默认规则：W 和 Δ 都先转成 stage 类型再相加，与现有实现逐位一致。FastH3 在 fp32 里相加，结果取 checkpoint 的类型。
-- 融合不乘 `lora_scale`。Δ 在用完后立即释放，峰值多出的显存由目录的 `write_transient.adapter_delta_bytes` 交给 04 计入准入。
-- 瘦路径和同机共享：Δ 挂在延迟张量上，只在物化时计算，所以只为本 rank 实际读取的张量计算；等待者对共享张量不物化，也不计算 Δ。
+- 读取器对每个 checkpoint 张量 `(name, W)`，有 `Δ[name]` 时产出 `(name, combine(W, Δ))`。融合点和数值规则按总体设计 5.7：Δ 在执行设备上按格式规定的类型计算；`combine` 默认把 W 和 Δ 都先转成 stage 类型再相加，FastH3 在 fp32 里相加、结果取 checkpoint 的类型；融合不乘 `lora_scale`。
+- Δ 用完立即释放，峰值多出的显存由 `write_transient.adapter_delta_bytes` 交给 04 计入准入。
+- Δ 挂在延迟张量上，只在物化时计算：瘦路径下只为本 rank 实际读取的张量计算，等待者对共享张量不物化，也不计算 Δ。
 
 #### 8.3 FastH3 与 VDN
 
 - 两者只能融合：它们改 RMSNorm 和 bias、注入额外的结构，做不成叠加层。
-- `unified` 下，MiniMax H3 pipeline 的构造函数在 `unified` 一支里只读文件头和元数据：`FastH3WeightFusion` 和 `VDNCheckpoint` 增加只建 manifest 的新方法，校验方法（`check_serving_contract` 等）与 legacy 相同；需要先建出的结构（`enable_vsa_gates`、`enable_vdn`）照常在构造函数里建。模型侧的这两个对象不参与写入。
+- `unified` 下，MiniMax H3 pipeline 的构造函数在 `unified` 一支里只读文件头和元数据：`FastH3WeightFusion` 和 `VDNCheckpoint` 各增加一个只读头部、生成适配器清单的新方法，原有方法不改，校验方法（`check_serving_contract` 等）与 legacy 相同；需要先建出的结构（`enable_vsa_gates`、`enable_vdn`）照常在构造函数里建。模型侧的这两个对象不参与写入。
 - Loader 的 `fasth3`、`vdn` 转换器按同样的头部算出 Δ 的位置；VDN 的 `linear_branch` 由 `extra_sources()` 作为额外的权重来源，写进 `enable_vdn` 建出的模块。
 - MiniMax H3 pipeline 的 `load_weights` 在 `unified` 下收到的 `transformer.` 流已经融合，`self._vdn.apply`、`self._fasth3.apply` 两层流包装只在 legacy 一支里执行；`validate_fully_applied` 一类的核对改由 Loader 的预检完成（8.6）。
 
@@ -647,19 +648,18 @@ HSDP 预分片配 LoRA 或量化由 05 在参数解析阶段报错。
 | 步骤 | 实现 |
 |---|---|
 | 1. 完成所有写入或绑定 | 排空所有流；对规则表声明了初始化方式、没有写入的参数写初值；没写完的量化层报 `FinalizeError`；HSDP 组件在这一步分片（第 13 节）。 |
-| 2. 需要整个模型参与、会改字节的工作 | 执行目录里 `finalize_replaced` 非空的组件登记的工作，例如会改参数的校准。工作产生的新张量记为替换。没有登记这类工作的组件跳过这一步。 |
-| 3. 共用存储的关系 | 按规则表的 `tied` 和 `TensorDecl.aliases` 核对别名与规范张量是同一个对象；不是时报 `FinalizeError`。 |
+| 2. 需要整个模型参与、会改字节的工作 | 这类工作只登记在 `loader/finalize.py` 的注册表里，每一项写明触发它的配置和它整个替换的张量名；构造结束时 Loader 按配置选出本模型的工作，把替换的张量记进 `finalize_replaced`。这一步执行选出的工作，新张量常驻加速卡时在 `ctx.memory_pools.weights()` 里分配，记为替换。注册表里没有命中的工作时跳过这一步。 |
+| 3. 共用存储的关系 | 共用的张量在 2.3 已并成一个 `TensorDecl`，7.4 绑定时别名已经指向规范张量的同一个对象；这一步把第 2 步替换的张量的别名改指向替换后的张量，再按规则表的 `tied` 和 `TensorDecl.aliases` 核对每个别名与规范张量是同一个对象，不是时报 `FinalizeError`。 |
 | 4. 按写入跟踪核对 | 带 `is_checkpoint_required` 和 `required` 的张量都已写到，量化方法声明可以缺少的张量放过；除第 2 步替换的张量以外，每个参数和持久 buffer 的绑定快照与 7.4 记录的相同。不满足时报 `FinalizeError`，写明张量名和变化的字段。 |
-| 5. 替换的张量与最终清单 | 第 2 步替换的张量拷进 host 存储（目标为 meta 时不拷）；生成最终清单（10.3）。 |
-| 6. host 存储定稿、交接和只读绑定 | 调用 `storage.seal(final_manifest)`。 |
+| 5. 替换的张量与最终清单 | 第 2 步替换的张量，最终形状和类型与预期清单的条目相同时拷进 `storage.view(name)`（目标为 meta 时不拷）；不同时留在原处，由 `seal()` 按最终清单搬入（03）。然后生成最终清单（10.3）。host 存储的定稿在第 6 步的 `seal()` 里完成（总体设计 4.1）。 |
+| 6. host 存储定稿、交接和只读绑定 | 调用 `storage.seal(final_manifest)`；返回后 Loader 重新记录全部绑定快照，第 7 步用它核对。 |
 | 7. `eval()` | 先调用 `apply_skip_softmax_calibration`（只给注意力层设置属性，不读写权重），再在每个 worker（包括等待者）上调用 `pipeline.eval()`。 |
 | 8. 交给启动事务 | 返回最终清单，由驱动调用 `commit()`。 |
 
-- 第 4 步在每个 worker 上做，只核对本 worker 自己写入的张量；共享存储里的张量由写入进程核对。瘦路径下本 rank 范围之外的张量写入跟踪记为已写，照样通过。
-- 同机共享时，等待者照常执行第 1 步，写进共享存储的张量是空操作，其余张量照常写，集合通信与写入进程的顺序相同；共享存储里的张量不做第 4、5 步，在第 6 步的 `seal()` 里接收、核对并绑定。
+- 第 4 步只核对本 worker 自己写入的张量，等待者的共享张量不做第 4、5 步，在 `seal()` 里接收、核对并绑定（总体设计 5.4）。
 - 收尾里的集合通信（HSDP 分片、量化方法的集合通信）全部在第 6 步之前完成，`seal()` 里不做集合通信。
-- 第 7 步的 `eval()` 是模型侧唯一的收尾入口：只能读权重，可以建立派生缓存等运行期状态，不能改参数和持久 buffer。调用前，Loader 把分片后端 Unit 的参数临时换成零元素占位，`eval()` 读它们会报错；调用后换回原来的绑定，再核对一次全部绑定快照，有变化时报 `FinalizeError`。需要分片后端 Unit 权重的派生状态在第一次使用时建立。
-- 新栈不调用 `post_load_weights`、`validate_loaded_weights`、`validate_restored_host_weights`。模型在自己 `load_weights` 里做的检查照常运行，例如 MiniMax H3 pipeline 的 `load_weights` 在里面调用的 `post_load_weights`。
+- 第 7 步：调用 `eval()` 之前，Loader 把分片后端 Unit 的参数（`PlacementPlan` 给出这些张量名）临时换成零元素占位，`eval()` 读它们会报错；调用之后换回原来的绑定，再与第 6 步之后记录的快照核对一次，有变化时报 `FinalizeError`。需要这些权重的派生状态在第一次使用时建立（总体设计 5.4 第 7 步）。
+- 新栈不调用 `post_load_weights`、`validate_loaded_weights`、`validate_restored_host_weights`。模型在自己 `load_weights` 里做的检查照常运行，例如 MiniMax H3 pipeline 的 `load_weights` 对 transformer 调用的 `post_load_weights`。
 - 第 5 步之后字节不再变化。读取陷阱在第 7 步结束时撤除，并最后核对一次违例。
 
 ### 10. 内容身份与清单
@@ -727,7 +727,7 @@ class FinalEntry:
     dtype: torch.dtype
     stride: tuple[int, ...]
     residency: Literal["host", "device", "hsdp"]
-    storage_key: str | None           # 绑定到的 host 存储张量键；residency 不是 host 时为 None
+    storage_key: str | None           # host 存储里的张量键，等于规范名，即 view() 用的名字；residency 不是 host 时为 None
     aliases: tuple[str, ...]
     written: Literal["self", "shared", "out_of_range"]   # 不参与摘要
 
@@ -766,32 +766,32 @@ class DynamicLoraSpec:
 
 #### 11.2 包装
 
-- 在 3.5 第 3 步，Loader 对 `lora_target_paths` 给出的组件逐层调用 `from_layer_diffusion`（`vllm_omni/diffusion/lora/utils.py`），`LoRAConfig` 的 `max_lora_rank` 取 `slot_rank`。包装的范围是管理器的 `_compute_supported_lora_modules` 给出的全部可替换线性层，不按单个适配器的 `target_modules` 筛选。被包装层的参数此时在 meta 上，`create_lora_weights` 分配的 `lora_a_stacked`、`lora_b_stacked` 因此也在 meta 上，不分配真实数据。
-- 包装后的层用 `replace_submodule` 装回原位，`self._lora_modules` 的键（组件名加模块路径）由 Loader 记在目录上，供管理器使用。
-- 规划看到包装后的最终结构：包装层整体属于原来那一层所在的 Unit，钩子装在包装层上。
+- 在 3.5 第 3 步，Loader 对 `lora_target_paths` 给出的组件逐层调用 `from_layer_diffusion`（`vllm_omni/diffusion/lora/utils.py`），`LoRAConfig` 的 `max_lora_rank` 取 `slot_rank`。包装的范围是管理器的 `_compute_supported_lora_modules` 给出的全部可替换线性层，不按单个适配器的 `target_modules` 筛选。包装不分配真实数据：`create_lora_weights` 返回之后，Loader 核对 `lora_a_stacked`、`lora_b_stacked` 都在 meta 上，不在 meta 上时报 `ConstructionError`。
+- 包装后的层用 `replace_submodule` 装回原位，包装层的规范路径记在 `catalog.wrapped_layers` 里，管理器由它得到 `_lora_modules`。
+- 规划看到包装后的最终结构：包装层整体属于原来那一层所在的 Unit，钩子装在包装层上（总体设计 5.6）。
 
 #### 11.3 名字规则
 
-- 包装后原来的参数路径多一级 `base_layer`。Loader 的通用规则：对 Loader 记录的包装层，名字里紧跟在它路径后面的 `base_layer` 段被去掉，得到规范名。目录、checkpoint 映射、内容身份、预期清单和最终清单都使用规范名。
-- 写入阶段，Loader 把每个包装层临时换回它的 `base_layer`（同一个对象），pipeline 和模块的 `load_weights` 用 `named_parameters()` 查到的就是包装前的名字；收尾第 4 步之后、第 6 步之前，Loader 把包装层换回原位。参数对象和存储绑定在这个过程中不变。
+- 包装后原来的参数路径多一级 `base_layer`。Loader 的通用规则：对 Loader 记录的包装层（动态 LoRA 包装层和 8.5 的 `FixedOverlayLinear`），名字里紧跟在它路径后面的 `base_layer` 段被去掉，得到规范名。目录、checkpoint 映射、内容身份、预期清单和最终清单都使用规范名。
+- 写入阶段，Loader 把每个包装层临时换回它的 `base_layer`（同一个对象），pipeline 和模块的 `load_weights` 用 `named_parameters()` 查到的就是包装前的名字；`overlay` 固定适配器的 A/B 由 Loader 按规范名直接写进包装层持有的张量。收尾第 4 步之后、第 6 步之前，Loader 把包装层换回原位。参数对象和存储绑定在这个过程中不变。
 - 是否启用动态 LoRA、加载了哪个动态适配器，都不影响内容身份和同机共享。
 
 #### 11.4 槽位
 
-- 每个包装层的每个 slice 有一对 A/B 槽位，形状由 `slot_rank` 和层的 TP 切分确定，类型是 stage 类型，以 `OverlaySlotDecl` 进入 `catalog.overlay_slots`。
+- 每个包装层的每个切片有一对 A/B 槽位，形状由 `slot_rank` 和层的 TP 切分确定，类型是 stage 类型，以 `OverlaySlotDecl` 进入 `catalog.overlay_slots`。
 - 规划把槽位放进“其余部分”：常驻加速卡，不进任何 Unit，不经过 HWM，不进内容身份。04 在 `prepare_materialization()` 里分配槽位并计入加速卡准入，在 `commit()` 里调用 `catalog.bind_overlay_slot` 装进包装层，再把槽位交给动态 LoRA 管理器，地址此后不变。
 
 #### 11.5 管理器的运行期
 
 `DiffusionLoRAManager` 增加 `unified` 一支（C16），由 `DiffusionWorker.init_lora_manager` 在 `unified` 下传入目录：
 
-- 构造时不调用 `resolve_offload_strategy`，不设置 `_resident_lora_device`；`_lora_modules` 取目录记录的包装层，`_max_lora_rank` 取 `slot_rank`。
+- 构造时不调用 `resolve_offload_strategy`，不设置 `_resident_lora_device`，不对包装层调用 `_set_diffusion_lora_buffer_device`；`_lora_modules` 由 `catalog.wrapped_layers` 得到，`_max_lora_rank` 取 `slot_rank`。槽位张量由 04 在 `commit()` 里绑定，管理器只用 `copy_` 往里写数据，不替换槽位张量对象，槽位地址因此到关闭前不变。
 - `_replace_layers_with_lora` 在 `unified` 下不包装，只核对适配器的 `target_modules` 都落在已包装的层里，落在外面的报错。
 - `_ensure_max_lora_rank` 在 `unified` 下不重建槽位：适配器的 rank 大于 `slot_rank` 时报错，提示调大 `--diffusion-max-lora-rank`。
 - `add_adapter` 把动态适配器读进 CPU 缓存，条数由 `max_cpu_loras` 限定，缓存归管理器，不经过 HWM。激活一个动态适配器就是把它的 A/B 拷进槽位，rank 小于槽位时补零；每次写槽位之后调用 `bump_weight_generation(pipeline)`。
 - `dynamic_lora` 为 `None` 时，`unified` 下 worker 不构造管理器，`DiffusionWorker.add_lora` 和带 `lora_request` 的请求报错，提示 `--diffusion-max-lora-rank`。
 - `peft` 加 `--lora-path` 的启动适配器在管理器构造时激活，与现有的 `set_active_adapter(init_request, lora_scale)` 相同；这一步发生在提交之后，只拷数据。
-- 包装层的前向是 `base(x) + scale · B(A(x))`。基础权重在哪由 Offloader 决定，包装层和管理器都不读 offload 配置。动态 LoRA 可以叠在融合了适配器的基础权重上。
+- 包装层的前向和其余运行期规则按总体设计 5.6；包装层和管理器都不读 offload 配置。
 
 ### 12. load_format
 
@@ -808,9 +808,11 @@ class DynamicLoraSpec:
 4. 对每个组件 [library, class]：
    PreTrainedModel 或 ModelMixin 的子类：经 HF 组件入口的分发（5.5）from_config 建结构，subfolder 为组件名
    其他（分词器、调度器、特征提取器、纯配置）：照常 from_pretrained
-5. pipeline = pipeline_cls(**components, **update_load_kwargs 给出的构造参数)
+5. pipeline = pipeline_cls(**components, **其余构造参数)；其余构造参数取 update_load_kwargs 给出的参数里
+   属于 pipeline 构造函数签名的部分
 6. adapter.attach_structure_only_pipeline(pipeline)：
-   执行 load_weights() 里不读权重的部分（apply_post_load_updates、__call__ 参数表、VAE slicing 和 tiling、注意力后端）
+   执行 load_weights() 里不读权重的部分（apply_post_load_updates、__call__ 参数表、VAE slicing 和 tiling、注意力后端），
+   不执行 self._pipeline.to(self.device) 和 diffusers 自带的 offload
 7. 声明组件：名字取 model_index.json 的键，路径为 "_pipeline.<键>"
 ```
 
@@ -828,9 +830,9 @@ class DynamicLoraSpec:
 - `parallel_config.use_hsdp` 为真时，HSDP 管理的组件是 legacy 选出的最外层 DiT（`PipelineModules.outermost_dits` 的规则），目录里 `hsdp_managed` 为真。它们同样只建结构。
 - 物化：7.4 对这些组件的参数在 CPU 上分配，只为 meta 参数分配，不用 `to_empty`，buffer 保持构造时的值（包括按配置算出的 RoPE 表）。它们不经过 HWM，`transaction.target()` 对它们返回 `None` 时也在 CPU 上分配。
 - 写入走同一个读取器和写入入口，适配器照常融合；量化层照常逐层量化。
-- 收尾第 1 步：对每个 HSDP 组件依次调用 `prepare_fp8_layers_for_fsdp`（有量化配置时）和 `apply_hsdp_to_model(module, hsdp_config, target_device)`，`hsdp_config` 的构造与 `_load_model_with_hsdp` 相同。分片之后，这些张量的绑定快照不再核对，只核对写入完整。
+- 收尾第 1 步：对每个 HSDP 组件依次调用 `prepare_fp8_layers_for_fsdp`（有量化配置时）和 `apply_hsdp_to_model(module, hsdp_config, target_device)`，`hsdp_config` 的构造与 `_load_model_with_hsdp` 相同。分片在 `ctx.memory_pools.weights()` 里进行，加速卡上的本地分片因此进入睡眠时备份的池。分片之后，这些张量的绑定快照不再核对，只核对写入完整。
 - 最终清单里这些张量的 `residency` 为 `hsdp`；04 让它们的 `fully_resident` 为假。
-- `hsdp_weight_load_strategy="pre_sharded"` 沿用 legacy 的预分片规划函数（`_prepare_pre_sharded_hsdp_load`），只把物化换成上面的规则，不调用 `_materialize_pre_sharded_hsdp_state` 和 `_finalize_pre_sharded_hsdp_loaded_weights`。
+- `hsdp_weight_load_strategy="pre_sharded"`：规划和在 meta 上的分片沿用 `_load_model_with_pre_sharded_hsdp` 里 `_prepare_pre_sharded_hsdp_load` 到 `finalize_hsdp_root` 的语句；物化不调用 `_materialize_pre_sharded_hsdp_state`，改为经 `nn.Module._apply` 只为 meta 张量在执行设备上分配本地分片，buffer 保持构造时的值，分配在 `ctx.memory_pools.weights()` 里；按 rank 读取切片沿用 legacy 的语句，在 `trap.trusted()` 里执行；不调用 `_finalize_pre_sharded_hsdp_loaded_weights`。这条路径不配 LoRA 和量化（总体设计 8.5，由 05 在参数解析阶段报错），所以不经过适配器融合。
 
 ### 14. 共存期：逐张量对比、例外表与指纹清单
 
@@ -849,6 +851,7 @@ class DynamicLoraSpec:
 - 结构可以配置的家族用合成的小 checkpoint（`tests/diffusion/weight_stack/baseline/fixtures/` 里的生成脚本），在改动对应家族目录或 `weight_stack/loader/` 的 PR 上运行，L2；结构固定的家族用真实 checkpoint，L4 每晚运行。
 - 按空闲显存选择分块大小的 VAE，对比时固定分块。
 - 融合适配器的组合逐张量对比融合结果；蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1 的组合，以“完整加载、融合、再量化”的参考结果为基准。
+- 框架同时提供 `export_legacy_hashes(family, checkpoint, od_overrides)`，把子进程 A 的快照存成逐张量的哈希文件，比较一侧可以换成这份文件。删除 `legacy` 之前用它存下每个家族的结果（总体设计 9 第 6 步、9.3），之后对比测试改为与哈希对比。
 
 #### 14.2 对比例外表
 
@@ -907,7 +910,7 @@ class LegacyReader:
 |---|---|---|
 | Wan2.2-S2V | `wan2_2/pipeline_wan2_2_s2v.py`：`Wan22S2VPipeline._init_original_format` 调用 `_load_wan_t5_as_umt5`（`torch.load` 加 `load_state_dict(assign=True)`）、`DistributedAutoencoderKLWan.from_single_file`、`Wav2Vec2ForCTC.from_pretrained`；`_init_diffusers_format` 直接调用 `UMT5EncoderModel`、`DistributedAutoencoderKLWan`、`Wav2Vec2ForCTC` 的 `from_pretrained`。 | HF 类经 `hf_component`；T5 的 `.pth` 用 `WeightSource(format="torch")` 加 Wan T5 到 UMT5 键名转换的规则表；单文件 VAE 用 `from_config` 加单文件键转换的规则表，表的测试以 `from_single_file` 为参考；`.to(self.device)` 在上下文里只改类型。 |
 | AuK | `auk/pipeline_auk.py`：`AuKPipeline.__init__` 调用 `self.dit.load_state_dict(_read_dit_weights(...))`（`safe_open` 加 `get_tensor`，`dit_state_dict` 改键），以及 `self.vae.load_weights(...)`（`auk/auk_vae.py` 的 `AuKVAE.load_weights` 用 `load_file`）。 | `declare_weights(self.dit, sources=..., writer=<dit_state_dict 的键映射>)`；`declare_weights(self.vae, sources=vae.safetensors)`，VAE 的 fp32 是构造出的类型。 |
-| Ming-Flash-Omni | `ming_flash_omni/pipeline_ming_imagegen.py`：`MingImagePipeline.__init__` 调用 `MingConditionEncoder.load_from_checkpoint`（`Qwen2ForCausalLM.from_pretrained`，`_load_optional_mlp_weights` 用 `load_file` 或 `torch.load`）和 `MingByT5Encoder.from_checkpoint`（`T5ForConditionalGeneration.from_pretrained(...).get_encoder()`，再依次 `torch.load` `base.pt`、`byt5_model.pt`、`byt5_mapper.pt` 并 `load_state_dict`）。 | Qwen2、T5 经 `hf_component`；ByT5 编码器用三条有序的 `WeightSource`（`weights_only=False`，与 legacy 相同），后面的覆盖前面的同名键；MLP 和 mapper 用 `declare_weights`。 |
+| Ming-Flash-Omni | `ming_flash_omni/pipeline_ming_imagegen.py`：`MingImagePipeline.__init__` 调用 `MingConditionEncoder.load_from_checkpoint`（`Qwen2ForCausalLM.from_pretrained`，`_load_optional_mlp_weights` 用 `load_file` 或 `torch.load`）和 `MingByT5Encoder.from_checkpoint`（`T5ForConditionalGeneration.from_pretrained(...).get_encoder()`，再依次 `torch.load` `base.pt`、`byt5_model.pt` 经 `load_state_dict` 写进编码器，`byt5_mapper.pt` 经 mapper 的 `load_weights` 写入）。 | Qwen2、T5 经 `hf_component`；ByT5 编码器（`get_encoder()` 取出的子模块）用一次 `declare_weights` 登记三条有序的来源：T5 目录（键名按 T5 的规则表映射到编码器子模块）、`base.pt`（`nested_key="state_dict"`，`include=("module.text_tower.encoder.*",)`，`strip_prefix="module.text_tower.encoder."`）、`byt5_model.pt`，torch 格式都是 `weights_only=False`，与 legacy 相同，后面的覆盖前面的同名键；MLP 和 mapper 各用一次 `declare_weights`，mapper 由它自己的 `load_weights` 写入。 |
 | Ming-Image | `ming_image/condition.py`：`MingImageConditioning.__init__` 调用 `query_encoder.load_from_checkpoint` 和 `_load_direct_weights`（`load_file` 加改键后的 `direct_projector.load_state_dict`）。 | 两处都改成 `declare_weights`，改键写进 `writer`。 |
 | π0 | `pi0/pipeline_pi0.py`：`Pi0Pipeline._initialize_model` 调用 `_load_checkpoint`（`safetensors.torch.load_file`）。 | `declare_weights(model, sources=..., writer=<_load_checkpoint 的键映射>)`。 |
 | π0.5 | `pi05/pipeline_pi05.py`：`Pi05Pipeline._initialize_model` 调用 `_load_checkpoint`（`load_file`）；`pi05/config.py`：`Pi05Config.from_pretrained` 调用 `load_lerobot_norm_stats`（`load_file`）；`_set_inference_dtype` 在加载后改类型。 | 模型同 π0；归一化统计量登记为 pipeline 上的非持久 buffer 来源，处理器在 `eval()` 里由它们建立 `NormStats`，这些 buffer 列入对比例外表；`_set_inference_dtype` 由规则表的类型取代。 |
@@ -925,21 +928,25 @@ class LegacyReader:
 | NextStep-1.1 | `nextstep_1_1/pipeline_nextstep_1_1.py`：`NextStep11Pipeline.__init__` 调用 `nextstep_1_1/modeling_flux_vae.py` 里自定义的 `AutoencoderKL.from_pretrained`（`torch.load` 加 `load_state_dict(strict=False)`）。 | 用配置构造 `AutoencoderKL`，`declare_weights` 登记 checkpoint；自定义 `from_pretrained` 里的键处理写进 `writer`。 |
 | LongCat-Video-Avatar | `longcat_video/pipeline_longcat_video_avatar.py`：`_load_components` 直接调用 `UMT5EncoderModel`、`DistributedAutoencoderKLWan`、`WhisperModel` 的 `from_pretrained`，并调用 `transformer.load_lora(...)`（`longcat_video/longcat_video_avatar_transformer.py` 的 `load_file` 加 `create_lora_network`），再 `enable_loras(["dmd"])`。 | HF 类经 `hf_component`；DMD LoRA 声明为 `overlay` 固定适配器（`format="longcat_dmd"`），A/B 在写入阶段写入，运行期由模型开关。 |
 
+构造函数里直接调用 `X.from_pretrained` 加载带权重组件、但不在上表里的 pipeline，在 `unified` 下触发读取陷阱（第 4 节表里 Hugging Face `from_pretrained` 的直接调用），由 02-18 改成 `hf_component`（umbrella 2a），`legacy` 下与原调用完全相同。主干里的这类调用点是：`flux/pipeline_flux.py`、`flux/pipeline_flux_kontext.py`、`flux2/pipeline_flux2.py`、`ernie_image/pipeline_ernie_image.py`、`helios/pipeline_helios.py`、`glm_image/pipeline_glm_image.py`、`hidream_image/pipeline_hidream_image.py`、`lingbot_video/pipeline_lingbot_video.py`、`cosmos3/pipeline_cosmos3.py` 的 VAE；完整清单以支持矩阵测试（5.7）的结果为准。用到的类在 02-3 或 02-18 里有规则表。
+
+LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `LINGBOT_VIDEO_FP32_MODULES` 匹配的参数保持 fp32（类上的 `_keep_in_fp32_modules` 取同一个列表），`LingBotVideoPipeline.to` 覆写在整体改类型之后再调用一次 transformer 自己的 `.to`。`unified` 下这一效果由 `LingBotVideoTransformer3DModel` 规则表的 `keep_fp32` 条目表达，条目的取值方式由逐表测试对 `from_pretrained` 的结果确定，LingBot-Video 另有一个以 legacy 为基准的逐张量对比测试（总体设计 9.3）；两个 `.to` 覆写不改，`legacy` 下行为不变，删除 `legacy` 时删除。
+
 ### 17. 本 RFC 承担的共存期必改行
 
-每一行只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变。承担一行的 PR 按 01 的 9.4 新增位置文件 `tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py`，在 `SITES` 里写出它新增的读总开关或构造上下文的位置；本 RFC 自己的分发点 D06 在 02-2 的位置文件里用 `NEW_ROW` 声明。
+每一行只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变（01 的 9.3）。承担一行的 PR 按 01 的 9.4 新增位置文件 `tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py`（例如 `C16_02_7.py`），在 `SITES` 里写出它新增的读总开关或构造上下文的位置，不修改 `registry.py`；一行拆给两个 PR 时各自新增一个位置文件。本 RFC 自己的分发点 D06 在 02-2 的位置文件 `D06_02_2.py` 里用 `NEW_ROW` 声明。模型代码只经 `is_unified_stack()` 或 `is_building_structure()` 判断。
 
 | 编号 | 位置 | `unified` 一支 |
 |---|---|---|
 | C02 | `magi2/mh_moe.py` 的 `Magi2MultiHeadMoE` | `is_building_structure()` 为真时只注册合并的参数 `W13`，`weight_loader` 按 shard id 写进交错的两半；上下文外保留 `W_gate`、`W_up`、`_owned_w13` 和 `_apply` 覆写。 |
 | C04 | MiniMax H3 的 AdaLN sidecar（`MiniMaxH3Pipeline._configure_adaln_sidecar`、`_verify_adaln_weights`、`_finish_adaln_sidecar`） | sidecar 的张量注册为 meta 非持久 buffer，由 `BufferSource` 写入；`eval()` 只用写好的 buffer 给 AdaLN 缓存播种，设备用 `execution_device()`，校验用 Loader 的内容身份。 |
-| C05 | `minimax_h3/vae.py` 里按 `next(self.parameters())` 取设备和类型、类型不是 fp32 时先 `self.to(torch.float32)`、结束后 `self.to(previous_dtype)` 的两处 | 规则表的 `runtime_dtype` 让这个 VAE 从写入起就是 fp32，往返的条件不成立；设备取 `execution_device()`。 |
+| C05 | `minimax_h3/vae.py` 里按 `next(self.parameters())` 取设备和类型、类型不是 fp32 时先 `self.to(torch.float32)`、结束后 `self.to(previous_dtype)` 的两处 | 规则表的 `runtime_dtype` 给出这个 VAE 运行时的类型，`next(self.parameters())` 读到的类型是 fp32，`unified` 下往返的条件不成立；设备取 `execution_device()`。 |
 | C09 | `sana_wm/pipeline_sana_wm.py` 的 `_ensure_stage1_text_encoder`、`_ensure_vae` | 不做 `.to(device, dtype)`；VAE 和第一阶段文本编码器在构造函数的 unified 一支里经 HF 组件入口建出，请求期不再 `from_pretrained`。 |
 | C10 | `hunyuan_image3/pipeline_hunyuan_image3.py` 的 `HunyuanImage3Pipeline.load_weights` 在调用 `AutoWeightsLoader` 之前对零散模块的 `.to(device)` | 只在 `legacy` 下执行。 |
 | C11 | `kandinsky6/pipeline_kandinsky6.py` 构造函数里由第一个参数的设备决定的 `self.device` | `unified` 下取 `execution_device()`。 |
-| C13 | `registry.py` 的 `_apply_wan_vae_fastpath_if_enabled`；`wan_vae_fastpath/install.py` 的 `install_wan_vae_fastpath` 对卷积权重的布局转换和 `tensor.data=` 的撤销、回滚 | 布局由规则表表达，Loader 按步长分配；安装时只绑定前向，不转换布局，不登记布局的撤销和回滚（第 15 节）。 |
+| C13 | `registry.py` 的 `_apply_wan_vae_fastpath_if_enabled`；`vllm_omni/diffusion/distributed/autoencoders/wan_vae_fastpath/install.py` 的 `install_wan_vae_fastpath` 对卷积权重的布局转换和 `tensor.data=` 的撤销、回滚 | 布局由规则表表达，Loader 按步长分配；安装时只绑定前向，不转换布局，不登记布局的撤销和回滚（第 15 节）。 |
 | C15 | `ltx2/ltx2_runtime.py` 的 `_run_ltx_vocoder` 对带 `bwe_generator` 的 vocoder 在 mps、xpu、cpu 上的 `vocoder.float()` 往返 | 规则表在这些平台上让 vocoder 保持 fp32，取值为 `stage_rounded`（与往返得到的字节相同），往返的条件不成立。 |
-| C16 | `DiffusionLoRAManager` 的包装和 `_ensure_max_lora_rank`；`DiffusionWorker.init_lora_manager` 的 distill 融合 | 包装挪到只建结构（11.2、11.5），融合挪到读取器（8.4）。 |
+| C16 | `DiffusionLoRAManager` 的包装和 `_ensure_max_lora_rank`；`DiffusionWorker.init_lora_manager` 的 distill 融合；`DiffusionWorker.add_lora` | 融合挪到读取器（8.4，02-7）；包装挪到只建结构，管理器和 `add_lora` 的 `unified` 一支见 11.5（02-8）。 |
 | C18 | `DiffusersAdapterPipeline._raise_unsupported_features` 对 `diffusion_offload_config` 的拒绝 | `unified` 下不执行这项拒绝，其余拒绝不变（12.1）。 |
 | D06 | `models/utils.py` 的 `create_transformers_model`、`create_transformers_model_with_vllm_linears` | `is_building_structure()` 为真时跳过 `init_parameters`、`init_parameters_preserving_vllm_linear`（3.4）。 |
 
@@ -952,26 +959,26 @@ class LegacyReader:
 | `weight_stack.loader.create_loader(ctx)`、`Preflight`、`ExpectedManifest`、`FinalManifest` | 01 | 签名见设计第 1 节和第 10 节；`Preflight.content_identities` 是组件名到摘要的映射，直接填进 `RankFingerprints.content_identities`。 |
 | `Loader.write()` 的绑定规则 | 03、04 | 每个张量调用一次 `transaction.target(name)`，名字是预期清单的规范名；返回张量的形状、类型、步长必须与清单一致；返回 meta 张量表示写入是空操作。 |
 | `Loader.finalize()` | 01、03 | 第 6 步之前完成收尾里的全部集合通信，第 6 步调用一次 `storage.seal(final_manifest)`；`final_manifest.live()` 给出要重新绑定的模型张量。 |
-| `ComponentCatalog` 及其方法 | 04 | `plan()` 先调用 `require_complete()`；`commit()` 调用 `set_fully_resident()` 和 `bind_overlay_slot()`；`write_transient` 计入加速卡准入；`shapes_final`、`finalize_replaced` 用于冷启动路径和共享条件。 |
+| `ComponentCatalog` 及其方法 | 04 | `plan()` 第一步调用 `require_complete()`，组件不完整或保持 fp32 的层配了量化时报 `PlanningError`；`plan()` 经 `set_discovered_blocks()` 记录自动发现的重复块；`commit()` 调用 `set_fully_resident()` 和 `bind_overlay_slot()`；`write_transient` 计入加速卡准入；`shapes_final`、`finalize_replaced` 用于冷启动路径和共享条件。 |
 | `ExpectedManifest` | 03 | `layout(plan, expected_manifest)` 的输入；`digest(names)` 是交接时核对的预期清单摘要。 |
 | `weight_stack.components` 的查询函数、`execution_device()`、`is_unified_stack()`、`weight_generation()`、`bump_weight_generation()` | 04、模型代码、`cache/`、`lora/`、`registry.py` | 第 2.8 节。`is_unified_stack()` 是模型代码读总开关的唯一入口（01 的 T6）。 |
-| `model_loader.construct`：`build_component`、`declare_weights`、`hf_component`、`is_building_structure`、`WeightSource`、`BufferSource` | 模型代码 | 第 5 节；上下文外调用 `declare_weights` 和 `unified` 下的 `build_component` 报 `LifecycleError`。 |
+| `model_loader.construct`：`build_component`、`declare_weights`、`hf_component`、`is_building_structure`、`WeightSource`、`BufferSource` | 模型代码 | 第 5 节；`declare_weights` 在构造阶段之外调用、`unified` 下 `build_component` 和 HF 组件入口（带权重的类）在构造阶段之外调用，都报 `LifecycleError`。 |
 | `DynamicLoraSpec` 和包装层记录 | 04、`lora/manager.py` | 槽位形状来自 `overlay_slots`；管理器从目录取包装层。 |
 
 ### 本 RFC 依赖的约定
 
 | 子 RFC | 约定 |
 |---|---|
-| [01](./01-startup-transaction.md) | `StartupContext`（含 `memory_pools`）、`Loader` 协议、错误类型、`process_weight_stack()`；驱动不进入睡眠池，常驻加速卡张量由 Loader 在 `memory_pools.weights()` 里分配；驱动在第 10 步成功之后立即调用 `loader.close()`；登记表的位置文件接受本 RFC 用 `NEW_ROW` 声明的 D06；T6 不检查 `model_loader/construct.py` 和 `model_loader/hub_prefetch.py` 内部；测试替身（全部常驻的规划、空的 host 存储）用于对比框架。 |
+| [01](./01-startup-transaction.md) | `StartupContext`（含 `memory_pools`）、`Loader` 协议、错误类型；总开关取自 `weight_stack.startup` 的 `WeightStack` 和 `process_weight_stack()`；驱动不进入任何睡眠池，常驻加速卡的张量（包括收尾里新建、替换的张量和 HSDP 的本地分片）由 Loader 自己在 `ctx.memory_pools.weights()` 里分配；驱动在第 10 步成功之后立即调用 `loader.close()`；必改行和 D06 的位置文件放在 `tests/diffusion/weight_stack/coexistence/sites/` 下，D06 用 `NEW_ROW` 声明，不修改 `registry.py`；T6 不检查 `weight_stack/`、`model_loader/construct.py` 和 `model_loader/hub_prefetch.py` 内部；测试替身（全部常驻的规划、空的 host 存储）用于对比框架。单进程执行器在同一进程里依次进行各 worker 的 `unified` 启动（3.1）。 |
 | [03](./03-host-storage.md) | `HostStorage.view(name)` 对瘦路径下本 rank 范围之外的张量、以及等待者的共享张量返回形状和类型正确的 meta 张量；`seal()` 在每个 worker、每种后端上都被调用一次：私有存储和分片在其中定稿，共享存储在其中封存、交接并用 `final_manifest.live()` 重新绑定；`layout()` 只读 `ExpectedManifest` 的条目。 |
-| [04](./04-unified-offloader.md) | `plan()` 第一步调用 `catalog.require_complete()`；`PlacementPlan` 给出每个组件的冷启动路径，供预检核对；`transaction.target()` 的语义同 01；`prepare_materialization()` 分配叠加层槽位，`commit()` 调用 `bind_overlay_slot()` 并把槽位交给动态 LoRA 管理器；自动发现的重复块结果记在目录上，供 `repeated_block_paths` 返回；`setup_compile` 经查询接口选目标。 |
+| [04](./04-unified-offloader.md) | `plan()` 第一步调用 `catalog.require_complete()`，并经 `set_discovered_blocks()` 记录自动发现的重复块；`PlacementPlan` 给出每个组件的冷启动路径（供预检核对）和分片后端 Unit 的张量规范名（供收尾第 7 步换成占位）；`transaction.target()` 的语义同 01；`prepare_materialization()` 分配叠加层槽位，`commit()` 调用 `bind_overlay_slot()` 并把槽位交给动态 LoRA 管理器；`repeated_block_paths` 返回 `set_discovered_blocks()` 记录的结果；`setup_compile` 经查询接口选目标。 |
 | [05](./05-configuration.md) | 解析 `--diffusion-max-lora-rank` 并检查合法值；HSDP 预分片配 LoRA 或量化在参数解析阶段报错；支持矩阵文档收录 5.7 的结果。 |
 
 ## 代码组织
 
 ```text
 vllm_omni/diffusion/weight_stack/
-  components.py            ComponentDecl、ComponentCatalog、TensorDecl、OverlaySlotDecl、查询函数
+  components.py            ComponentDecl、ComponentCatalog、TensorDecl、OverlaySlotDecl、查询函数、目录的弱引用表
   loader/
     __init__.py            create_loader、Preflight、ExpectedManifest、FinalManifest、ContentIdentity
     loader.py              UnifiedLoader：build_structure、preflight、write、finalize、close
@@ -984,7 +991,7 @@ vllm_omni/diffusion/weight_stack/
     quant.py               quant_output_specs、逐层量化
     adapters/              AdapterFormat 注册表；diffusers、kohya、fasth3、vdn、ltx_phase、longcat_dmd 转换器
     overlay.py             动态 LoRA 包装、FixedOverlayLinear、base_layer 名字规则
-    finalize.py            收尾第 1 到第 7 步
+    finalize.py            收尾第 1 到第 7 步、第 2 步工作的注册表
     identity.py            ContentIdentity、ExpectedManifest、FinalManifest
     diffusers_format.py    load_format="diffusers"
     hsdp.py                HSDP 组件的物化和分片
@@ -1014,6 +1021,7 @@ tests/diffusion/weight_stack/baseline/
 | `vllm_omni/diffusion/cache/cachedit/backend.py`、`vllm_omni/diffusion/registry.py` | 第 15 节的查询接口迁移；C13。 |
 | `vllm_omni/diffusion/models/diffusers_adapter/pipeline_diffusers_adapter.py` | C18；新方法 `attach_structure_only_pipeline`。 |
 | 19 个家族目录、`magi2/mh_moe.py`、`sana_wm/`、`hunyuan_image3/`、`kandinsky6/`、`ltx2/ltx2_runtime.py` | 第 16、17 节。 |
+| 第 16 节列出的直接调用 `X.from_pretrained` 的 pipeline（`flux/`、`flux2/`、`ernie_image/`、`helios/`、`glm_image/`、`hidream_image/`、`lingbot_video/`、`cosmos3/`） | 调用点改成 `hf_component`；LingBot-Video 的 `.to` 覆写不改，由规则表表达。 |
 
 ## 实现拆分
 
@@ -1026,34 +1034,38 @@ tests/diffusion/weight_stack/baseline/
 | 02-3 | 2b | 规则表的格式和执行、`generate` 工具、逐表测试框架，以及主干 pipeline 用到的 Hugging Face 类的第一批表 | `loader/rules/` | `rules/test_rule_tables.py` | 02-2 | L | 无 |
 | 02-4 | 2c | 来源解析、读取流水线、延迟张量、预检的来源核对、内容身份、预期清单 | `loader/reader.py`、`loader/identity.py` | `test_reader.py`、`test_lazy_tensor.py`、`test_content_identity.py` | 02-2 | L | 无 |
 | 02-5 | 2c | 存储绑定、写入入口选择、写入跟踪、逐层在线量化、收尾顺序、最终清单、HSDP 组件的物化和分片 | `loader/writer.py`、`loader/quant.py`、`loader/finalize.py`、`loader/hsdp.py` | `test_write_tracking.py`、`test_online_quant.py`、`test_finalize.py`、`test_manifests.py`、`test_hsdp.py` | 02-3、02-4 | L | 无 |
-| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_stack/baseline/`、`loader/fingerprints.py` | 框架自测（用一个已按新写法构造的 pipeline，例如 Z-Image） | 02-5 | M | 无 |
+| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架和 `export_legacy_hashes`、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_stack/baseline/`、`loader/fingerprints.py` | 框架自测（用一个已按新写法构造的 pipeline，例如 Z-Image） | 02-5 | M | 无 |
 | 02-7 | 2c | 适配器格式转换器（diffusers、kohya、fasth3、vdn）、读取器里的融合、预检的键核对、`fuse` 固定适配器、worker 的 distill 分支 | `loader/adapters/`、`diffusion_worker.py` | `test_adapters.py`；融合后在线量化在 TP 为 1 和 2 时与参考一致 | 02-5 | L | C16（融合） |
 | 02-8 | 2f | 动态 LoRA 包装、`base_layer` 名字规则、槽位声明、`overlay` 固定适配器（ltx_phase、longcat_dmd 转换器）、管理器的 `unified` 一支 | `loader/overlay.py`、`lora/manager.py`、`diffusion_worker.py` | `test_overlay.py`；加载、切换、卸载动态 LoRA 前后结构和基础权重地址不变 | 02-5 | M | C16（包装） |
 | 02-9 | 2f | `load_format="diffusers"` 的 `unified` 一支、`attach_structure_only_pipeline`、C18 | `loader/diffusers_format.py`、`pipeline_diffusers_adapter.py` | `test_diffusers_format.py`；SDXL fp16 的 `upcast_vae` 由规则表固定类型 | 02-3、02-5 | M | C18 |
-| 02-10 | 2e | 查询接口和第 15 节的使用方迁移、Wan VAE 的内存格式规则表 | `components.py`、`cache/cachedit/backend.py`、`registry.py`、`lora/manager.py` | `test_query_api.py` | 02-2、02-3 | M | C13 |
+| 02-10 | 2e | 查询接口和第 15 节的使用方迁移、Wan VAE 的内存格式规则表 | `components.py`、`cache/cachedit/backend.py`、`registry.py`、`distributed/autoencoders/wan_vae_fastpath/install.py`、`lora/manager.py`、`loader/rules/` | `test_query_api.py` | 02-2、02-3 | M | C13 |
 | 02-11 | 2d | MiniMax H3 | `minimax_h3/` | 对比测试（合成 checkpoint，L2；真实 checkpoint，L4） | 02-6、02-7 | L | C04、C05 |
 | 02-12 | 2d | MAGI-2、Lance | `magi2/`、`lance/` | 对比测试 | 02-6 | L | C02 |
 | 02-13 | 2d | LTX2 | `ltx2/` | 对比测试；相位适配器开关前后的输出与 legacy 一致 | 02-6、02-8 | M | C15 |
 | 02-14 | 2d | Wan2.2-S2V、DreamZero、LongCat-Video-Avatar | `wan2_2/`、`dreamzero/`、`longcat_video/` | 对比测试 | 02-6、02-8 | M | 无 |
 | 02-15 | 2d | Ming-Flash-Omni、Ming-Image、Anima、NextStep-1.1、Cosmos3 声音 tokenizer 和 Cosmos3 的显式组件声明、SeedVR2、AuK、OmniVoice | 对应家族目录 | 对比测试 | 02-6 | L | 无 |
 | 02-16 | 2d | π0、π0.5、InternVLA-A1、Gr00t | 对应家族目录 | 对比测试 | 02-6 | M | 无 |
-| 02-17 | 2a | SANA-WM、HunyuanImage3、Kandinsky6 的必改行 | `sana_wm/`、`hunyuan_image3/`、`kandinsky6/` | 每行一个 `unified` 用例 | 02-2 | S | C09、C10、C11 |
+| 02-17 | 2a | SANA-WM、HunyuanImage3、Kandinsky6 的必改行；SANA-WM 构造函数里的 HF 组件改用 `hf_component` | `sana_wm/`、`hunyuan_image3/`、`kandinsky6/` | 每行一个 `unified` 用例；`legacy` 下已有测试不变 | 02-3 | S | C09、C10、C11 |
+| 02-18 | 2a | 第 16 节列出的直接调用 `X.from_pretrained` 的 pipeline 改用 `hf_component`；所需类的规则表，包括 LingBot-Video 的 `keep_fp32` 条目 | 第 16 节列出的 pipeline 文件、`loader/rules/` | 支持矩阵里这些 pipeline 构造成功；新增规则表的逐表测试；LingBot-Video 的逐张量对比测试 | 02-3、02-6 | M | 无 |
 
 - 每个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变，不修改已有测试文件；承担必改行的 PR 新增自己的位置文件（第 17 节），PR 描述写明行编号和这一行的 `legacy_removal`。
-- 02-11 到 02-16 可以并行；它们合入之前，这些 pipeline 在 `unified` 下启动报 `ConstructionError`。
-- 依赖关系：
+- 02-11 到 02-16、02-18 可以并行；它们合入之前，对应的 pipeline 在 `unified` 下启动报 `ConstructionError`。
+- 本 RFC 的 PR 之间的依赖如下，都在 01 的全部 PR 之上，与 03、04 的 PR 互不依赖（umbrella 的依赖图）：
 
 ```text
 01-1..01-7
   02-1
     02-2
-      02-3      02-4      02-17
-      02-10（依赖 02-2、02-3）
-        02-5（依赖 02-3、02-4）
-          02-6    02-7    02-8    02-9（依赖 02-3、02-5）
-            02-11（依赖 02-6、02-7）
-            02-12、02-15、02-16（依赖 02-6）
-            02-13、02-14（依赖 02-6、02-8）
+      02-3
+        02-10、02-17          依赖 02-3
+      02-4
+        02-5                  依赖 02-3、02-4
+          02-6、02-7、02-8
+          02-9                依赖 02-3、02-5
+            02-11             依赖 02-6、02-7
+            02-12、02-15、02-16  依赖 02-6
+            02-13、02-14      依赖 02-6、02-8
+            02-18             依赖 02-3、02-6
 ```
 
 ## 测试计划
@@ -1064,14 +1076,16 @@ tests/diffusion/weight_stack/baseline/
 
 - 默认推导对 `SupportsComponentDiscovery` 和回退属性各一个用例，角色按 2.2 的表；显式声明取代推导。
 - 路径列表、嵌套划出（Cosmos3 式的 `transformer.language_model`）、别名模块去重、共用参数去重、非模块对象上的路径（Gr00t 式）。
-- 完整性：缺归属和多归属各报出全部路径；`require_complete()` 报 `PlanningError`。
+- 完整性：缺归属和多归属各报出全部路径；保持 fp32 的层配了量化方法时记进 `dtype_violations`；两类违例都只在 `require_complete()` 里报 `PlanningError`，构造阶段不报错。
+- 目录不挂在 pipeline 对象上；pipeline 被回收后弱引用表里的条目消失；`set_discovered_blocks`、`set_fully_resident`、`bind_overlay_slot` 重复调用报 `LifecycleError`。
 - 带类型字段：每个字段的每条校验规则一个反例。
 
 **构造上下文和读取陷阱**（`test_context.py`、`test_trap.py`）
 
 - 在 `torch.device("cuda")` 和 `set_default_torch_dtype` 里构造，参数仍落到 meta，子类和 `weight_loader` 保留；buffer 在 CPU。
 - `.to("cuda", torch.float16)` 只改类型；`.to(memory_format=torch.channels_last)` 改步长；`to_empty` 报错。
-- 陷阱：第 4 节表里每个被拦截的调用在两个阶段各一个用例；头部读取放行；`from safetensors import safe_open` 绑进模块命名空间的名字同样被拦截；上下文里新 import 的模块同样被拦截；Loader 读取器的线程池不被拦截。
+- 陷阱：第 4 节表里每个被拦截的调用在两个阶段各一个用例；头部读取放行；`from safetensors import safe_open` 绑进模型模块和 `vllm`、`diffusers` 模块命名空间的名字同样被拦截；上下文里新 import 的模块同样被拦截；Loader 读取器的线程池不被拦截；上下文关闭后所有名字恢复为原对象。
+- 同一进程里第二个上下文在第一个关闭之前打开时报 `LifecycleError`；动态 LoRA 槽位和 `overlay` A/B 的 meta 张量不被构造后检查报出。
 - 模型代码用 `try/except` 吞掉陷阱的异常，`build_structure()` 照样报错，信息里有调用位置。
 - 构造期用权重数值算出的普通属性（meta 张量）被构造后检查报出。
 
@@ -1084,9 +1098,10 @@ tests/diffusion/weight_stack/baseline/
 
 - 来源解析与 `DiffusersPipelineLoader._prepare_weights` 的结果相同；有序来源只产出最后一个来源的张量。
 - 延迟张量：视图操作不读数据；写进 meta 目标不读数据；`narrow` 之后物化只读对应的切片（统计读取字节数）。
-- 写入跟踪：重复写入报 `WriteError`；`writer`、`AutoWeightsLoader`、`load_state_dict` 的写入都被计数；改绑参数（`param.data = ...`、替换 `Parameter` 对象）在收尾第 4 步被报出。
-- 逐层量化：用一个 fp8 在线量化的小模型，量化在每层写完时立即发生，量化前的临时张量随即释放，最终字节与 legacy 的 `_process_weights_after_loading` 一致；输出声明与实际不符时报错。
-- 收尾：第 2 步为空时跳过；`tied` 核对；`eval()` 读分片后端 Unit 的参数时报错；`eval()` 改了参数时报 `FinalizeError`；不调用 `post_load_weights` 等钩子（用替身模型记录调用）；读取陷阱在收尾结束时最后核对一次违例。
+- 写入跟踪：重复写入报 `WriteError`；`writer`、`AutoWeightsLoader`、`load_state_dict` 的写入都被计数；包装后的 `weight_loader` 与原函数对同一输入写出相同的字节，没有 `weight_loader` 的参数走 `default_weight_loader`；改绑参数（`param.data = ...`、替换 `Parameter` 对象）在收尾第 4 步被报出。
+- 预检：名字映射由 Loader 决定的来源缺少 `required` 张量时报 `PreflightError`；经模型 `load_weights` 写入的来源不做这项核对，缺写的张量在收尾第 4 步报出。
+- 逐层量化：用一个 fp8 在线量化的小模型，量化在每层写完时立即发生，量化前的临时张量随即释放，最终字节与 legacy 的 `_process_weights_after_loading` 一致；输出声明与实际不符时报错；不经过 `weight_loader` 写量化层量化前的参数时报 `WriteError`；输出目标全是 meta 的层不读 checkpoint，层上的运行期属性与目标为真实存储时相同。
+- 收尾：第 2 步的注册表为空时跳过；第 2 步替换的张量的别名在第 3 步改指向新张量；`tied` 核对；常驻加速卡的新张量在 `weights()` 池里分配（用记录进入次数的替身 `MemoryPools`）；`eval()` 读分片后端 Unit 的参数时报错；`eval()` 改了参数时按第 6 步之后的快照报 `FinalizeError`，`seal()` 的只读重绑定本身不报错；不调用 `post_load_weights` 等钩子（用替身模型记录调用）；读取陷阱在收尾结束时最后核对一次违例。
 
 **内容身份和清单**（`test_content_identity.py`、`test_manifests.py`）
 
@@ -1104,7 +1119,7 @@ tests/diffusion/weight_stack/baseline/
 **load_format 和 HSDP**（`test_diffusers_format.py`、`test_hsdp.py`）
 
 - 用测试资源里缩小到几层、由 `save_pretrained` 生成的 diffusers 格式模型目录：`unified` 下不调用 `load_weights()`，组件声明来自 `model_index.json`，前向输出与 legacy 一致（L2，CUDA 单卡）。
-- HSDP：物化只为 meta 参数分配，RoPE 表等非持久 buffer 保持构造时的值；L2，`parallel`，2 卡，输出与 legacy 的 HSDP 一致。
+- HSDP：物化只为 meta 参数分配，RoPE 表等非持久 buffer 保持构造时的值，不调用 `to_empty`；分片在 `weights()` 池里进行；`pre_sharded` 不调用 `_materialize_pre_sharded_hsdp_state` 和 `_finalize_pre_sharded_hsdp_loaded_weights`；L2，`parallel`，2 卡，两种策略的输出都与 legacy 的 HSDP 一致。
 
 **查询接口**（`test_query_api.py`）
 
@@ -1135,6 +1150,8 @@ tests/diffusion/weight_stack/baseline/
 - 融合适配器后再在线量化的结果，在 TP 为 1 和大于 1 时都与先融合、后量化的参考一致。
 - 在线量化时 Host 和加速卡的峰值不高于 `legacy` 的逐层量化。
 - 内容身份的包含项和不包含项与总体设计 5.5 一致，由测试逐项断言。
+- 组件不完整、保持 fp32 的层配了量化方法，都在规划阶段由 `require_complete()` 报 `PlanningError`。
+- 常驻加速卡的张量（包括收尾里新建的和 HSDP 的本地分片）都在 `memory_pools.weights()` 里分配，只建结构期间的分配和写入期间的临时张量不在任何睡眠池里。
 - 加载、切换、卸载动态 LoRA 前后，模块结构和基础权重的地址不变。
 - `unified` 下 `load_format="diffusers"` 不调用适配器的 `load_weights()`；HSDP 组件的物化不调用 `to_empty`。
 - 第 15 节的使用方在 `unified` 下都从组件目录读取，不读 `_dit_modules`、`_encoder_modules`、`_vae_modules`。
@@ -1153,7 +1170,7 @@ tests/diffusion/weight_stack/baseline/
 - 删除之前，逐张量对比测试的 legacy 结果存成逐张量的哈希；删除之后，对比测试改为与这份哈希对比，对比例外表保留。
 - 指纹清单 `LEGACY_READERS` 和指纹测试。
 
-总体设计 9.3 的删除前保证里与加载有关的两条由本 RFC 落实：逐张量对比的 legacy 结果已存成逐张量的哈希；只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类先补进 `_repeated_blocks`（列表见总体设计 9.3）的测试与 04 共用，本 RFC 的 02-10 保证 `repeated_block_paths` 在 `unified` 下给出与补齐后的 `_repeated_blocks` 相同的编译目标。
+总体设计 9.3 的删除前保证里与加载有关的一条由本 RFC 落实：逐张量对比的 legacy 结果已经用 `export_legacy_hashes` 存成逐张量的哈希（14.1）。重复块发现的期望表、只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类补进 `_repeated_blocks`、MAGI-2 内存窗口的 recipe 由 04 和 05 落实；02-10 的 `repeated_block_paths` 在 `unified` 下返回组件声明或 04 记录的结果，不读 `_layerwise_offload_blocks_attrs`。
 
 ## 风险
 
@@ -1164,6 +1181,9 @@ tests/diffusion/weight_stack/baseline/
 | 写入期间把包装层临时换回 `base_layer`。 | 模型 `load_weights` 持有包装层引用时找不到原来的层。 | 换回的是同一个 `base_layer` 对象；`test_overlay.py` 对启用动态 LoRA 的 pipeline 跑一遍写入，主干里 `_lora_components` 声明的 pipeline 都覆盖。 |
 | 规则表跟不上 transformers 或 diffusers 的升级。 | 升级后 `from_pretrained` 的行为变化没有反映到表里，字节不一致。 | 逐表测试断言库版本，升级时全部表重新验证。 |
 | 量化方法缺少输出声明。 | 使用这种量化方法的模型在 `unified` 下构造失败。 | 报错写明方法名并提示 `legacy`；支持矩阵按量化方法列出。 |
+| checkpoint 里同一层的张量不相邻，或多线程读取让几层交错写入。 | 几层量化前的临时张量同时存在，写入期间的显存峰值超过 `write_transient.quant_layer_bytes`，准入通过后在写入阶段显存不足。 | 读取器对含量化层的组件按键名的自然顺序产出张量，不对这些组件开多线程；Loader 记录写入期间临时张量的峰值并写进启动日志，在线量化的测试断言峰值不超过 `quant_layer_bytes`。 |
+| 陷阱的补丁对整个进程生效。 | 上下文打开期间同一进程里的其他加载（例如同进程里另一个 stage 的加载）被拦截。 | 同一进程同一时刻只有一个上下文（3.1）；报错写明调用位置，便于定位。 |
+| `pre_sharded` 的物化经 `nn.Module._apply` 只替换 meta 张量（第 13 节）。 | 与 HSDP 在 meta 上分片之后的内部状态不配合时，本地分片没有被 HSDP 登记。 | `test_hsdp.py` 的 2 卡用例对 `pre_sharded` 比较输出和每个分片的字节，这个用例是 02-5 合入的条件。 |
 
 ## 反馈期
 
