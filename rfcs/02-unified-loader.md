@@ -203,6 +203,7 @@ class OverlaySlotDecl:
 
 class ComponentCatalog:
     entries: Mapping[str, CatalogEntry]          # 按组件名排序
+    declaration_order: tuple[str, ...]           # 组件名按声明顺序：declare_components 的顺序；默认推导时按推导顺序（2.2）
     overlay_slots: tuple[OverlaySlotDecl, ...]   # 动态 LoRA 槽位（11.4），不属于任何组件
     wrapped_layers: tuple[str, ...]              # 动态 LoRA 包装层的规范路径（11.2），供管理器使用
     dynamic_lora: DynamicLoraSpec | None         # 11.1；None 表示不启用
@@ -217,6 +218,7 @@ class ComponentCatalog:
     def set_fully_resident(self, component: str, value: bool) -> None: ...
 ```
 
+- `declaration_order` 给出组件的声明顺序。04 按这个顺序调用 05 的 `resolve_selection()`、清点 `resident_layers`；`entries` 按组件名排序，只用于查找。
 - `tensors` 是最终张量表：参数、持久 buffer、登记过来源的数据张量、量化方法声明的输出张量（7.6）、`overlay` 固定适配器的 A/B（8.5）。量化层量化前的参数不在表里，它们只在写入期间以临时张量的形式存在于加速卡上。
 - `kind="buffer"` 只指持久 buffer。没有登记来源的非持久 buffer（例如按配置算出的 RoPE 表）不在表里，它们跟随所在模块由 Offloader 放置。
 - `bind_overlay_slot` 只给 04 用：04 在 `prepare_materialization()` 里分配槽位，在 `commit()` 里调用它把槽位装进包装层，然后交给动态 LoRA 管理器。每个槽位只能绑定一次，形状和类型必须与声明一致。

@@ -672,7 +672,7 @@ offload 策略 = Unit + Trigger + Transport
 ### CUDA graph 与编译
 
 - `fully_resident` 由 `commit()` 填写：组件的全部权重和 buffer 常驻加速卡，地址到 `close()` 前不变，并且组件不由 HSDP 管理。
-- 模型自己捕获的 CUDA graph 只能读取 `fully_resident` 组件的权重，不是的走 eager。模型通过一个通用函数读这个属性：`unified` 下读声明，`legacy` 下执行模型现有的判断。Offloader 的钩子在 graph 捕获期间被调用时直接报错。
+- 模型自己捕获的 CUDA graph 只能读取 `fully_resident` 组件的权重，不是的走 eager。模型通过一个通用函数读这个属性：`unified` 下读声明，`legacy` 下执行模型现有的判断。graph 捕获期间，块环和使用触发的钩子被调用时直接报错；常驻组件上的让出钩子只在这次调用需要让出 Unit 时报错。
 - 编译设置在 `commit()` 之后运行，编译目标从组件声明读取。`reduce-overhead`、`max-autotune`、`triton.cudagraphs` 只用于 `fully_resident` 的组件；对其他组件，通用的编译函数自己降成 `default` 并记日志。
 - 以权重为键的运行期缓存用参数身份加写入代数做签名，不用存储地址和设备。
 

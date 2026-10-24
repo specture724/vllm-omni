@@ -824,7 +824,7 @@ offload 策略 = Unit + Trigger + Transport
 
 - 模型自己捕获的 CUDA graph 只能读取 `fully_resident` 组件的权重。模型通过一个通用函数读这个属性：`unified` 下读声明，`legacy` 下执行模型现有的判断。
 - 不是 `fully_resident` 的组件走 eager。
-- 安全网：Offloader 的钩子在 graph 捕获期间被调用时直接报错，写明组件名。
+- 安全网：graph 捕获期间，块环和使用触发的钩子被调用时直接报错，写明组件名；常驻组件上的让出钩子只在这次调用需要让出 Unit 时报错。
 
 **编译**。
 
