@@ -363,7 +363,7 @@ Loader 按固定顺序做一次：
 
 动态 LoRA 是叠加在基础权重之上的叠加层，不修改基础权重。它的结构在启动时定死，提交之后只拷数据。
 
-**启用**。启动配置给出 `max_lora_rank` 时启用动态 LoRA，槽位按它分配。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
+**启用**。启动配置给出 `max_lora_rank` 时启用动态 LoRA，槽位按它分配。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，向上取到 LoRA 层支持的最小合法 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
 
 **包装在只建结构时完成**。
 
@@ -859,8 +859,8 @@ offload 策略 = Unit + Trigger + Transport
 | 阶段 | 校验内容 |
 |---|---|
 | 参数解析 | 类型、未知字段、互斥项、新旧冲突、不支持的组合 |
-| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量、保持 fp32 的层不量化 |
-| Offloader 规划 | 组件完整、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
+| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量 |
+| Offloader 规划 | 组件完整、保持 fp32 的层不量化、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
 | Loader 预检 | 来源可读、内容身份、冷启动路径、适配器的键 |
 | 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、AllGather 组的成员、单机 Host 容量 |
 | `prepare_materialization()` | 加速卡和 Host 的运行期资源准入、内存登记或暂存区的计划、多 rank 的全组确认 |
@@ -989,6 +989,7 @@ offload 策略 = Unit + Trigger + Transport
   - 读取陷阱（构造期间拦截张量读取，写入和收尾期间只拦截文件读取；被吞掉的违例照样失败）、构造后检查、写入跟踪、收尾的存储绑定检查；上下文关闭后调用组件构造函数直接报错。
   - 组件声明，包括按实例生成、路径列表和嵌套划出、完整性检查、按 rank 声明。
   - 每个注册的 pipeline 在上下文里构造一次，结果写进支持矩阵。
+  - 构造函数里直接调用 `X.from_pretrained` 的 pipeline（Flux、Flux2、ERNIE-Image、Helios、GLM-Image、HiDream-Image、LingBot-Video、Cosmos3 的 VAE 等）改成 `hf_component`，用到的类各配一张规则表。LingBot-Video 的 `.to()` 覆写让 `_keep_in_fp32_modules` 保持 fp32，`unified` 下这一效果由它的规则表表达，`legacy` 下不变。
 - **2b 规则表和对比测试**（约 2～3 周，可按家族并行）
   - 每个 Hugging Face 类一张规则表，配一个与 `from_pretrained` 逐张量对比的测试。
   - 以 legacy 为基准的 pipeline 级逐张量对比框架，以及对比例外表。
@@ -1044,6 +1045,7 @@ offload 策略 = Unit + Trigger + Transport
 - 翻转默认值；保留一个版本的回退，这个版本里共存期的同步规则照旧执行。
 - 删除前，把逐张量对比的 legacy 结果存成逐张量哈希，对比测试改为与哈希对比。
 - 删除 `legacy` 和模型侧代码。其中构造代码：
+  - 每个注册的 pipeline 都显式调用 `declare_components`，从 `_dit_modules` 等属性推出组件声明的默认推导随之删除；
   - 每个 `build_component` 调用只留 unified 一支，`build_component` 删除；
   - 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 generator、decoder 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留。`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删；
   - HF 组件入口里加载带权重组件的 legacy 一支，以及 `create_transformers_model` 里的 `init_parameters`、`create_transformers_model_with_vllm_linears` 里的 `init_parameters_preserving_vllm_linear`；
@@ -1086,7 +1088,7 @@ Job 2 内部，2d 依赖 2a、2c 和 2b 的对比框架。
 
 - 同一个部署在一台机器上的 worker 数从 1 增加到 k，各 worker 按共享比例平摊后的内存占用之和不随 k 增长。
 - 同一台机器上两个单卡副本属于同一个部署时共用一份；headless 副本并发启动时只有一个写入进程。
-- 同一个部署里两个 stage 使用内容相同的组件时，同一台机器上共用一份。
+- 同一个部署里两个 stage 的 worker 在同一台机器上、整套权重的内容身份和规划指纹都相同时，共用一份。
 - 同一台机器上两个部署跑同一个模型，彼此不共享、不连接；一个部署退出，另一个不受影响。
 - 部署标识、共享指纹或 uid 不一致的连接被写入进程拒绝；套接字名被其他 uid 的进程占用时，等待者不绑定。
 - 权重大于 `/dev/shm` 的大小时正常加载，`/dev/shm` 的用量不变。

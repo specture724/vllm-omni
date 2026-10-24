@@ -293,13 +293,13 @@ Loader 在这个上下文里调用 pipeline 的构造函数：
 
 - 每张表配一个测试，逐张量对比它和 `from_pretrained` 的结果，固定 transformers 和 diffusers 的版本。
 - 运行时 Loader 只读入库的表，不读类上的 `_keep_in_fp32_modules`。这个属性是否生效随库的版本和类型变化。
-- 保持 fp32 的层，量化方法必须是“不量化”，否则构造阶段报错：最终类型和量化方法在构造时已经确定。
+- 保持 fp32 的层，量化方法必须是“不量化”，否则规划阶段报错。
 - `config.json` 自带 `quantization_config` 的 Hugging Face 组件报错，`from_config` 不会套用 Hugging Face 的量化器。
 - 会在 `__call__` 里改组件类型的 diffusers pipeline（例如 SDXL fp16 的 `upcast_vae()`），由规则表把这类组件固定为运行时的类型。
 
 **构造期间改结构的其他情况**。构造期间删掉的子树（例如 Qwen-Image 文生图删掉视觉塔），Loader 按构造结束时的结构跳过对应的键。构造期间改布局或类型（Wan VAE 的 channels_last、MiniMax H3 VAE 解码器转 fp16）由规则表表达，Loader 按参数的类型和步长分配存储、写入时转换。
 
-**HSDP**。被 HSDP 管理的组件同样只建结构。物化时只为 meta 参数分配 CPU 存储，不用 `to_empty`，因为它会连 buffer 一起重新分配，清掉构造期间按配置算出的 RoPE 表等。之后照常 `load_weights` 并分片，不经过 HWM。
+**HSDP**。被 HSDP 管理的组件同样只建结构。物化时只为 meta 参数分配 CPU 存储，不用 `to_empty`，因为它会连 buffer 一起重新分配，清掉构造期间按配置算出的 RoPE 表等。之后照常 `load_weights` 并分片，不经过 HWM。`hsdp_weight_load_strategy="pre_sharded"` 时，在 meta 上的分片沿用 HSDP 现有的预分片流程；物化只为 meta 张量在执行设备上分配本地分片，同样不用 `to_empty`，buffer 保持构造时的值；按 rank 读取切片由 HSDP 的流程完成，不调用模型的加载后钩子。
 
 **`load_format="diffusers"`** 按 `model_index.json` 声明组件：每个带权重的组件用 `from_config` 只建结构，由 Loader 写入，走同一条流程。diffusers 的 pipeline 对象只负责编排前向和去噪循环，不加载权重，也不调用 diffusers 自带的 offload。分词器、调度器和纯配置不经过 Loader。`unified` 不调用 diffusers 适配器的 `load_weights()`，也不经过 `build_component`；`legacy` 下适配器在 `load_weights()` 里整条 `from_pretrained` 的代码不改。
 
@@ -399,7 +399,7 @@ Loader 按固定顺序做一次：
 
 动态 LoRA 是叠加在基础权重之上的叠加层，不修改基础权重。它的结构在启动时定死，提交之后只拷数据。
 
-**启用**。启动配置给出 `max_lora_rank` 时启用动态 LoRA，槽位按它分配。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
+**启用**。启动配置给出 `max_lora_rank` 时启用动态 LoRA，槽位按它分配。`lora_backend` 是 `peft` 并给了 `--lora-path`、但没给 `max_lora_rank` 时，槽位取这个适配器自己的 rank，向上取到 LoRA 层支持的最小合法 rank，运行期 `add_lora` 更大的 rank 被拒绝。都不给时，运行期的 `add_lora` 被拒绝。
 
 **包装在只建结构时完成**。
 
@@ -956,8 +956,8 @@ offload 策略 = Unit + Trigger + Transport
 | 阶段 | 校验内容 |
 |---|---|
 | 参数解析 | 类型、未知字段、互斥项、新旧冲突、不支持的组合 |
-| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量、保持 fp32 的层不量化 |
-| Offloader 规划 | 组件完整、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
+| 构造 | 只建结构、读取陷阱、构造后没有残留的 meta 张量 |
+| Offloader 规划 | 组件完整、保持 fp32 的层不量化、选中的组件和 `unit_groups` 存在、重复块可发现、常驻层数合法、共用存储的生命周期一致 |
 | Loader 预检 | 来源可读、内容身份、冷启动路径、适配器的键 |
 | 全组确认第 1 点 | 参与集合通信的部分各 rank 一致、AllGather 组的成员、单机 Host 容量 |
 | `prepare_materialization()` | 加速卡和 Host 的运行期资源准入、内存登记或暂存区的计划、多 rank 的全组确认 |

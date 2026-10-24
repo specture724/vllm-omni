@@ -531,8 +531,10 @@ class _Startup:
 
     def confirm_admission(self):                                   # 第 1 点
         gathered = self.round("point1_fingerprints", lambda: Point1Payload(
-            fingerprints=self.fingerprints, group_keys=group_table_keys()))
+            fingerprints=self.fingerprints, group_keys=group_table_keys(),
+            unmatched_policy_keys=self.plan_.unmatched_policy_keys()))
         all_fps = tuple(p.fingerprints for p in gathered)
+        check_unmatched_policy_keys(gathered)                      # 各 rank 的集合取交集，非空时所有 rank 同时报 PlanningError
         check_collective_parts(all_fps)                            # 只依赖收集结果；不一致时所有 rank 同时报错
         groups = create_allgather_groups(all_fps, gathered)        # 集合通信，本副本每个 rank 以相同顺序执行
         self.local("confirm", lambda: self.bind_and_elect(groups, all_fps))
@@ -693,6 +695,7 @@ class Point0Payload:
 class Point1Payload:
     fingerprints: RankFingerprints
     group_keys: frozenset[tuple[tuple[int, ...], str]]   # 进程级 AllGather 组表里已有的（成员，后端）
+    unmatched_policy_keys: frozenset[str]                 # 本 rank 的目录里没有匹配的、if_absent 为 error 的策略键（05 的 L01）
 ```
 
 | 确认点 | 轮次名 | 每个 rank 交出的内容 | 收集之后每个 rank 做的事 |
@@ -714,6 +717,8 @@ class Point1Payload:
 - 某个组件在任何一个 rank 的 `collective` 里出现时，每个在 `content_identities` 里声明了这个组件的 rank，`collective` 里也必须有它；
 - 同一个 AllGather 组里，各成员的 `collective[component]` 必须相同。
 - 不一致时报 `GroupConfirmationError`，写明组件名和取值不同的 rank。`rank-local` 的 Unit 和只在部分 rank 上声明、不用 `allgather` 的组件不参与核对。
+
+**策略键的匹配**。组件可以按 rank 声明（02 第 2.5 节），所以 `if_absent` 为 `error` 的策略键只有在本副本每个 rank 的目录里都没有匹配时才报错（05 的 L01）。每个 rank 交出 `PlacementPlan.unmatched_policy_keys()`（04），收集之后取所有 rank 的交集；交集不为空时，每个 rank 以同样的内容报 `PlanningError`，写明这些键和本 rank 声明的组件。这项判断只依赖收集到的结果，所以各 rank 同时失败。world size 为 1 时，交集就是本 rank 的集合。
 
 **AllGather 组**。对每个出现在 `collective` 里的组件，声明了它的 rank 按 `content_identities[component]` 分组，内容身份相同的 rank 组成一个 AllGather 组（总体设计 6.4）。
 
@@ -767,6 +772,7 @@ _load_model_unified(memory_pools, load_format, custom_pipeline_name)
 - prompt embedding 缓存与文本编码器 `allgather` 的组合检查，`legacy` 下照旧在 runner 里做；`unified` 下由 05 在参数解析阶段做（总体设计 8.5）。`legacy` 一支照旧调用 `resolve_prompt_embed_cache_config`（`vllm_omni/diffusion/cache/prompt_embed_cache.py`），它在 worker 里读 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` 和 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE`；`unified` 一支不调用它。
 - `ARDiffusionModelRunner.load_model` 调用父类的 `load_model`，自动走同一个分支。
 - 驱动返回之后、`mark_in_service()` 之前的任何一步失败时，runner 调用 `close_weight_stack()` 后抛出，worker 初始化失败。
+- 一个进程里同一时刻只运行一次 `unified` 启动。单进程执行器把几个 worker 放在同一个进程里时，各 worker 的启动依次进行：02 的只建结构上下文在一个进程里同一时刻只能打开一个，读取陷阱对整个进程生效。第二次启动在上下文打开期间进入时报 `LifecycleError`，不排队：排队的启动可能是持有上下文的 worker 在 `seal()` 里等待的写入进程。
 
 #### 8.2 睡眠池
 
@@ -1052,7 +1058,7 @@ commit              point3_commit     compile_setup     close
 |---|---|
 | [02](./02-unified-loader.md) | `vllm_omni.diffusion.weight_stack.loader` 导出 `create_loader(ctx: StartupContext) -> Loader`，以及 `Preflight`（含 `content_identities: Mapping[str, str]` 和 `expected_manifest`）、`ExpectedManifest`、`FinalManifest`。`vllm_omni.diffusion.weight_stack.components` 导出 `ComponentCatalog` 和 `is_unified_stack()`。组件声明在 `Loader.close()` 之后仍然可以查询。Loader 自己在 `ctx.memory_pools.weights()` 里分配常驻加速卡的张量。`Loader.finalize()` 在第 6 步调用 `storage.seal()`，在此之前完成收尾里的全部集合通信。`model_loader/construct.py` 的 `is_building_structure()` 是构造上下文的判断函数，模型代码对它的调用按 T6 登记。02 承担 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。 |
 | [03](./03-host-storage.md) | `vllm_omni.diffusion.weight_stack.host` 导出 `create_host_weight_manager(ctx: StartupContext) -> HostWeightManager`，以及 `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`。`LocalRecord` 和 `ElectionRecord` 可以 pickle。`HostWeightManager.deployment_id()` 按第 2 节的规范实现。`elect()` 在每个 rank 上都可以调用，非代表返回空的 `Election`。`Election.close()`、`HostStorage.close()` 可以多次调用。`allocate()` 成功时接管 `Election`，失败时不接管。`HostStorage.connect_writer()` 在第 2 点之后由驱动调用。`HostLayout.plan_fingerprint` 只依赖配置和并行布局。03 给 `OmniDiffusionConfig` 增加 `init=False` 的 `deployment_id` 字段，没有下发时为 `None`。 |
-| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`。 |
+| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`。 |
 | [05](./05-configuration.md) | `vllm_omni.diffusion.weight_stack.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把它填进 `StartupContext.policy`。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
 
 ## 代码组织
