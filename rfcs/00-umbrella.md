@@ -978,8 +978,8 @@ offload 策略 = Unit + Trigger + Transport
 | Cosmos3 混合精度的 NVFP4 查找表 | 按加载后权重的设备放置，只做一次 | `unified` 下按调用时权重的设备取，或按设备缓存；`legacy` 下不变 |
 | LTX2 vocoder 在 mps、xpu、cpu 上运行时 `.float()` 往返 | 撞上提交后的守卫 | `unified` 下由规则表在这些平台上保持 fp32、经 stage 类型舍入，跳过往返；`legacy` 下不变 |
 | LoRA 管理器提交后才包装 PEFT 层；worker 提交后融合蒸馏 LoRA | 提交后改结构、改基础权重 | `unified` 下包装挪到只建结构（2f），融合挪到 checkpoint 读取器（2c）；`legacy` 下不变 |
-| diffusers 适配器的 `DiffusersAdapterPipeline` 在构造函数里调用 `_raise_unsupported_features`，`diffusion_offload_config` 不是 `None` 时报 `NotImplementedError` | 旧的 `--diffusion-offload-config` 在 `unified` 下由兼容层翻译成策略，这项拒绝让 diffusers 格式在 `unified` 下无法用 offload 启动 | 只在 `legacy` 下执行；`unified` 下 offload 由策略和 Offloader 承担（2f） |
 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad` | `unified` 下没有分布式逐层后端 | `unified` 下这一项改读 `OffloadRuntime` 给出的梯度模式，runner 不读 offload 策略；HSDP 下照旧用 `no_grad`；`legacy` 下不变 |
+| diffusers 适配器的 `DiffusersAdapterPipeline` 在构造函数里调用 `_raise_unsupported_features`，`diffusion_offload_config` 不是 `None` 时报 `NotImplementedError` | 旧的 `--diffusion-offload-config` 在 `unified` 下由兼容层翻译成策略，这项拒绝让 diffusers 格式在 `unified` 下无法用 offload 启动 | 只在 `legacy` 下执行；`unified` 下 offload 由策略和 Offloader 承担（2f） |
 
 ### Job 2：Loader
 
@@ -1055,12 +1055,25 @@ offload 策略 = Unit + Trigger + Transport
 ### 依赖
 
 ```text
-Job 1 ─┬─▶ Job 2 ─┐
-       ├─▶ Job 3 ─┼─▶ Job 5 ─▶ Job 6
-       └─▶ Job 4 ─┘
+Job 1（01-1 到 01-7）
+├── Job 2（02-1 到 02-18）
+├── Job 3（03-1 到 03-8）
+├── Job 4（04-1 到 04-13），另依赖 Job 2、Job 3 的部分 PR
+├── Job 5 的解析部分（05-1、05-2）
+│     └── Job 5 的其余部分（05-3 起），另依赖 Job 2、Job 3、Job 4 的部分 PR
+└── 03-9（Job 3 的端到端测试），另依赖 02-5、04-5
+Job 6 在 Job 2 到 Job 5 全部完成之后
 ```
 
 Job 2 内部，2d 依赖 2a、2c 和 2b 的对比框架。
+
+Job 之间的边以各子 RFC“实现拆分”里的 PR 编号为准。每条边都指向先合入的 PR，依赖图没有环：
+
+- Job 4 依赖 Job 2：04-1 用 02-1 的组件目录和 `pipeline_of`；04-2 在 02-2 的只建结构的上下文里构造 pipeline；04-8、04-9 用 02-10 的查询接口，04-8 的用例另要求 02-14、02-15、02-16 迁移过的家族；04-10、04-11、04-12 修改的模型文件分别在 02-12、02-11、02-18 之后修改；04-13 用 02-5 的 Loader。
+- Job 4 依赖 Job 3：04-3 用 03-3 的 `HostRequest` 和 `flatten_shard_unit`；04-13 用 03-5、03-6 的 host 存储。
+- 03-9 只含 Job 3 的端到端测试，依赖 02-5 和 04-5；Job 3 的其余 PR 只依赖 Job 1。
+- 05-1、05-2 只做解析和传递，不改变已有配置的行为，只依赖 Job 1；05-3 起的 PR 改变 `unified` 的行为，依赖 Job 2、Job 3、Job 4 的相应 PR。
+- Job 2 不依赖 Job 3、Job 4、Job 5；Job 2、Job 3、Job 4 都不依赖 Job 5。
 
 ## 验收标准
 
