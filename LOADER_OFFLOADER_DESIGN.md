@@ -148,6 +148,7 @@ class MemoryRange:
     read_only: bool       # 共享存储为真，私有存储和 rank 分片为假
 ```
 
+- `plan()` 的模型结构来自组件声明：Loader 提供从组件目录找到 pipeline 模块树的只读入口，`plan()` 只读模块的类型、注册顺序和是否定义了 `forward`，不另外接收模型对象。
 - `Topology`：部署标识，以及按 rank 排列的 `LocalRecord`。副本内所有 rank 拿到同一份。`plan()` 的单机容量检查、`share_plan()`、`admit()` 都用它。
 - `SharePlan`：本副本内每个共享集合在每台机器上的成员、代表（rank 最小者）和套接字名。
 - `Election`：每个共享集合的写入进程在本副本还是在别处；在别处时，它是否已封存、还有多少字节没写入。还记录代表参选时读到的本机可用内存。本 rank 是写入进程时，`Election` 持有监听套接字和监听线程，`allocate()` 时移交给 `HostStorage`；在这之前失败时由 Runner 关闭。
@@ -692,7 +693,7 @@ offload 策略 = Unit + Trigger + Transport
 - 后继表：每个 Unit 的后继初始为组件内注册顺序的下一个。`rank-local` 表里最后一个接回第一个；`allgather` 表里最后一个没有后继。进入一个 Unit 时预取它的后继。
 - 预测错时（缓存跳块、切换 DiT 等），进入的 Unit 不在缓冲区里就同步装入，并把同一张表里上一个 Unit 的后继改成它。
 - 一个流式 Unit 的前向还没结束又进入另一个流式 Unit 时，直接报错。
-- `allgather` 的 Unit 不跨前向保留：每次前向的第一个块在进入时拼接，之后按后继表预取。`allgather` 的后继表只按 `allgather` Unit 的进入顺序更新，所以是否拼接只取决于各 rank 相同的进入顺序。每次拼接带上 Unit 编号，在加速卡上断言。
+- `allgather` 的 Unit 不跨前向保留：每次前向的第一个块在进入时拼接，之后按后继表预取。`allgather` 的后继表只按 `allgather` Unit 的进入顺序更新；上一个进入的 Unit 与这次进入的 Unit 属于不同组件时不更新，因为不同组件的 AllGather 组可以不同，跨组件的预取会让不在两个组里的 rank 发起的集合通信次数不同。所以是否拼接只取决于同一个 AllGather 组里各 rank 相同的进入顺序。每次拼接带上 Unit 编号，在加速卡上断言。
 - 编译边界只包住块的计算，不包住钩子。
 
 **钩子的位置**。

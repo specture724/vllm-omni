@@ -235,6 +235,7 @@ def lora_target_paths(pipeline, *, legacy: Callable[[], Sequence[str]]) -> tuple
 def repeated_block_paths(pipeline, component: str, *, legacy: Callable[[], Sequence[str]]) -> tuple[str, ...]: ...
 def fully_resident(pipeline, component: str, *, legacy: Callable[[], bool]) -> bool: ...
 def catalog(pipeline) -> ComponentCatalog: ...          # unified 下返回目录；legacy 下报 LifecycleError
+def pipeline_of(catalog: ComponentCatalog) -> nn.Module: ...   # 以这个目录登记的 pipeline；找不到时报 LifecycleError
 def execution_device() -> torch.device: ...
 def is_unified_stack() -> bool: ...
 def weight_generation(pipeline) -> int: ...
@@ -243,6 +244,7 @@ def bump_weight_generation(pipeline) -> None: ...
 
 - `unified` 下前三个函数读目录：`component_paths` 返回这个角色的组件的规范根路径；`lora_target_paths` 返回 `dit` 组件和 `_lora_components` 的根路径；`repeated_block_paths` 返回组件声明的 `repeated_blocks`，没有声明时返回 04 经 `set_discovered_blocks()` 记录的自动发现结果。
 - `fully_resident` 是读这个属性的通用函数：`unified` 下读目录里 `commit()` 填好的值，`commit()` 之前调用报 `LifecycleError`；`legacy` 下执行模型现有的判断。
+- `pipeline_of(catalog)` 读同一张进程级弱引用表，返回以这个目录登记的 pipeline 对象。它只给 04 的 `plan()` 读模块树用：模块的类型、`forward` 是否被覆写、子模块的注册顺序（总体设计 4.1），由 02-1 提供。
 - `execution_device()` 返回本 worker 的执行设备，与 `vllm_omni.diffusion.distributed.utils.get_local_device()` 相同。
 - `is_unified_stack()` 返回 01 的 `process_weight_stack() is WeightStack.UNIFIED`。模型代码只在共存期必改清单登记的位置调用它（01 的静态测试 T6 检查调用位置）。
 - `weight_generation` 和 `bump_weight_generation` 是以权重为键的缓存签名用的写入代数（总体设计 7.8）。基础权重提交后不变；动态 LoRA 管理器每次写叠加层槽位后调用一次 `bump_weight_generation`。签名的计算归 04。
@@ -1033,7 +1035,7 @@ tests/diffusion/weight_stack/baseline/
 
 | PR | 组 | 内容 | 主要文件 | 测试 | 依赖 | 大小 | 必改行 |
 |---|---|---|---|---|---|---|---|
-| 02-1 | 2a | 组件声明的类型、`declare_components`、默认推导、路径解析和划出、去重、完整性违例、按 rank 声明、带类型字段的校验、目录构建 | `components.py`、`loader/catalog.py` | `test_catalog.py` | 无 | M | 无 |
+| 02-1 | 2a | 组件声明的类型、`declare_components`、默认推导、路径解析和划出、去重、完整性违例、按 rank 声明、带类型字段的校验、目录构建、进程级弱引用表和 `pipeline_of` | `components.py`、`loader/catalog.py` | `test_catalog.py` | 无 | M | 无 |
 | 02-2 | 2a | 构造上下文、读取陷阱、构造后检查、最终类型、`build_component`、`declare_weights`、`hf_component`、`from_pretrained_with_prefetch` 的分发、`load_format="default"` 和 `custom_pipeline` 的 `build_structure()`、D06、支持矩阵测试 | `loader/context.py`、`loader/trap.py`、`loader/loader.py`、`model_loader/construct.py`、`hub_prefetch.py`、`models/utils.py` | `test_context.py`、`test_trap.py`、`test_construct_api.py`、`test_hf_entry.py`、`test_structure_matrix.py` | 02-1 | L | D06 |
 | 02-3 | 2b | 规则表的格式和执行、`generate` 工具、逐表测试框架，以及主干 pipeline 用到的 Hugging Face 类的第一批表 | `loader/rules/` | `rules/test_rule_tables.py` | 02-2 | L | 无 |
 | 02-4 | 2c | 来源解析、读取流水线、延迟张量、预检的来源核对、内容身份、预期清单 | `loader/reader.py`、`loader/identity.py` | `test_reader.py`、`test_lazy_tensor.py`、`test_content_identity.py` | 02-2 | L | 无 |
