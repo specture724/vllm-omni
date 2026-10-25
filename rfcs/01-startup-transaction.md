@@ -720,7 +720,7 @@ class Point1Payload:
 - 同一个 AllGather 组里，各成员的 `collective[component]` 必须相同。
 - 不一致时报 `GroupConfirmationError`，写明组件名和取值不同的 rank。`rank-local` 的 Unit 和只在部分 rank 上声明、不用 `allgather` 的组件不参与核对。
 
-**策略键的匹配**。组件可以按 rank 声明（02 第 2.5 节），所以 `if_absent` 为 `error` 的策略键只有在本副本每个 rank 的目录里都没有匹配时才报错（05 的 L01）。每个 rank 交出 `PlacementPlan.unmatched_policy_keys()`（04），收集之后取所有 rank 的交集；交集不为空时，每个 rank 以同样的内容报 `PlanningError`，写明这些键和本 rank 声明的组件。这项判断只依赖收集到的结果，所以各 rank 同时失败。world size 为 1 时，交集就是本 rank 的集合。
+**策略键的匹配**。组件可以按 rank 声明（02 第 2.5 节），所以 `if_absent` 为 `error` 的策略键只有在本副本每个 rank 的目录里都没有匹配时才报错（05 的 L01）。每个 rank 交出 `PlacementPlan.unmatched_policy_keys()`（04），收集之后取所有 rank 的交集；交集不为空时，每个 rank 以同样的内容报 `PlanningError`，报错文本用 [05](./05-configuration.md) 第 8.2 节 L01 的格式，写明这些键和本 rank 声明的组件。这项判断只依赖收集到的结果，所以各 rank 同时失败。world size 为 1 时，交集就是本 rank 的集合。
 
 **AllGather 组**。对每个出现在 `collective` 里的组件，声明了它的 rank 按 `content_identities[component]` 分组，内容身份相同的 rank 组成一个 AllGather 组（总体设计 6.4）。
 

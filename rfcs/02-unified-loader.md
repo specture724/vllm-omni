@@ -425,7 +425,7 @@ class BufferSource:
 #### 5.7 未迁移的 pipeline 与支持矩阵
 
 - 未迁移的 pipeline 在 `unified` 下构造时触发读取陷阱或构造后检查，启动报 `ConstructionError`，写明读取发生的位置，`fix` 是 `use --diffusion-weight-stack legacy`。是否已迁移不另设标记。
-- `tests/diffusion/weight_stack/loader/test_structure_matrix.py` 为 `DiffusionModelRegistry` 里注册的每个 pipeline，用测试资源里的配置文件在上下文里调用一次 `build_structure()`（不需要权重），记录结果：成功、触发陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表。结果写进 `docs/` 下的支持矩阵（05 发布）。
+- `tests/diffusion/weight_stack/loader/test_structure_matrix.py` 为 `DiffusionModelRegistry` 里注册的每个 pipeline，用测试资源里的配置文件在上下文里调用一次 `build_structure()`（不需要权重），记录结果：成功、触发陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表，以及成功时目录里的组件名和角色。结果按 [05](./05-configuration.md) 第 17.3 节规定的格式写进 `structure_matrix.json`，由 05 渲染成 `docs/` 下的支持矩阵。
 - 共存期间不合入构造期读张量的新 pipeline：这个测试对新注册的 pipeline 要求结果为成功。
 
 ### 6. 规则表
@@ -762,7 +762,7 @@ class DynamicLoraSpec:
 
 | 配置 | `dynamic_lora` |
 |---|---|
-| 给出 `max_lora_rank` | `slot_rank = max_lora_rank`，`from_flag` 为真。 |
+| 给出 `max_lora_rank` | `slot_rank = max_lora_rank`，`from_flag` 为真。字段由 05-2 增加，02-8 用 `getattr(od_config, "max_lora_rank", None)` 读取，05-2 合入之前按没给处理。 |
 | 没给 `max_lora_rank`，`lora_backend=peft` 并给了 `--lora-path` | `slot_rank` 取这个适配器的 rank（只读它的 `adapter_config.json` 或 safetensors 头部），再按 `DiffusionLoRAManager._get_smallest_valid_max_rank` 向上取到 `_VALID_MAX_RANKS` 里最小的合法值。 |
 | 其他 | `None`，不启用。 |
 

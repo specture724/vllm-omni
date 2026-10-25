@@ -882,7 +882,7 @@ offload 策略 = Unit + Trigger + Transport
 - `units` 只用于 `layer`，取组件声明里 `unit_groups` 的名字。MiniMax H3 的 AdaLN 投影写成 `"dit": {"mode": "layer", "units": "adaln"}`。
 - 预设和自定义配置在同一个配置来源里互斥。
 - 命令行、Python 参数、YAML 使用同一个解析器；多个来源之间，优先级高的整体覆盖。
-- 预设里的角色在某个模型上不存在时忽略；自定义配置里显式选了不存在的角色、组件名或 `unit_groups` 名字时，规划阶段报错。
+- 预设里的角色在某个模型上不存在时忽略；自定义配置里显式选了不存在的角色或组件名时，在全组确认第 1 点按全部 rank 的规划结果判断，每个 rank 都没有匹配时报规划错误；`unit_groups` 名字不存在时规划阶段报错。
 - 未知字段和类型错误报错。
 
 预设和旧开关都不选 `vae`。要让 VAE 由使用触发管理，在自定义配置里选中它。
@@ -949,6 +949,8 @@ offload 策略 = Unit + Trigger + Transport
 | 有张量不属于任何组件 | 规划 |
 | 融合适配器的键在已加载的组件上对不上；融合时 `lora_scale` 不等于 1；对已量化的 checkpoint 融合 | Loader 预检 |
 | pipeline 还没有迁移到只建结构（5.2） | 构造 |
+
+组件名键在参数解析阶段还不知道所属角色：组件名键选中 `other` 角色的组件，或选中文本编码器并在 DP 大于 1 时配 `allgather` 和 prompt embedding 缓存，在规划阶段报错，报错文本与参数解析阶段相同。
 
 环境变量 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` 在构建配置时折进配置并冻结，worker 不读它，组合检查只在参数解析时做一次。
 

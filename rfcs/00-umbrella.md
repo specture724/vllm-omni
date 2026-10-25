@@ -779,7 +779,7 @@ offload 策略 = Unit + Trigger + Transport
 - `units` 只用于 `layer`，取组件声明里 `unit_groups` 的名字。MiniMax H3 的 AdaLN 投影写成 `"dit": {"mode": "layer", "units": "adaln"}`。
 - 预设和自定义配置在同一个配置来源里互斥。
 - 命令行、Python 参数、YAML 使用同一个解析器；多个来源之间，优先级高的整体覆盖。
-- 预设里的角色在某个模型上不存在时忽略；自定义配置里显式选了不存在的角色、组件名或 `unit_groups` 名字时，规划阶段报错。
+- 预设里的角色在某个模型上不存在时忽略；自定义配置里显式选了不存在的角色或组件名时，在全组确认第 1 点按全部 rank 的规划结果判断，每个 rank 都没有匹配时报规划错误；`unit_groups` 名字不存在时规划阶段报错。
 - 未知字段和类型错误报错。
 
 预设和旧开关都不选 `vae`。要让 VAE 由使用触发管理，在自定义配置里选中它。`unified` 不做与硬件相关的隐式 offload：`none` 就是不 offload。
