@@ -252,7 +252,7 @@ Unit 补零后的大小 = Σ_g P_g
   所以一页只属于一个组
   组件预留区大小 = 各 Unit 各组的 P_g 向上取整到页大小之后的和
 释放阈值     = 本 worker 全部瘦路径组件里最大的一个 Unit 补零后的大小
-最大两个张量 = 本 worker 全部瘦路径组件的分片 Unit 里最大的两个张量的 nbytes 之和
+最大的两个张量 = 本 worker 全部瘦路径组件的分片 Unit 里最大的两个张量的 nbytes 之和
 ```
 
 - 按元素数取上整等分，与现有 `DistributedLayerwiseOffloadHook._shard_and_pin` 的切分方式一致（`(total_numel + dp_size - 1) // dp_size`）。
@@ -301,7 +301,7 @@ class HostLayout:
 class HostDemand:                                      # 可以 pickle，随 ElectionRecord 收集
     local_bytes: int          # 本机部分各文件大小之和，即一份 W
     shard_bytes: int          # 稳定后的 rank 分片：各组覆盖本 rank 范围的整页之和
-    cold_extra_bytes: int     # 有瘦路径组件时：释放阈值 + 最大两个张量；
+    cold_extra_bytes: int     # 有瘦路径组件时：释放阈值 + 最大的两个张量；
                               # 另加每个先全量后裁剪组件的预留区大小（总体设计 10）
     staging_bytes: int
     transient_bytes: int
@@ -606,7 +606,7 @@ note_written(name)：
 
 - `note_written` 在 Loader 的写入线程里同步执行，不启动线程，不做集合通信，每个 rank 独立执行。归还的页在 `MAP_PRIVATE | MAP_ANONYMOUS` 映射里，再次读取时得到零。
 - 一个边界张量只在全部写完之后才可能被归还（总体设计 6.4：跨越范围边界的张量先完整写入，再归还范围之外的页），所以写入入口在写的过程中读回目标时不会读到被归还的页。
-- 上限：每次 `note_written` 返回时 `pending` 小于释放阈值。任何时刻，超出稳态（各组覆盖 R_g 的整页）的驻留字节，等于待归还列表里的字节（小于释放阈值）加上已经开始写、还没写完的边界张量的范围外字节。02 的写入入口对瘦路径组件按 Unit 的顺序产出张量（总体设计 6.4），每个 Unit 的每个类型组最多两个边界张量，所以同一时刻没写完的边界张量不超过两个，后一项不超过最大两个张量，冷启动的额外占用严格小于“释放阈值 + 最大两个张量”（总体设计 6.4、10）。合并参数或堆叠参数分几次写入时也在这个上限之内。
+- 上限：每次 `note_written` 返回时 `pending` 小于释放阈值。任何时刻，超出稳态（各组覆盖 R_g 的整页）的驻留字节，等于待归还列表里的字节（小于释放阈值）加上已经开始写、还没写完的边界张量的范围外字节。02 的写入入口对瘦路径组件按 Unit 的顺序产出张量（总体设计 6.4），每个 Unit 的每个类型组最多两个边界张量，所以同一时刻没写完的边界张量不超过两个，后一项不超过最大的两个张量，冷启动的额外占用严格小于“释放阈值 + 最大的两个张量”（总体设计 6.4、10）。合并参数或堆叠参数分几次写入时也在这个上限之内。
 - `seal()` 对待归还列表里的页和所有边界张量的可归还页做最后一次归还；没有被 `note_written` 记过的边界张量（量化方法声明可以缺少的张量）也在这里归还。
 
 #### 9.3 先全量后裁剪
@@ -718,10 +718,10 @@ note_written(name)：
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
 | `weight_stack.host.create_host_weight_manager(ctx: StartupContext) -> HostWeightManager` | 01 | 由 01 的 `EntryPointFactory` 经 `importlib` 取得。非 Linux 平台报 `StackUnavailableError`。 |
-| `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`、`Mapping` | 01、04 | 字段见设计第 2、4、5、7 节。`LocalRecord`、`ElectionRecord`、`HostDemand` 可以 pickle。`Election.record()`、`Election.close()` 按 01 第 2 节实现，`close()` 可以多次调用。 |
+| `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`、`Mapping` | 01、04；05 读 `Mapping.kind` | 字段见设计第 2、4、5、7 节。`LocalRecord`、`ElectionRecord`、`HostDemand` 可以 pickle。`Election.record()`、`Election.close()` 按 01 第 2 节实现，`close()` 可以多次调用。 |
 | `HostWeightManager` 的七个方法 | 01 | `deployment_id()` 按 3.6；`layout()` 只读预期清单的条目（4.1）；`plan_fingerprint` 只依赖配置和并行布局（4.5）；`share_plan()`、`admit()` 是纯函数；`elect()` 每个 rank 都调用，非代表返回空的 `Election`；`allocate()` 成功时接管 `Election`，失败时不接管；超出容量时 `admit()` 报 `HostCapacityError`。 |
 | `HostLayout.bind_groups(groups)` | 01 | 第 1 点之后调用；组的大小或位置与规划的推算不同时报 `GroupConfirmationError`。 |
-| `HostStorage` 的六个方法：01 第 2 节的五个，加上 `note_written(tensor_key: str) -> None` | 01、02、04 | `view()` 按 7.2 和 9.1，对等待者的共享张量和瘦路径的范围外张量返回形状、类型、步长正确的 meta 张量，Loader 对它的拷贝是空操作并记为已写；`note_written()` 在写入阶段由 Loader 对每个 Host 驻留张量在全部写完之后调用一次，不做集合通信，瘦路径据此同步归还范围之外的页（9.2），其他后端只做名字检查；`seal()` 在每个 worker、每种后端上被调用一次，不做集合通信，私有内存和分片在其中定稿，共享存储在其中封存、交接并用 `FinalManifest.entries` 和 `live()` 重新绑定到只读映射；`connect_writer()` 在第 2 点之后调用；`ranges()` 在 `seal()` 之后有效；`close()` 幂等，只影响本进程。 |
+| `HostStorage` 的六个方法：`view()`、`ranges()`、`seal()`、`connect_writer()`、`note_written()`、`close()`，签名见 01 第 2 节 | 01、02、04 | `view()` 按 7.2 和 9.1，对等待者的共享张量和瘦路径的范围外张量返回形状、类型、步长正确的 meta 张量，Loader 对它的拷贝是空操作并记为已写；`note_written()` 在写入阶段由 Loader 对每个 Host 驻留张量在全部写完之后调用一次，不做集合通信，瘦路径据此同步归还范围之外的页（9.2），其他后端只做名字检查；`seal()` 在每个 worker、每种后端上被调用一次，不做集合通信，私有内存和分片在其中定稿，共享存储在其中封存、交接并用 `FinalManifest.entries` 和 `live()` 重新绑定到只读映射；`connect_writer()` 在第 2 点之后调用；`ranges()` 在 `seal()` 之后有效；`close()` 幂等，只影响本进程。 |
 | `flatten_shard_unit(tensors, group_size) -> ShardUnitLayout` | 04 | 分片 Unit 的拉平和补零规则的唯一实现（4.3），04 用它决定 AllGather 结果在块环缓冲区里的布局。 |
 | `OmniDiffusionConfig.deployment_id` | 01 | `init=False`，没有下发时为 `None`；`HostWeightManager.deployment_id()` 读它。 |
 
@@ -778,7 +778,7 @@ tests/diffusion/weight_stack/host/
 
 本 RFC 的 PR 都依赖 01-1 到 01-7 全部合入，下表不再重复。除 03-9 外，测试里的 Loader 和 Offloader 用 01 的测试替身，或 `host/conftest.py` 里在其基础上增加 Host 驻留 Unit 和写入的替身，不依赖 02、04 的 PR。01 的测试替身里的 host 存储实现 `note_written()`，什么都不做。每个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变，不修改已有测试文件。本 RFC 不承担共存期必改清单的任何一行，也没有自己读总开关的分发点。
 
-03-9 只含测试，是 Job 3 的收尾：它在 02-5 和 04 实现 `prepare_materialization()`、`commit()`、内存登记的 PR 合入之后合入，02、04 的任何 PR 都不依赖它，所以依赖图没有环；Job 3 的其余 PR 与 Job 2、Job 4 并行（umbrella 的依赖图）。04 用到的 `flatten_shard_unit` 和 `HostRequest` 协议在 03-3 里。
+03-9 只含测试，是 Job 3 的收尾：它在 02-5 和 04-5（`prepare_materialization()`、`commit()`、内存登记的完整实现）合入之后合入，02、04 的任何 PR 都不依赖它，所以依赖图没有环；Job 3 的其余 PR 与 Job 2、Job 4 并行（umbrella 的依赖图）。04 用到的 `flatten_shard_unit` 和 `HostRequest` 协议在 03-3 里。
 
 | PR | 内容 | 主要文件 | 测试 | 依赖 | 大小 | 必改行 |
 |---|---|---|---|---|---|---|
@@ -790,7 +790,7 @@ tests/diffusion/weight_stack/host/
 | 03-6 | 分片后端：预留区、瘦路径的视图、`note_written()` 和同步页归还、先全量后裁剪、`ranges()`。 | `shard_storage.py`、`storage.py` | `test_shard_storage.py` | 03-3 | M | 无 |
 | 03-7 | 容量准入 `admit()`。 | `admission.py`、`manager.py` | `test_admission.py` | 03-4 | S | 无 |
 | 03-8 | fork 处理、故障注入点，以及经 01 驱动的多进程生命周期和故障测试。 | `forksafe.py`，各模块的注入点 | `test_lifecycle_multiproc.py` | 03-5、03-6、03-7 | M | 无 |
-| 03-9 | 与真实 Loader 和 Offloader 一起的 GPU 端到端测试。 | 只有测试 | `test_host_e2e.py` | 03-8、02-5，以及 04 里实现 `prepare_materialization()`、`commit()` 和内存登记的 PR | M | 无 |
+| 03-9 | 与真实 Loader 和 Offloader 一起的 GPU 端到端测试。 | 只有测试 | `test_host_e2e.py` | 03-8、02-5、04-5（`prepare_materialization()`、`commit()` 和内存登记的完整实现） | M | 无 |
 
 ```text
 01-1..01-7
@@ -802,7 +802,7 @@ tests/diffusion/weight_stack/host/
         03-7
       03-6
           03-8（依赖 03-5、03-6、03-7）
-            03-9（另依赖 02-5 和 04 的相应 PR）
+            03-9（另依赖 02-5、04-5）
 ```
 
 ## 测试计划
@@ -846,9 +846,9 @@ tests/diffusion/weight_stack/host/
 **分片后端**（`test_shard_storage.py`）：
 
 - 瘦路径下范围外的张量得到 meta、范围内和边界张量得到视图；`flatten_shard_unit` 的结果与 `_shard_and_pin` 的段长一致。
-- 按张量逐个写入一个合成组件，每写完一个张量调用 `note_written`，每次调用之后用 `/proc/self/smaps` 的驻留量断言额外占用严格小于“释放阈值 + 最大两个张量”；用记录调用的 `SysApi` 断言归还的页都在 Z_g 之内、不含范围起点和终点所在的页，范围之内的字节在 `seal()` 之后与写入的值相同。
+- 按张量逐个写入一个合成组件，每写完一个张量调用 `note_written`，每次调用之后用 `/proc/self/smaps` 的驻留量断言额外占用严格小于“释放阈值 + 最大的两个张量”；用记录调用的 `SysApi` 断言归还的页都在 Z_g 之内、不含范围起点和终点所在的页，范围之内的字节在 `seal()` 之后与写入的值相同。
 - 以极快的速度写入（不让出线程）时上一条的断言同样成立：归还与时间无关。
-- 合并参数分几次写入、期间写同一个组的另一个边界张量时，额外占用仍小于“释放阈值 + 最大两个张量”。
+- 合并参数分几次写入、期间写同一个组的另一个边界张量时，额外占用仍小于“释放阈值 + 最大的两个张量”。
 - `seal()` 之后只剩覆盖本 rank 范围的页；没有被 `note_written` 记过的边界张量在 `seal()` 里归还；`seal()` 之后调用 `note_written` 报 `LifecycleError`。
 - 先全量后裁剪之后的驻留量与瘦路径相同；形状改变的替换张量重新布局，补零大小超过原大小时报 `FinalizeError`；瘦路径组件带 `replaced_at_finalize` 条目时 `layout()` 报 `PreflightError`。
 
@@ -874,7 +874,7 @@ tests/diffusion/weight_stack/host/
 - 部署标识、共享指纹或 uid 不一致的连接被拒绝；套接字名被其他 uid 的进程占用时，等待者不绑定。
 - 权重大于 `/dev/shm` 时正常加载，`/dev/shm` 的用量不变；定稿之后任何进程对内存文件的写入和可写映射都被拒绝。
 - 等待者绑定后，已绑定的字节和存储地址在 `eval()` 前后不变。
-- 分片后端稳定后每个 rank 占 `W / N`（含补零和页的取整）；瘦路径冷启动的额外占用在任何写入速度下都严格小于“释放阈值 + 最大两个张量”。
+- 分片后端稳定后每个 rank 占 `W / N`（含补零和页的取整）；瘦路径冷启动的额外占用在任何写入速度下都严格小于“释放阈值 + 最大的两个张量”。
 - 对任意一个 worker 执行 `kill -9` 后，其他副本的映射和服务不受影响；对一个部署的全部 worker 执行 `kill -9` 或 OOM 终止后，机器的共享内存用量回到这个部署启动前。
 - 写入进程在封存前被杀，等待者所在副本启动失败，没有残留。
 - 写入进程所在的副本退出后，已绑定的副本照常服务；之后加入的副本重新选举、重新构建，并能正常服务。

@@ -44,7 +44,7 @@ umbrella RFC 的“背景与问题”已经说明总体问题，这里只列本 
 
 依赖规则（01 的 T1、T2 检查）：
 
-- `offload/` 运行期只 import `weight_stack.interfaces`、`weight_stack.errors`、`weight_stack.startup`（`ResourceKind`、`ResourceLedger`、`FaultPlan`）、`weight_stack.components`（02 的数据类型和查询接口）、`weight_stack.policy`（`resolve_selection`、`ComponentRef`，只在 `plan()` 的函数体里 import）、`weight_stack.observability`、`weight_stack.host` 的 `flatten_shard_unit`、`vllm_omni.diffusion.hooks`、`vllm_omni.diffusion.compile`、`vllm_omni.platforms`。`MemoryRange`、`Mapping`、`HostRequest`、`OffloadPolicy`、`Selection` 只在 `if TYPE_CHECKING:` 里引用，运行期只读它们的属性。
+- `offload/` 运行期只 import `weight_stack.interfaces`、`weight_stack.errors`、`weight_stack.startup`（`ResourceKind`、`ResourceLedger`、`FaultPlan`）、`weight_stack.components`（02 的数据类型和查询接口）、`weight_stack.policy`（`resolve_selection`、`ComponentRef`，只在 `plan()` 的函数体里 import）、`weight_stack.observability`（05-6 合入之后，第 9 节）、`weight_stack.host` 的 `flatten_shard_unit`、`vllm_omni.diffusion.hooks`、`vllm_omni.diffusion.compile`、`vllm_omni.platforms`。`MemoryRange`、`Mapping`、`HostRequest`、`OffloadPolicy`、`Selection` 只在 `if TYPE_CHECKING:` 里引用，运行期只读它们的属性。
 - `offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors`、`vllm.model_executor.model_loader`、`vllm_omni.diffusion.offloader`，也不 import `vllm_omni.diffusion.cache`：写入代数的绑定按方法名识别缓存对象（6.4）。
 - import `weight_stack.host` 的 `flatten_shard_unit` 符合总体设计 3.2：第 1 条只约束 Loader 对 HWM 和 Offloader 的 import，第 2 条只禁止 Offloader import Loader 和 safetensors 读取器，第 3 条约束的是 HWM 的职责；01 的 T1 只禁止 `host/` 反向 import `offload/`，依赖方向无环。03 第 4.3 节规定 `flatten_shard_unit` 从 `weight_stack.host` 导出，是分片布局规则的唯一实现，所以这个函数不挪到别的模块。`host/` 不 import `safetensors`（03 第 4.2 节自己生成和解析头部），T2 对 `weight_stack.offload` 的运行期模块图检查会发现违例。
 - Offloader 不调用模型的任何加载后钩子（总体设计 3.2 第 2 条）。
@@ -153,7 +153,7 @@ class PlacementPlan:
 - `unit_id` 只由组件目录和策略决定：`MODULE` 是 `"<组件名>/module"`，`BLOCK` 是 `"<组件名>/block/<块的规范路径>"`，`GROUP` 是 `"<组件名>/group/<模块的规范路径>"`，`RESIDENT_LAYERS` 是 `"<组件名>/resident"`，`REMAINDER` 是 `"<组件名>/remainder/<直接子模块的规范路径>"`。合并后的 Unit 取被合并者里规划顺序最前的那个的 `unit_id`（3.5）。
 - `PlacementPlan` 在 `plan()` 返回之后不可变，只有 `bind_groups()` 写入一次进程组引用，第二次调用报 `LifecycleError`。
 - `placement(name)` 对目录里的每个规范名和别名都有定义，别名返回它的规范张量的结果；不在目录里的名字报 `LifecycleError`。
-- `host_request()` 实现 03 的 `HostRequest` 协议：`units` 是全部 `residency` 为 `host` 的 Unit，`backend` 在 `allgather` 时为 `sharded`、否则为 `local`；`sharded` 给出每个有 `allgather` Unit 的组件的 `group_size`、`group_index`、`cold_start`；`staging_bytes` 在本 worker 有 Host 驻留的 Unit 时为 2 × 256 MiB，否则为 0；`transient_bytes` 取本 worker Host 驻留张量里最大的单个张量的字节数与 `catalog.write_transient.quant_layer_bytes` 中的较大者；`shapes_final` 是全部本机后端组件的 `CatalogEntry.shapes_final` 的与。
+- `host_request()` 实现 03 的 `HostRequest` 协议：`units` 按规划顺序为每个 Host 驻留的 Unit 给出一条满足 `HostUnitRequest` 的记录，`unit_id`、`component`、`tensors` 取自这个 Unit，`backend` 在 `allgather` 时为 `sharded`、否则为 `local`；`sharded` 给出每个有 `allgather` Unit 的组件的 `group_size`、`group_index`、`cold_start`；`staging_bytes` 在本 worker 有 Host 驻留的 Unit 时为 2 × 256 MiB，否则为 0；`transient_bytes` 取本 worker Host 驻留张量里最大的单个张量的字节数与 `catalog.write_transient.quant_layer_bytes` 中的较大者；`shapes_final` 是全部本机后端组件的 `CatalogEntry.shapes_final` 的与。
 - `collective_signature()` 只含有 `allgather` Unit 的组件。每个组件的值是规范 JSON（键排序）的 blake2b 摘要（`digest_size=16`），覆盖：按 `order` 排列的每个 `allgather` Unit 的 `unit_id`、每个张量的（规范名、形状、类型、步长、存储范围）、`flatten_shard_unit` 给出的各类型组的元素数和段长、`group_size`、`Transport`。它不含 `rank-local` 的 Unit、`LocalRecord` 和任何地址。组件的内容身份不进这个摘要：01 在第 1 点按 `content_identities` 分组，同一个 AllGather 组里的内容身份按定义相同，01 第 2 节 `RankFingerprints.collective` 要求的“内容身份”由这个分组覆盖。
 - `unmatched_policy_keys()` 返回 `frozenset(Selection.unmatched)`，`Selection` 是 `plan()` 里 `resolve_selection()` 在本 rank 上的结果；`policy` 为 `None` 时为空集合。01 在第 1 点把它放进 `Point1Payload.unmatched_policy_keys`，对各 rank 的结果取交集，交集不为空时报 `PlanningError`（05 的 L01）。
 - `bind_groups(groups)`：对每个有 `allgather` Unit 的组件，在 `groups[component]` 里找含本 rank 的组；找不到、组的大小不等于 `group_size`、或本 rank 在 `ranks` 里的位置不等于 `group_index` 时报 `GroupConfirmationError`，写明组件名、推算值和实际值。找到时记下 `AllGatherGroup.group`，运行期的拼接用它。
@@ -208,7 +208,7 @@ B：组件 c 里全部候选列表的全部元素 size 的最大值
 ```
 
 - `ModuleDict`、`ModuleList`、`ParameterList` 本身从不成为 Unit，钩子只装在块和块里的模块上。
-- 组件声明了 `repeated_blocks` 时不做自动发现，按列表顺序取每个容器里 size 大于 0 的元素；容器路径不存在或不是 `nn.ModuleList` 时报 `PlanningError`。
+- 组件声明了 `repeated_blocks` 时不做自动发现，按列表顺序取每个容器里 size 大于 0 的元素；容器路径不存在，或者不是 `nn.ModuleList` 或 `nn.Sequential`（02 第 2.6 节的校验）时报 `PlanningError`。
 - `plan()` 对每个做了自动发现的组件调用一次 `catalog.set_discovered_blocks(component, paths)`，`paths` 是发现的容器路径（相对组件根，写法与 `repeated_blocks` 相同）；声明了 `repeated_blocks` 的组件不调用。编译设置经 `repeated_block_paths` 读它（6.2）。
 
 #### 3.5 Unit 的划分
@@ -300,7 +300,8 @@ shard_slot_bytes = 全部 allgather Unit 在分片槽位里的占用的最大值
    （pin_cpu_memory 为真时锁页）
 7  把不由 HSDP 管理的组件里没有登记来源的非持久 buffer，在 ctx.memory_pools.weights() 里搬到执行设备
 8  在任何梯度模式之外，为每个块环 Unit 在缓冲区的两个位置各建一组张量视图（5.2），为每种类型建零元素占位，
-   为每个 allgather Unit 在执行设备上建一个装着它的 order 的 int64 张量（5.4）
+   在 ctx.memory_pools.weights() 里为每个 allgather Unit 在执行设备上建一个装着它的 order 的 int64 张量（5.4）；
+   这些张量的内容在服务期间不变，所以放在睡眠时备份的池里
 9  建启动事务：每个资源按 ResourceKind 登记进 ResourceLedger；storage 登记为 HOST_STORAGE；
    另登记一个 PLACEHOLDER 条目，关闭时按 TensorDecl 的规范名在 model 里取出每个 Host 驻留张量的对象（含别名），
    改指向占位，所以 abort() 在关闭 host 存储之前先让参数离开 host 存储（03 的约定）
@@ -347,7 +348,7 @@ resident_bytes + 非持久 buffer + overlay_bytes + ring_bytes + shard_slot_byte
 6  在 compile.py 的驻留表里登记每个组件（6.3）；给模型里的每个以权重为键的缓存绑定写入代数（6.4）
 7  经 HookRegistry 装钩子（5.1），对每个不由 HSDP 管理的组件装提交后的守卫（5.5）
 8  ledger.transfer() 移交给新建的 OffloadRuntime，启动事务变为空；
-   调用 observability.record_device_resources(...)，输出 fully_resident 事件
+   输出 fully_resident 事件；05-6 合入之后在这里调用 observability.record_device_resources(...)（第 9 节）
 ```
 
 第 1 步的校验：
@@ -368,7 +369,7 @@ resident_bytes + 非持久 buffer + overlay_bytes + ring_bytes + shard_slot_byte
 
 - `abort()` 按 01 第 5.2 节的 `ResourceLedger.close()` 顺序释放启动事务持有的全部资源，包括关闭 host 存储；可以多次调用，提交之后什么都不做。
 - 启动事务没提交就被丢弃时，`__del__` 不释放资源；释放只经 01 驱动的释放流程调用 `abort()`。
-- 同一个句柄只登记一次：两个块环缓冲区、两个分片槽位、编号缓冲区（含各 `allgather` Unit 的 order 张量）、每个合并区间的登记、每个暂存区、每条流、每个事件组、第 9 步的占位条目各是一个句柄；`commit()` 第 3 步建好的 Unit 记录在 `transfer()` 时随占位条目一起移交，运行时的 `PLACEHOLDER` 关闭用这份记录里的张量对象；钩子按（模块，钩子名）登记一个句柄；守卫按组件登记一个句柄；驻留表的登记和写入代数的绑定按组件登记在 `HOOKS` 下。
+- 同一个句柄只登记一次：两个块环缓冲区、两个分片槽位、编号缓冲区、各 `allgather` Unit 的 order 张量、每个合并区间的登记、每个暂存区、每条流、每个事件组、第 9 步的占位条目各是一个句柄；`commit()` 第 3 步建好的 Unit 记录在 `transfer()` 时随占位条目一起移交，运行时的 `PLACEHOLDER` 关闭用这份记录里的张量对象；钩子按（模块，钩子名）登记一个句柄；守卫按组件登记一个句柄；驻留表的登记和写入代数的绑定按组件登记在 `HOOKS` 下。
 
 ### 5. 运行期
 
@@ -535,7 +536,7 @@ PLACEHOLDER   每个 Host 驻留的张量和块环 Unit 的张量改指向占位
 HOST_STORAGE  storage.close()
 ```
 
-- 关闭不把权重恢复回 CPU，不发起集合通信（总体设计不变量 11）。关闭之后调用 `record_device_resources` 把本 worker 的数值清零。
+- 关闭不把权重恢复回 CPU，不发起集合通信（总体设计不变量 11）。05-6 合入之后，`close()` 在最后一步之后调用 `record_device_resources` 把本 worker 的数值清零（第 9 节）。
 - 运行时因为拼接失败被标记为不可用时，`INFLIGHT` 不等待拼接流，`DEVICE` 不释放块环缓冲区和分片槽位，它们留到进程退出：拼接流上可能还有永远不会完成的集合通信在写它们。
 - 一个关闭函数抛出异常时其余照常执行，由账本汇总报 `LifecycleError`（01 第 5.2 节）。
 
@@ -545,7 +546,7 @@ HOST_STORAGE  storage.close()
 
 | 加速卡上的显存 | 分配位置 | 睡眠时 | 唤醒时 |
 |---|---|---|---|
-| 常驻的权重和 buffer（Loader 分配）、本 RFC 搬到执行设备的非持久 buffer、叠加层槽位 | `memory_pools.weights()` | 由睡眠模式拷到 Host。 | 由睡眠模式拷回原地址。 |
+| 常驻的权重和 buffer（Loader 分配）、本 RFC 搬到执行设备的非持久 buffer、叠加层槽位、`allgather` Unit 的 order 张量 | `memory_pools.weights()` | 由睡眠模式拷到 Host。 | 由睡眠模式拷回原地址。 |
 | 块环缓冲区、分片槽位、编号缓冲区 | `memory_pools.slots()` | 直接释放，不备份。 | 重新映射到原地址，内容在下一次使用时装入。 |
 | 使用触发 Unit | 缓存分配器 | `before_sleep()` 让出。 | 下一次使用时装入。 |
 | host 存储、暂存区、内存登记 | Host | 不受影响。 | 不受影响。 |
@@ -650,7 +651,7 @@ def host_range_is_pinned(cls, address: int) -> bool: ...         # 默认 False
 | C08 | `models/lingbot_video/pipeline_lingbot_video.py` 的 `LingBotVideoPipeline._generate` | `offload_vae_during_denoise` 为真时不执行挪走 VAE 的分支，用 `logger.warning_once` 记一次警告（总体设计 8.4）。 | 04-12 |
 | C12 | 见下文 | 经 `fully_resident` 门控，编译模式改走 6.3 的通用编译函数。 | 04-8 |
 | C14 | `models/cosmos3/mixed_precision/strategy.py` 的 `Nvfp4W4A4W4A16Strategy` | `validate_after_processing` 不搬动查找表；`materialize()` 在反量化之前，`kE2M1ToFloat_handle.val` 的设备与 `layer.weight` 的设备不同时，换成按设备缓存在模块级字典里的那一份。 | 04-9 |
-| C17 | `worker/diffusion_model_runner.py` 的 `_execute_request_list` 和 `_execute_stepwise_core` | 不调用 `resolve_offload_strategy`；HSDP 时用 `no_grad`，否则用 `self.weight_stack.runtime.grad_mode()`；现有 `with grad_context:` 包住的整段（请求准备、缓存刷新、`pipeline.forward` 和分步执行的各步）同时包在 `runtime.execution()` 里，`profile_run` 经 `_execute_request_list` 走同一条路径。没有运行时（`load_format` 为 `dummy`）时与 `legacy` 相同。 | 04-6 |
+| C17 | `worker/diffusion_model_runner.py` 的 `_execute_request_list` 和 `_execute_stepwise_core` | 不调用 `resolve_offload_strategy`；HSDP 时用 `no_grad`，否则用 `self.weight_stack.runtime.grad_mode()`；现有 `with grad_context:` 包住的整段（请求准备、缓存刷新、`pipeline.forward` 和分步执行的各步）同时包在 `runtime.execution()` 里；`execute_model`、`execute_model_batch`、`execute_stepwise`、两种执行模式下的 `profile_run` 和 `ARDiffusionModelRunner` 的预热都经这两个方法，所以走同一条路径（01 第 8.1 节）。没有运行时（`load_format` 为 `dummy`）时与 `legacy` 相同。 | 04-6 |
 
 C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，由 pipeline 的构造函数在 `unified` 一支注入一个零参数的判断函数，函数持有 pipeline 的弱引用，第一次捕获之前求值，组件名由 `catalog(pipeline).module_owner(<模块路径>)` 给出：
 
@@ -664,8 +665,8 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 
 ### 9. 故障注入点与启动日志
 
-- 本 RFC 在模块内部增加的注入点，命名规则和 `FaultPlan` 与 01 第 10 节相同：`prepare_slots`（4.1 第 4 步之前）、`commit_register`（4.3 第 2 步之前）、`commit_hooks`（4.3 第 7 步之前）、`runtime_load`（5.3 的装入之前）、`runtime_gather`（5.4 发起拼接之前）。`runtime_*` 的 `raise` 让这次 `execution()` 走异常退出。
-- 启动日志的事件名和字段按 05 第 15.2 节：`component_plan`、`component_skipped`、`unit_resident`、`unit_transfer`、`fully_resident`。05-6 合入之前，事件用 logger `vllm_omni.diffusion.weight_stack.offload` 按同样的事件名和字段输出；`record_device_resources` 的调用由 05-6 加进 `commit()` 和 `close()`。
+- 本 RFC 在模块内部增加的注入点，命名规则和 `FaultPlan` 与 01 第 10 节相同：名字以 `offload_` 开头：`offload_prepare_slots`（4.1 第 4 步之前）、`offload_commit_register`（4.3 第 2 步之前）、`offload_commit_hooks`（4.3 第 7 步之前）、`offload_runtime_load`（5.3 的装入之前）、`offload_runtime_gather`（5.4 发起拼接之前）。`offload_runtime_*` 的 `raise` 让这次 `execution()` 走异常退出。
+- 启动日志的事件名和字段按 05 第 15.2 节：`component_plan`、`component_skipped`、`unit_resident`、`unit_transfer`、`fully_resident`。05-6 合入之前，事件用 logger `vllm_omni.diffusion.weight_stack.offload` 按同样的事件名和字段输出；`record_device_resources` 的调用由 05-6 加进 `commit()` 的第 8 步和 `close()` 的最后一步之后（05 第 16.2 节）。
 
 ## 与其他子 RFC 的接口
 
@@ -676,7 +677,7 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 | `weight_stack.offload.create_offloader(ctx)`、`PlacementPlan`、`Unit`、`HOOK_NAMES` | 01 | 第 1、2 节；`HOOK_NAMES` 供 01 的 T4。 |
 | `PlacementPlan.collective_signature()`、`unmatched_policy_keys()`、`bind_groups(groups)` | 01 | 第 2 节；`bind_groups` 组大小或位置不符时报 `GroupConfirmationError`。 |
 | `PlacementPlan.host_request()`、`Unit.unit_id` | 03 | 03 第 4.1 节的结构；Unit 划分不依赖 `LocalRecord` 的 pid、可用内存和空闲显存。 |
-| `PlacementPlan.cold_start(component)`、`sharded_tensor_names()`、`placement(name)` | 02 | 预检核对冷启动路径；收尾第 7 步换占位。 |
+| `PlacementPlan.cold_start(component)`、`sharded_tensor_names()`、`placement(name)`、`units`，以及 `Unit.roots`、`Unit.transport` | 02 | 预检核对冷启动路径；收尾第 7 步换占位；瘦路径的读取器按 `units` 里 `allgather` Unit 的规划顺序产出（02 第 7.2 节）。 |
 | `LoadTransaction.target()`、`commit()`、`abort()` | 01、02 | 4.2～4.4；`prepare_materialization()` 失败时不接管 `storage`，`commit()` 失败时资源全部留在启动事务里。 |
 | `OffloadRuntime` 的 `grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`、`close()` | 01 | 5.6～5.8。 |
 | `Offloader.setup_compile()` | 01 | 6.2。 |
@@ -689,8 +690,8 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 | 子 RFC | 约定 |
 |---|---|
 | [01](./01-startup-transaction.md) | 第 2 节的 Protocol 和数据类型；`ResourceLedger` 的 `register`、`hand_over`、`transfer`、`close`；驱动在第 1 点调用 `collective_signature()`、`unmatched_policy_keys()` 和 `bind_groups()`，在第 12 步调用 `setup_compile()`；`MemoryPools.slots()` 对应 `weight_slots` 池；worker 在睡眠前后调用 `before_sleep()`、`after_wake()`；`StartupContext.policy` 为 `None` 表示不做 offload；`StartupContext.faults`；05-3 合入之前 `unified` 下的 offload 配置在参数解析阶段被拒绝。 |
-| [02](./02-unified-loader.md) | `ComponentCatalog` 的字段和三个写方法；`require_complete()` 报 `PlanningError`（归属违例和保持 fp32 的层配了量化）；`TensorDecl.module` 是包装前的规范路径、解析得到包装层；`ComponentCatalog.declaration_order` 给出组件的声明顺序（02 第 2.7 节），`resolve_selection()` 的 `refs` 和常驻层计数用它，`entries` 只用于查找；`weight_stack.components.pipeline_of(catalog) -> nn.Module` 返回以这个目录登记的 pipeline 对象，`plan()` 用它读模块树（读 02 第 2.8 节的进程级弱引用表），这个函数由 02-1 提供（见风险）；`FinalManifest.live()` 给出规范张量和别名对象；`repeated_block_paths` 返回 `set_discovered_blocks()` 的记录；`fully_resident`、`component_paths`、`catalog`、`weight_generation` 的语义按 02 第 2.8 节；动态 LoRA 管理器从包装层取槽位，只用 `copy_` 写入，每次写入后调用 `bump_weight_generation`。 |
-| [03](./03-host-storage.md) | `HostRequest` 的结构（03 第 4.1 节），`cold_start` 为 `thin` 的组件没有 `replaced_at_finalize` 的条目；`HostStorage.note_written()` 由 Loader 调用，04 不调用；先全量后裁剪的组件在 `seal()` 里按 `flatten_shard_unit` 重新布局，`commit()` 按最终清单重建块环和分片槽位的视图（4.3）；`view()` 对等待者的共享张量和瘦路径的范围外张量返回 meta 张量；`ranges(unit)` 在 `seal()` 之后有效，本机部分每个文件一段、分片部分每个类型组一段；`MemoryRange.read_only` 与 `Mapping.kind` 一致；`flatten_shard_unit(tensors, group_size)` 接受带 `name`、`dtype`、`nbytes` 属性的对象，给出每个类型组的元素数、段长和组内偏移；`storage.close()` 可以多次调用。 |
+| [02](./02-unified-loader.md) | `ComponentCatalog` 的字段和三个写方法；`require_complete()` 报 `PlanningError`（归属违例和保持 fp32 的层配了量化）；`TensorDecl.module` 是包装前的规范路径、解析得到包装层；`ComponentCatalog.declaration_order` 给出组件的声明顺序（02 第 2.7 节），`resolve_selection()` 的 `refs` 和常驻层计数用它，`entries` 只用于查找；`weight_stack.components.pipeline_of(catalog) -> nn.Module` 返回以这个目录登记的 pipeline 对象，`plan()` 用它读模块树（读 02 第 2.8 节的进程级弱引用表），这个函数由 02-1 提供；`FinalManifest.live()` 给出规范张量和别名对象；`repeated_block_paths` 返回 `set_discovered_blocks()` 的记录；`fully_resident`、`component_paths`、`catalog`、`weight_generation` 的语义按 02 第 2.8 节；动态 LoRA 管理器从包装层取槽位，只用 `copy_` 写入，每次写入后调用 `bump_weight_generation`。 |
+| [03](./03-host-storage.md) | `HostRequest` 的结构（03 第 4.1 节），`cold_start` 为 `thin` 的组件没有 `replaced_at_finalize` 的条目；`HostStorage.note_written()` 由 Loader 调用，04 不调用；先全量后裁剪的组件在 `seal()` 里按 `flatten_shard_unit` 重新布局，`commit()` 按最终清单重建块环和分片槽位的视图（4.3）；`view()` 对等待者的共享张量和瘦路径的范围外张量返回 meta 张量；`ranges(unit)` 在 `seal()` 之后有效，本机部分按地址合并相邻的张量、一个文件里可以有几段，分片部分每个类型组一段（03 第 7.6 节）；`MemoryRange.read_only` 与 `Mapping.kind` 一致；`flatten_shard_unit(tensors, group_size)` 接受带 `name`、`dtype`、`nbytes` 属性的对象，给出每个类型组的元素数、段长和组内偏移；`storage.close()` 可以多次调用。 |
 | [05](./05-configuration.md) | `resolve_selection(policy, refs, *, pipeline)` 按 `declaration_order` 的 `refs` 调用，报 L02 到 L05，`Selection.unmatched` 按本 rank 判断；`HostPolicy.pin_cpu_memory` 和 `registration_limit_bytes`；P15 到 P18 和 P29 在参数解析阶段拒绝 `module` 配 `allgather`、`resident_layers` 大于 0 配 `allgather`、`units` 配 `module`、`units` 配 `resident_layers` 大于 0、全量编译配 offload；第 15.2 节的启动日志事件；05-6 在 `commit()` 末尾和 `OffloadRuntime.close()` 之后加入 `record_device_resources` 的调用（05 第 16.2 节）。 |
 
 ## 代码组织
@@ -848,7 +849,6 @@ umbrella RFC Job 6 删除 `legacy` 时，本 RFC 范围内删除：
 | 非 CUDA 平台不做内存登记 | 每个流式块每一步都经暂存区 H2D，比现有实现的锁页副本慢 | 支持矩阵写明这些平台走暂存区；平台实现第 7 节的方法并有验证测试后放开（总体设计 13）。 |
 | 运行期 `tensor.data` 换绑与 `torch.compile` 的守卫 | 换绑触发重新编译 | 编译只包住块的原始 `forward`，块的形状不变；冒烟测试统计重新编译次数，与 `legacy` 的逐层 offload 相同。 |
 | 内存登记的驱动开销 | 驱动按登记量占用内核内存 | 门槛测试记录登记前后的内核内存占用（总体设计 13）。 |
-| `plan()` 的签名只有目录、拓扑和策略，02 第 2.7 节的目录不带模块对象 | 没有 `pipeline_of(catalog)` 时 `plan()` 读不到模块树，重复块发现无法实现 | 02 在 02-1 里增加 `pipeline_of(catalog)`；04-1 合入之前确认它存在，`test_planner.py` 用它构造合成的模块树。 |
 | `shard_group` 组件的 AllGather 组推算假设切分组编号等于候选位置模 s | 模型按别的方式给切分组编号时，`bind_groups()` 在第 1 点报 `GroupConfirmationError`，这个组件不能用 `allgather` | 推算只决定报错，不会静默错位；`test_planner.py` 和多进程测试覆盖 MiniMax H3 文本编码器的切分组布局。 |
 
 ## 反馈期

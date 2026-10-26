@@ -171,8 +171,8 @@ class RankFingerprints:
     rank: int
     content_identities: Mapping[str, str]        # 组件名到内容身份摘要；只含本 rank 声明的组件
     plan_fingerprint: str                        # HostLayout 里本机后端部分的摘要
-    collective: Mapping[str, str]                # 组件名到这个组件的 AllGather Unit、它们的内容身份和布局、Transport 的摘要；
-                                                 # 只含有 allgather Unit 的组件
+    collective: Mapping[str, str]                # 组件名到这个组件的 AllGather Unit、它们的布局和 Transport 的摘要（04 第 2 节）；
+                                                 # 只含有 allgather Unit 的组件；内容身份由第 1 点按 content_identities 分组覆盖
 
 
 Fingerprints = tuple[RankFingerprints, ...]      # 按 rank 排列
@@ -268,13 +268,13 @@ class HostStorage(Protocol):
 |---|---|
 | `Loader.build_structure()` | 在只建结构的上下文里构造 pipeline，返回模型和组件声明。组件声明在 `Loader.close()` 之后仍然可以查询。 |
 | `Loader.preflight()` | 返回的 `Preflight` 含按组件的内容身份和预期清单，不写模型。 |
-| `Loader.write()` | 每个张量的写入目标取 `transaction.target(tensor_key)`；返回 `None` 的张量常驻加速卡，由 Loader 在执行设备上、在 `ctx.memory_pools.weights()` 里分配，因此进入睡眠时备份的池。写入期间的临时张量不在这个池里分配（总体设计 5.2：只有 Loader 分配的常驻存储进池）。 |
+| `Loader.write()` | 每个张量的写入目标取 `transaction.target(tensor_key)`；返回 `None` 的张量常驻加速卡，由 Loader 在执行设备上、在 `ctx.memory_pools.weights()` 里分配，因此进入睡眠时备份的池；由 HSDP 管理的张量同样返回 `None`，按 02 第 13 节的物化流程分配。写入期间的临时张量不在这个池里分配（总体设计 5.2：只有 Loader 分配的常驻存储进池）。 |
 | `Loader.finalize()` | 执行总体设计 5.4 的第 1 到第 7 步，其中第 6 步调用 `storage.seal()`，返回最终清单。收尾里新建、替换常驻加速卡参数的张量同样由 Loader 在 `ctx.memory_pools.weights()` 里分配。 |
 | `Loader.close()` | 关闭构造上下文、读取陷阱、checkpoint 读取器和临时张量。驱动在第 10 步成功之后立即调用它（总体设计 5.2：读取陷阱开到收尾结束）；失败时由释放流程调用。可以多次调用。 |
 | `Offloader.plan()` | 纯计算，不分配大块资源，不改模型，不装钩子。 |
 | `Offloader.prepare_materialization()` | 成功时返回的启动事务持有 `storage` 和全部运行期资源。失败时它自己分配的资源由它释放，`storage` 仍归调用方。 |
 | `Offloader.setup_compile()` | 在提交之后运行，编译目标从组件声明读取（总体设计 7.8）。 |
-| `LoadTransaction.target()` | Host 驻留的张量返回 `storage.view(tensor_key)`；常驻加速卡的张量返回 `None`。 |
+| `LoadTransaction.target()` | Host 驻留的张量返回 `storage.view(tensor_key)`；常驻加速卡的张量和由 HSDP 管理的张量返回 `None`（04 第 4.2 节）。 |
 | `LoadTransaction.commit()` | 成功时全部资源一次性移交返回的 `OffloadRuntime`，启动事务变为空。失败时全部资源仍在启动事务里，由 `abort()` 释放。 |
 | `LoadTransaction.abort()` | 按资源账本的顺序释放启动事务持有的全部资源，其中包括关闭 host 存储。 |
 | `OffloadRuntime.close()` | 按总体设计 7.5 的顺序关闭，不把权重恢复回 CPU，不发起集合通信。 |
@@ -290,7 +290,7 @@ class HostStorage(Protocol):
 | `HostStorage.note_written()` | 写入阶段由 Loader 在一个 Host 驻留张量全部写完之后调用一次，在写入线程里同步执行，不做集合通信；分片后端的瘦路径据此同步归还范围之外的页（03 第 9.2 节），其他后端只做名字检查；`seal()` 之后调用报 `LifecycleError`。 |
 | `HostStorage.close()` | 只释放本进程的映射；写入进程同时关闭监听套接字和文件描述符。 |
 
-`Election` 必须提供 `record() -> ElectionRecord`（可以 pickle 的参选结果）和可以多次调用的 `close()`。`PlacementPlan` 必须提供 `collective_signature() -> Mapping[str, str]`（即 `RankFingerprints.collective`）和 `bind_groups(groups: AllGatherGroups) -> None`。`HostLayout` 必须提供 `plan_fingerprint` 和 `bind_groups(groups: AllGatherGroups) -> None`。`bind_groups` 发现组的大小与规划的假设不同时报 `GroupConfirmationError`。
+`Election` 必须提供 `record() -> ElectionRecord`（可以 pickle 的参选结果）和可以多次调用的 `close()`。`PlacementPlan` 必须提供 `collective_signature() -> Mapping[str, str]`（即 `RankFingerprints.collective`）、`unmatched_policy_keys() -> frozenset[str]`（即 `Point1Payload.unmatched_policy_keys`，7.2）和 `bind_groups(groups: AllGatherGroups) -> None`。`HostLayout` 必须提供 `plan_fingerprint` 和 `bind_groups(groups: AllGatherGroups) -> None`。`bind_groups` 发现组的大小与规划的假设不同时报 `GroupConfirmationError`。
 
 HWM 和 Offloader 对象本身不持有资源：它们分配的资源都在返回值里交给调用方。
 
@@ -320,15 +320,15 @@ class ErrorSummary:               # 全组确认时随消息收集，可以 pick
 
 | 类型 | 说明 |
 |---|---|
-| `ConfigError`（同时是 `ValueError`） | 对应参数解析阶段。`phase` 是 `config`，由 01 和 05 抛出。总开关取值非法、同一个进程里的 worker 取值冲突、参数解析阶段发现不支持的组合时报这个错。 |
+| `ConfigError`（同时是 `ValueError`） | 对应参数解析阶段。`phase` 是 `config`，由 01、05 和 03 抛出。总开关取值非法、同一个进程里的 worker 取值冲突、参数解析阶段发现不支持的组合时报这个错；03 的 `deployment_id()` 读到不是 32 个小写十六进制字符的部署标识时同样报这个错（03 第 3.6 节）。 |
 | `ConstructionError` | 对应构造阶段。`phase` 是 `build_structure`，由 02 抛出。读取陷阱触发、构造后残留 meta 张量、pipeline 还没有迁移到只建结构时报这个错。 |
-| `PlanningError` | 对应 Offloader 规划阶段。`phase` 是 `plan`，由 04 抛出。组件不完整、找不到重复块、重复块以外的组件单机放不下时报这个错。 |
-| `PreflightError` | 对应 Loader 预检阶段。`phase` 是 `preflight`，由 02 抛出。来源不可读、适配器的键对不上时报这个错。 |
+| `PlanningError` | 对应 Offloader 规划阶段。`phase` 是 `plan`，由 04 的 `plan()` 抛出，其中组件完整性和保持 fp32 的层配了量化的检查经 02 的 `ComponentCatalog.require_complete()`，L02 到 L05 经 05 的 `resolve_selection()`；L01 由 01 在第 1 点第一轮收集之后抛出（7.2）。组件不完整、保持 fp32 的层配了量化、选择器不合法、找不到重复块、重复块以外的组件单机放不下时报这个错。 |
+| `PreflightError` | 对应 Loader 预检阶段。`phase` 是 `preflight`，由 02 的预检和 03 的 `layout()` 抛出。来源不可读、适配器的键对不上、冷启动路径与组件声明不符、规划的 Host 请求与预期清单对不上时报这个错。 |
 | `GroupConfirmationError` | 对应全组确认第 1 点。`phase` 是所在的确认点或第 1 点的本地步骤（`confirm`、`admit`），由 01、03、04 抛出。参与集合通信的部分各 rank 不一致、AllGather 组只剩一个 rank、部署标识不一致、各 rank 不在同一个确认点上时报这个错。子类 `HostCapacityError` 的 `phase` 是 `admit`，由 03 的 `admit()` 在单机 Host 容量不足时抛出。 |
 | `PrepareError` | 对应 `prepare_materialization()` 阶段。`phase` 是 `prepare`，由 04 抛出。加速卡槽位、流、事件或暂存区分配失败，内存登记或暂存区的计划不成立时报这个错。子类 `DeviceCapacityError` 在加速卡容量准入不通过时抛出。 |
 | `StackUnavailableError` | 启动事务的失败。`phase` 是 `construct_modules`，由 01 抛出。新栈的某个实现模块或工厂函数不存在时报这个错。 |
 | `AllocationError` | 启动事务的失败。`phase` 是 `allocate` 或 `connect_writer`，由 03 抛出。host 存储分配失败、等待者连接写入进程失败时报这个错。 |
-| `WriteError` | 启动事务的失败。`phase` 是 `write`，由 02 抛出。写入失败时报这个错。 |
+| `WriteError` | 启动事务的失败。`phase` 是 `write`，由 02 和 03 抛出。写入失败、写入目标或 `note_written()` 的张量名不在 host 存储的布局里时报这个错。 |
 | `FinalizeError` | 启动事务的失败。`phase` 是 `finalize`，由 02 和 03 抛出。收尾核对失败，或封存、交接、只读绑定失败时报这个错。 |
 | `CommitError` | 启动事务的失败。`phase` 是 `commit`，由 04 抛出。校验最终清单、内存登记、装钩子或移交失败时报这个错。 |
 | `PeerFailureError` | 启动事务的失败。`phase` 是所在的确认点，由 01 抛出。别的 rank 在这个确认点报告了错误时报这个错。 |
@@ -643,7 +643,7 @@ class _Startup:
 - 第 1 点第一轮之后，核对和建组只依赖收集到的结果，各 rank 的输入相同、结论相同，所以它们不是本地步骤：核对不通过时所有 rank 同时报错，不需要再收集一轮；建组是集合通信，本副本的每个 rank 都执行。本地步骤 `confirm` 在建组之后才开始，它的失败不会让别的 rank 停在建组的集合通信上。
 - 每个本地步骤都在第 3 点之前，所以每个错误都会在某个确认点上被报告。第 3 点之后只剩编译设置和 runner 的后续步骤。编译设置的异常只记警告；runner 后续步骤的失败是本 rank 的启动失败：worker 初始化失败，执行器的启动随之失败，本副本的其余 worker 一起终止（总体设计 4.4、6.5）。
 - `KeyboardInterrupt`、`SystemExit` 这类不是 `Exception` 的异常不进入确认点，由最外层的 `except BaseException` 释放资源后立即抛出。
-- 驱动自己不进入任何睡眠池。Loader 在 `memory_pools.weights()` 里分配常驻加速卡的权重（02）；Offloader 在 `prepare_materialization()` 里于 `memory_pools.slots()` 分配块环缓冲区和分片槽位，于 `memory_pools.weights()` 分配叠加层槽位（04，总体设计 7.6）。只建结构期间的分配和写入期间的临时张量不进任何睡眠池（总体设计 5.2）。
+- 驱动自己不进入任何睡眠池。Loader 在 `memory_pools.weights()` 里分配常驻加速卡的权重（02）；Offloader 在 `prepare_materialization()` 里于 `memory_pools.slots()` 分配块环缓冲区和分片槽位，于 `memory_pools.weights()` 分配叠加层槽位、搬到执行设备的非持久 buffer 和 `allgather` Unit 的 order 张量（04 第 4.1、5.8 节，总体设计 7.6）。只建结构期间的分配和写入期间的临时张量不进任何睡眠池（总体设计 5.2）。
 
 ### 7. 全组确认
 
@@ -757,13 +757,16 @@ _load_model_unified(memory_pools, load_format, custom_pipeline_name)
   enable_pec = od_config.enable_prompt_embed_cache                           不读环境变量（总体设计 8.5）
   pec_size = od_config.prompt_embed_cache_size
   current_omni_platform.init_diffusion_model_runner_runtime(...)             与 legacy 相同
-  ctx = StartupContext(..., policy=05 解析出的策略或 None, faults=FaultPlan.from_environ())
+  observability.bind_context(stage_id, rank, world_size)                    05-6 加入（05 第 15.1 节）
+  ctx = StartupContext(..., policy=startup_policy(od_config, log=(rank == 0)), faults=FaultPlan.from_environ())
+                                                                             05-3 合入之前 policy 为 None（05 第 13 节）
   with DeviceMemoryProfiler() as m:
       handle = run_unified_startup(ctx)                                      第 1 到第 12 步
   self.weight_stack = handle；self.pipeline = handle.model；self.offload_backend = None
   self.model_memory_usage = m.consumed_memory
   step_execution、streaming_output 的检查                                   与 legacy 相同
   self._install_runtime_services(enable_pec, pec_size)                      缓存后端、prompt embedding 缓存、InteractionCoordinator
+  observability.log_startup_summary(handle)                                 05-6 加入（05 第 15.2 节）
   handle.mark_in_service()
 ```
 
@@ -773,6 +776,7 @@ _load_model_unified(memory_pools, load_format, custom_pipeline_name)
 - `unified` 下 `load_format` 为 `default`、`diffusers` 或 `custom_pipeline` 时都走驱动，只建结构的方式由 Loader 按 `load_format` 选择（02）。
 - prompt embedding 缓存与文本编码器 `allgather` 的组合检查，`legacy` 下照旧在 runner 里做；`unified` 下由 05 在参数解析阶段做（总体设计 8.5）。`legacy` 一支照旧调用 `resolve_prompt_embed_cache_config`（`vllm_omni/diffusion/cache/prompt_embed_cache.py`），它在 worker 里读 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` 和 `OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE`；`unified` 一支不调用它。
 - `ARDiffusionModelRunner.load_model` 调用父类的 `load_model`，自动走同一个分支。
+- 进入服务之后，对被管理模块的调用都必须在 `OffloadRuntime.execution()` 里，钩子在它之外被调用时报 `RuntimeFault`（04 第 5.1、5.6 节）。runner 的 `_execute_request_list` 和 `_execute_stepwise_core` 由 04 承担的 C17 包进 `execution()`；`execute_model`、`execute_model_batch`、`execute_stepwise`、两种执行模式下的 `profile_run`，以及 `ARDiffusionModelRunner.load_model` 末尾的预热，都只经这两个方法调用 pipeline。编译设置在 `execution()` 里调用 pipeline 的 `setup_compile()`（04 第 6.2 节）。`_install_runtime_services` 和 `init_lora_manager` 只安装包装和钩子，不调用被管理模块的 `forward`；prompt embedding 缓存包住的 `encode_prompt` 只在前向里被调用。
 - 驱动返回之后、`mark_in_service()` 之前的任何一步失败时，runner 调用 `close_weight_stack()` 后抛出，worker 初始化失败。
 - 一个进程里同一时刻只运行一次 `unified` 启动。单进程执行器把几个 worker 放在同一个进程里时，各 worker 的启动依次进行：02 的只建结构上下文在一个进程里同一时刻只能打开一个，读取陷阱对整个进程生效。第二次启动在上下文打开期间进入时报 `LifecycleError`，不排队：排队的启动可能是持有上下文的 worker 在 `seal()` 里等待的写入进程。
 
@@ -869,9 +873,9 @@ class ExecutionOffloadFacts:
 
 | 字段 | `legacy` 下的取值 | `unified` 下的取值 |
 |---|---|---|
-| `weight_collectives` | `any_selected_component_uses_allgather(config)` 的值。 | 05 解析出的策略里有被选中的组件用 `allgather` 时为真。 |
-| `text_encoder_allgather` | `_uses_text_encoder_allgather` 现有表达式的值。 | 05 解析出的策略里 `text_encoder` 角色或属于这个角色的组件名用 `allgather` 时为真。 |
-| `whole_component_offload` | `resolve_offload_strategy(config) is OffloadStrategy.MODEL_LEVEL` 的值。 | 05 解析出的策略里有组件按 `module` 选中时为真。 |
+| `weight_collectives` | `any_selected_component_uses_allgather(config)` 的值。 | 05 第 12 节：策略里有任何选择器的设置用 `allgather` 时为真。 |
+| `text_encoder_allgather` | `_uses_text_encoder_allgather` 现有表达式的值。 | 05 第 12 节：`text_encoder` 角色键用 `allgather`，或者有任何组件名键用 `allgather` 时为真。 |
+| `whole_component_offload` | `resolve_offload_strategy(config) is OffloadStrategy.MODEL_LEVEL` 的值。 | 05 第 12 节：策略里有任何选择器的设置是 `module` 时为真。 |
 
 - 调用点上 DP 大小、请求数等其余条件不变，只把读查询函数的那一项换成对应的字段。`legacy` 下每个字段与原表达式逐项相同，引擎和执行器的行为不变。
 - `unified` 下的取值只读策略，不读规划：引擎和执行器所在的进程没有规划结果。策略选了某个组件、而模型里没有这个组件时，字段可能为真而实际没有 `allgather` 的 Unit，这时 DP 下多做的同步执行不影响正确性。
@@ -987,13 +991,13 @@ commit              point3_commit     compile_setup     close
 - `close` 注入点在 `handle.close()` 里、调用 `runtime.close()` 之前触发。`handle.close()` 照常调用 `runtime.close()`、丢弃模型、进入 `CLOSED`，然后报 `LifecycleError`，注入的异常作为 `__cause__`。
 - `FaultPlan` 把注入点映射到 rank 集合和动作。动作是 `raise`（抛出 `InjectedFault`，驱动按第 3 节的表包装）或 `hang`（阻塞，用于超时测试）。不给 rank 时对所有 rank 生效。
 - runner 用 `FaultPlan.from_environ()` 构造它，读环境变量 `VLLM_OMNI_WEIGHT_STACK_FAULTS`，格式是逗号分隔的 `<注入点>[@<rank>][:raise|:hang]`。变量不存在时为 `None`，驱动不做任何检查。这个变量只用于测试，不写进用户文档。
-- 02、03、04 在各自模块内部增加更细的注入点（例如 03 的封存），命名规则相同，用同一个 `FaultPlan`。
+- 03、04 在各自模块内部增加更细的注入点，用同一个 `FaultPlan` 和同样的环境变量格式。模块内部的注入点以模块前缀开头，与上面的名字和彼此都不重复：03 用 `hwm_`（03 第 14 节），04 用 `offload_`（04 第 9 节）。02 不增加模块内部的注入点，Loader 的失败经 `build_structure`、`preflight`、`write`、`finalize` 注入。
 
 ### 11. 静态依赖测试与冻结白名单
 
 | 编号 | 检查 | 范围和规则 |
 |---|---|---|
-| T1 | `weight_stack` 内部的 import 方向 | 用 AST 扫描运行期 import，包括函数内的 import，跳过 `if TYPE_CHECKING:` 的块。`weight_stack/` 里的任何模块都不 import `vllm_omni.host_weight_runtime`（总体设计 1.2）。`weight_stack/` 里只有 `startup.py` 的 `execution_offload_facts` 可以 import `vllm_omni.diffusion.offloader`，而且只在函数内 import `vllm_omni.diffusion.offloader.config`。`loader/` 不 import `host/`、`offload/`。`offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors` 和 `vllm.model_executor.model_loader`。`host/` 不 import `loader/`、`offload/` 和 `vllm_omni.diffusion.model_loader`。`policy.py` 不 import `loader/`、`host/`、`offload/`。`interfaces.py`、`errors.py` 只 import 标准库、`torch` 和 `weight_stack.errors`。`group.py`、`startup.py` 不 import `loader/`、`host/`、`offload/`：三个工厂函数由 `EntryPointFactory` 经 `importlib` 按名字取得；`execution_offload_facts` 的 `unified` 一支在函数内 import `weight_stack.policy`。 |
+| T1 | `weight_stack` 内部的 import 方向 | 用 AST 扫描运行期 import，包括函数内的 import，跳过 `if TYPE_CHECKING:` 的块。`weight_stack/` 里的任何模块都不 import `vllm_omni.host_weight_runtime`（总体设计 1.2）。`weight_stack/` 里只有 `startup.py` 的 `execution_offload_facts` 可以 import `vllm_omni.diffusion.offloader`，而且只在函数内 import `vllm_omni.diffusion.offloader.config`。`loader/` 不 import `host/`、`offload/`。`offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors` 和 `vllm.model_executor.model_loader`。`host/` 不 import `loader/`、`offload/` 和 `vllm_omni.diffusion.model_loader`。`policy.py` 不 import `loader/`、`host/`、`offload/`。`observability.py`（05）只 import 标准库和 `weight_stack.errors`，`loader/`、`host/`、`offload/`、`policy.py` 都可以 import 它。`interfaces.py`、`errors.py` 只 import 标准库、`torch` 和 `weight_stack.errors`。`group.py`、`startup.py` 不 import `loader/`、`host/`、`offload/`：三个工厂函数由 `EntryPointFactory` 经 `importlib` 按名字取得；`execution_offload_facts` 的 `unified` 一支在函数内 import `weight_stack.policy`。 |
 | T2 | 运行期的模块图 | 在子进程里以 `import vllm_omni` 之后已加载的模块为基线，分别 import `weight_stack.loader`、`weight_stack.host`、`weight_stack.offload`，只看新增的模块：不出现 T1 禁止的模块。 |
 | T3 | 模型代码对新栈和 Offloader 的 import | `models/`、`lora/`、`cache/` 只能 import 新栈里的 `model_loader.construct`、`model_loader.hub_prefetch` 和 `weight_stack.components`，`if TYPE_CHECKING:` 里的 import 同样计入。import `vllm_omni.diffusion.offloader`（任何子模块，绝对或相对写法）的文件必须在冻结白名单 `OFFLOADER_IMPORT_ALLOWLIST` 里：现有的 28 个模型文件和 `lora/manager.py`。 |
 | T4 | 按字符串名读 offload 钩子 | `models/`、`lora/`、`cache/` 里等于某个 offload 钩子名的字符串常量，只允许出现在冻结白名单 `HOOK_NAME_ALLOWLIST` 里：`cache/seacache/hook.py`。钩子名从 `SequentialOffloadHook`、`LayerwiseOffloadHook`、`DistributedLayerwiseOffloadHook` 的 `_HOOK_NAME` 和 04 导出的 `HOOK_NAMES` 读取。 |
@@ -1050,7 +1054,7 @@ commit              point3_commit     compile_setup     close
 | `startup.execution_offload_facts` | 引擎和执行器使用，05 提供 `unified` 下的取值。 | `unified` 一支读 05 的策略。 |
 | `startup.py` 的驱动、`StartupContext`、`EntryPointFactory`、`FaultPlan` | 02、03、04 使用。 | 三个工厂函数各自接收 `StartupContext`；模块内部的故障注入点使用同一个 `FaultPlan`。 |
 | `group.py` 的 `AllGatherGroups` | 03、04 使用。 | 第 1 点之后经 `bind_groups()` 交给 `HostLayout` 和 `PlacementPlan`。 |
-| `MemoryPools` | 02、04 使用。 | 驱动不进入任何睡眠池。02 在 `weights()` 里分配常驻加速卡的张量，包括收尾里新建的；04 在 `prepare_materialization()` 里于 `slots()` 分配块环缓冲区和分片槽位，于 `weights()` 分配叠加层槽位。 |
+| `MemoryPools` | 02、04 使用。 | 驱动不进入任何睡眠池。02 在 `weights()` 里分配常驻加速卡的张量，包括收尾里新建的；04 在 `prepare_materialization()` 里于 `slots()` 分配块环缓冲区和分片槽位，于 `weights()` 分配叠加层槽位、搬到执行设备的非持久 buffer 和 `allgather` Unit 的 order 张量（04 第 5.8 节）。 |
 | 登记表 `tests/diffusion/weight_stack/coexistence/` | 02、03、04、05 使用。 | 承担必改行或自己分发点的 PR 在 `sites/` 下新增位置文件，自己的分发点用 `NEW_ROW` 声明；不修改 `registry.py` 和白名单。 |
 | 测试替身 `tests/diffusion/weight_stack/fakes.py` | 02、03、04 使用。 | 各自的测试用替身替换另外两个模块，经 `run_unified_startup(ctx, factory)` 走完整的启动流程。替身的 host 存储实现 `note_written()`，什么都不做。 |
 
@@ -1061,7 +1065,7 @@ commit              point3_commit     compile_setup     close
 | [02](./02-unified-loader.md) | `vllm_omni.diffusion.weight_stack.loader` 导出 `create_loader(ctx: StartupContext) -> Loader`，以及 `Preflight`（含 `content_identities: Mapping[str, str]` 和 `expected_manifest`）、`ExpectedManifest`、`FinalManifest`。`vllm_omni.diffusion.weight_stack.components` 导出 `ComponentCatalog` 和 `is_unified_stack()`。组件声明在 `Loader.close()` 之后仍然可以查询。Loader 自己在 `ctx.memory_pools.weights()` 里分配常驻加速卡的张量。`Loader.finalize()` 在第 6 步调用 `storage.seal()`，在此之前完成收尾里的全部集合通信。`model_loader/construct.py` 的 `is_building_structure()` 是构造上下文的判断函数，模型代码对它的调用按 T6 登记。02 承担 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。 |
 | [03](./03-host-storage.md) | `vllm_omni.diffusion.weight_stack.host` 导出 `create_host_weight_manager(ctx: StartupContext) -> HostWeightManager`，以及 `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`。`LocalRecord` 和 `ElectionRecord` 可以 pickle。`HostWeightManager.deployment_id()` 按第 2 节的规范实现。`elect()` 在每个 rank 上都可以调用，非代表返回空的 `Election`。`Election.close()`、`HostStorage.close()` 可以多次调用。`allocate()` 成功时接管 `Election`，失败时不接管。`HostStorage.connect_writer()` 在第 2 点之后由驱动调用。`HostLayout.plan_fingerprint` 只依赖配置和并行布局。03 给 `OmniDiffusionConfig` 增加 `init=False` 的 `deployment_id` 字段，没有下发时为 `None`。 |
 | [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`。 |
-| [05](./05-configuration.md) | `vllm_omni.diffusion.weight_stack.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把它填进 `StartupContext.policy`。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
+| [05](./05-configuration.md) | `vllm_omni.diffusion.weight_stack.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把 `startup_policy()` 的结果填进 `StartupContext.policy`。05-6 提供 `observability.bind_context()` 和 `log_startup_summary()`，由 runner 在 8.1 写明的位置调用，并在 03、04 的代码里加入日志和字节登记的调用（05 第 15、16 节）。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
 
 ## 代码组织
 
@@ -1137,7 +1141,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 
 - 本 RFC 的 PR 不承担共存期必改清单的 C 行，只承担自己的分发点 D01 到 D05。每个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变。
 - 01-2、01-3、01-6 的分发点在 01-7 建立登记表之前合入，01-7 合入时为它们新增位置文件，T6 从这时起生效。
-- 02、03、04 的 PR 依赖 01-1 到 01-7 全部合入。
+- 02、03、04、05 的 PR 都依赖 01-1 到 01-7 全部合入。
 
 ## 测试计划
 
@@ -1153,7 +1157,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 **接口、错误和资源账本**（`test_interfaces.py`、`test_errors.py`、`test_resources.py`）
 
 - 在子进程里以 `import vllm_omni` 之后已加载的模块为基线，import `interfaces.py` 和 `errors.py` 不加载 `TYPE_CHECKING` 里列出的任何模块。
-- `fakes.py` 里的每个替身都实现了对应 Protocol 的全部方法，方法名和参数与 Protocol 一致。
+- `fakes.py` 里的每个替身都实现了对应 Protocol 的全部方法，方法名和参数与 Protocol 一致，包括 `HostStorage.note_written()`；替身的 `PlacementPlan` 实现 `collective_signature()`、`unmatched_policy_keys()`、`bind_groups()`，替身的 `HostLayout` 实现 `plan_fingerprint` 和 `bind_groups()`，替身的 `Election` 实现 `record()` 和 `close()`（第 2 节）。
 - 错误信息符合第 3 节的格式；`ErrorSummary` 可以 pickle，超长的信息被截断；非 `WeightStackError` 的异常按步骤包装，`__cause__` 保留。
 - `ResourceLedger`：关闭顺序按种类、同种类内逆序；重复登记、`transfer()` 之后登记、关闭之后登记都报 `LifecycleError`；关闭可以多次调用；一个关闭函数报错时其余照常执行，最后报 `LifecycleError`。
 
@@ -1188,6 +1192,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
   - 同一个进程里第二次启动复用成员相同的组，不再调用 `new_group`；
   - 一个 rank 的进程级表里没有某个组、其余 rank 有时，所有 rank 都为这个组调用 `new_group`，各 rank 的调用次数和顺序相同；
   - `collective` 摘要在组内不一致时所有 rank 报 `GroupConfirmationError`。
+  - 替身规划在两个 rank 上交出不同的 `unmatched_policy_keys`：交集为空时继续；交集不为空时两个 rank 以同样的内容报 `PlanningError`，文本按 05 第 8.2 节的 L01，之后没有 rank 调用 `new_group`。
 
 **共存**（`test_offload_query_coexistence.py`、`test_execution_facts.py`）
 

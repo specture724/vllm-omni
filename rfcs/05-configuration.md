@@ -67,7 +67,7 @@ vllm_omni/diffusion/data.py          OmniDiffusionConfig                   同�
 
 - 命令行参数默认是 `None`，`build_stage_runtime_overrides` 跳过值为 `None` 的键，所以没给出的参数不覆盖 YAML。`--pin-cpu-memory` 和 `--no-pin-cpu-memory` 的 `dest` 都是 `pin_cpu_memory`，前者 `store_const` 为 `True`，后者为 `False`。
 - 四个新字段属于 `_DIFFUSION_CONFIG_FIELDS`，随 `od_config` 到达每个 worker，不进内容身份。
-- `diffusion_offload_policy` 在配置里保存原始的映射或字符串，与现有 `diffusion_offload_config` 保存原始映射的做法相同，跨进程序列化不经过解析后的对象。解析后的 `OffloadPolicy` 不挂在配置对象上；worker 用 `startup_policy(od_config)`（第 13 节）从字段重新得到同一个结果。
+- `diffusion_offload_policy` 在配置里保存原始的映射或字符串，与现有 `diffusion_offload_config` 保存原始映射的做法相同，跨进程序列化不经过解析后的对象。解析后的 `OffloadPolicy` 不挂在配置对象上；worker 用 `startup_policy(od_config, log=...)`（第 13 节）从字段重新得到同一个结果。
 - `_DiffusionConfigProjection.from_kwargs` 在调用 `parse_diffusion_offload_config` 之后，对 `diffusion_offload_policy` 调用 `policy.parse_policy_document()` 只做结构校验（第 4.1 节），让 YAML 和 Python 参数里的结构错误在构造 stage 之前报出。
 
 ### 2. `OffloadPolicy`
@@ -217,7 +217,7 @@ schema 之外由解析器检查的规则：每个被选中的设置必须能解�
 ```python
 def parse_policy_document(value: object) -> PolicyDocument: ...       # 只做结构校验，返回规范化的文档
 def parse_unified_config(config: OmniDiffusionConfig) -> OffloadPolicy | None: ...   # 参数解析阶段的入口（第 13 节）
-def startup_policy(config: OmniDiffusionConfig) -> OffloadPolicy | None: ...         # worker 里由 runner 调用（第 13 节）
+def startup_policy(config: OmniDiffusionConfig, *, log: bool) -> OffloadPolicy | None: ...   # worker 里由 runner 调用（第 13 节）
 ```
 
 - 命令行的 `--diffusion-offload-policy` 的 `type` 是 `str`，原样存进字段；Python 参数可以传映射或 JSON 字符串；YAML 写映射。三者都由 `parse_policy_document` 解析，字符串先用 `json.loads` 解析，解析失败报 `P04`（第 8 节）。
@@ -662,7 +662,7 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
 | `host_share` | 03 | `component`、`shared`、`reason`、`role`（`writer`、`waiter`、`private`）、`writer_pid`、`socket`（抽象命名空间开头的 `\0` 写成 `@`）。 |
 | `host_admission` | 03 | `machine`、新增占用的每一项、`available_bytes`、`memory_source`。 |
 | `unit_transfer` | 04 | `unit`、`path`（`registered` 或 `staging`）、`reason`（`limit`、`unsupported`、`failed`、`pin_disabled`）、`bytes`。 |
-| `fully_resident` | 04 | `component`、`value`、`compile_mode`、`downgraded_from`（编译模式被降成 `default` 时给出原模式）。 |
+| `fully_resident` | 04 | `commit()` 时每个组件一条，字段 `component`、`value`；编译模式被降成 `default` 时再输出一条，另带 `compile_mode`（降级后的模式）和 `downgraded_from`（原模式）（04 第 6.3 节）。 |
 | `startup_summary` | 05，`IN_SERVICE` 之前 | `host_private_bytes`、`host_shared_bytes`、`host_shard_bytes`、`registered_bytes`、`staging_bytes`、`device_slot_bytes`、`startup_s`。 |
 
 - 03 第 14 节和 04 第 9 节的启动日志按这张表的事件名和字段输出。03、04 的 PR 先于 05-6 合入，期间用各自的 logger（`vllm_omni.diffusion.weight_stack.host`、`.offload`）按同样的事件名和字段输出；05-6 把这些调用点改成 `log_event`，事件名和字段不变。
@@ -693,7 +693,7 @@ worker（每个 rank）
   03：allocate() 和 seal() 返回之前，对每个新建的 Mapping 调用 observability.record_host_mapping(mapping)；
       HostStorage.close() 里调用 forget_host_mapping(mapping)。这三处调用由 05-6 加进 03 的代码（03 第 14 节）
   04：commit() 末尾调用 observability.record_device_resources(registered=..., staging=..., slots={...})，
-      OffloadRuntime.close() 之后用同一个函数清零。这两处调用由 05-6 加进 04 的代码（04 第 9 节）
+      OffloadRuntime.close() 的最后一步之后用同一个函数清零。这两处调用由 05-6 加进 04 的代码（04 第 9 节）
   DiffusionWorker.weight_stack_memory_report() -> WeightStackMemoryReport | None
     legacy 或启动未完成时返回 None；否则汇总上面的登记，并读一次 /proc/self/smaps_rollup
 stage 进程（只在 unified 下，D21）
@@ -776,7 +776,7 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | `parse_unified_config`、`check_late`、`check_migration`、`reject_unified_only_fields` | `OmniDiffusionConfig`、`_DiffusionConfigProjection` | 第 13 节，取代 01 第 1.3 节的临时拒绝。 |
 | `startup_policy(config, *, log)` | 01 的 `_load_model_unified` | 第 13 节。 |
 | `HostPolicy` | 04 | `pin_cpu_memory` 为假时不查询平台能力、不登记，暂存区不锁页；`registration_limit_bytes` 为 0 表示不设上限。 |
-| `observability` 的 `log_event`、`record_host_mapping`、`record_device_resources`、`WeightStackMemoryReport` | 02、03、04 | 第 15、16 节。 |
+| `observability` 的 `bind_context`、`format_event`、`log_event`、`log_startup_summary`、`record_host_mapping`、`forget_host_mapping`、`record_device_resources`、`WeightStackMemoryReport` | 01 的 runner、03、04 | 第 15、16 节。runner 调用 `bind_context` 和 `log_startup_summary`（01 第 8.1 节）；03 调用 `log_event`、`record_host_mapping`、`forget_host_mapping`；04 调用 `log_event`、`record_device_resources`。这些调用由 05-6 加入。 |
 | 新字段列表 `diffusion_offload`、`diffusion_offload_policy`、`host_registration_limit_gib`、`max_lora_rank` | 01 的 T5 | 05-2 把它们加进 `test_static_dependencies.py` 的 T5 字段表。 |
 | `max_lora_rank` 的解析和合法值、HSDP 预分片配 LoRA 或量化的拒绝、支持矩阵文档 | 02 | 第 9 节、P28、第 17.3 节。 |
 
@@ -787,7 +787,7 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | [01](./01-startup-transaction.md) | `is_unified(config)`；`ConfigError`、`PlanningError` 和报错格式；`execution_offload_facts` 的 `unified` 一支调用 `cached_policy(config).execution_facts()`，策略为 `None` 时三个字段为假；`_load_model_unified` 把 `startup_policy()` 的结果填进 `StartupContext.policy`；登记表接受 D20、D21、D22 的 `NEW_ROW`；T1 不禁止 `loader/`、`host/`、`offload/`、`policy.py` import `observability.py`，`observability.py` 只 import 标准库和 `errors.py`。全组确认第 1 点第一轮收集 `Point1Payload.unmatched_policy_keys`，对各 rank 的集合取交集，不为空时每个 rank 以同样的内容报 `PlanningError`，文本按第 8.2 节的 L01（01 第 7.2 节）。 |
 | [02](./02-unified-loader.md) | 组件目录给出每个组件的名字、角色、`hsdp_managed` 和 `declaration_order`；编码器的角色符合总体设计 8.4 的对应；`DynamicLoraSpec` 读 `od_config.max_lora_rank`；`test_structure_matrix.py` 按第 17.3 节的格式输出 `structure_matrix.json`；动态 LoRA 未启用时 `DiffusionWorker.add_lora` 的报错提示 `--diffusion-max-lora-rank`。 |
 | [03](./03-host-storage.md) | `Mapping.kind` 取 `shared`、`private`、`shard`；05-6 在 `allocate()`、`seal()` 返回之前加入 `record_host_mapping` 调用，在 `close()` 里加入 `forget_host_mapping` 调用；`host_share`、`host_admission` 事件按第 15.2 节的事件名和字段输出，`socket` 里的 `\0` 写成 `@`。HWM 不读 host 策略。 |
-| [04](./04-unified-offloader.md) | `plan()` 只经 `resolve_selection()` 解释策略，`refs` 按 `declaration_order` 构造，按 `if_no_blocks` 处理找不到重复块的组件，按 `Selection.resident_layers` 计数常驻层；`PlacementPlan.unmatched_policy_keys()` 原样返回 `Selection.unmatched`，`policy` 为 `None` 时为空集合；`policy` 为 `None` 时不做 offload；从 `policy.host` 读 `pin_cpu_memory` 和登记上限；05-6 在 `commit()` 和 `close()` 里加入 `record_device_resources` 调用；第 15.2 节里 04 的事件；HSDP 组件的报错用 L03 的文本；`DeviceCapacityError` 的 `fix` 指向 recipe；承担 C08（`offload_vae_during_denoise` 忽略并记警告）。 |
+| [04](./04-unified-offloader.md) | `plan()` 只经 `resolve_selection()` 解释策略，`refs` 按 `declaration_order` 构造，按 `if_no_blocks` 处理找不到重复块的组件，按 `Selection.resident_layers` 计数常驻层；`PlacementPlan.unmatched_policy_keys()` 原样返回 `Selection.unmatched`，`policy` 为 `None` 时为空集合；`policy` 为 `None` 时不做 offload；从 `policy.host` 读 `pin_cpu_memory` 和登记上限；05-6 在 `commit()` 的第 8 步和 `close()` 的最后一步之后加入 `record_device_resources` 调用（04 第 9 节）；第 15.2 节里 04 的事件；HSDP 组件的报错用 L03 的文本；`DeviceCapacityError` 的 `fix` 指向 recipe；承担 C08（`offload_vae_during_denoise` 忽略并记警告）。 |
 
 ## 代码组织
 

@@ -4,7 +4,7 @@
 >
 > 范围：`vllm_omni/diffusion/weight_stack/loader/`、`vllm_omni/diffusion/weight_stack/components.py`、`vllm_omni/diffusion/model_loader/construct.py`、`vllm_omni/diffusion/model_loader/hub_prefetch.py`，19 个构造期读张量的家族目录，以及共存期必改清单里由本 RFC 承担的各行。
 >
-> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_stack/interfaces.py`、`weight_stack/errors.py`、启动驱动、`StartupContext.memory_pools`、共存期登记表（`tests/diffusion/weight_stack/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan` 给出的冷启动路径和每个张量的 Transport、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
+> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_stack/interfaces.py`、`weight_stack/errors.py`、启动驱动、`StartupContext.memory_pools`、共存期登记表（`tests/diffusion/weight_stack/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan` 给出的冷启动路径、每个张量的 Transport、分片 Unit 的规划顺序、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
 
 ## 摘要
 
@@ -524,7 +524,7 @@ class ResolvedSource:
 - `weights_sources` 的来源（`DiffusersPipelineLoader.ComponentSource`）用 `DiffusersPipelineLoader._prepare_weights` 解析文件，与 legacy 一致；读取器在函数内 import `diffusers_loader`，用同一份 `LoadConfig` 和 `od_config` 构造一个只用于解析的实例。
 - `WeightSource`、`BufferSource` 和 HF 来源用 `prefetch_subfolders`（`hub_prefetch.py`）下载并校验缓存，再按 `files` 选择文件。
 - 预检读每个 safetensors 文件的头部，核对来源可读。名字映射完全由 Loader 决定的来源（HF 来源和没有 `writer`、模块也没有 `load_weights` 的 `declare_weights` 来源）另外核对：每个 `required` 的张量在按规则表转换之后的键里出现。不满足时报 `PreflightError`，写明组件、来源和键名。经 pipeline 或模块 `load_weights`、`writer` 写入的张量，名字映射在模型代码里，预检不核对，是否写到由收尾第 4 步按写入跟踪核对（总体设计 5.4）。
-- 预检同时核对规划选定的冷启动路径：组件的 `shapes_final` 为假时，规划不能选瘦路径，否则报 `PreflightError`。
+- 预检同时核对规划选定的冷启动路径：组件的 `shapes_final` 为假或 `finalize_replaced` 不为空时，规划不能选瘦路径（04 第 3.7 节），否则报 `PreflightError`。
 
 #### 7.2 读取流水线
 
@@ -541,7 +541,7 @@ checkpoint 适配器 get_checkpoint_adapter 选中的格式转换（例如 Model
 ```
 
 - 格式和并行方式的选择规则与 `DiffusersPipelineLoader._get_weights_iterator` 相同：torchao 序列化的 checkpoint 按 torch 格式读；`enable_multithread_weight_load` 为真时，safetensors 文件用线程池按 `num_weight_load_threads` 并行打开，文件按 `_natural_sort_key` 排序。含在线量化层的组件不开线程池，按键名的自然顺序产出，以减少同时存在的量化前临时张量（风险表）。
-- 规划给这个组件选了瘦路径（04 的冷启动路径）时，读取器同样不开线程池，按 Unit 的顺序产出：加前缀之后的 checkpoint 张量名按最长的 Unit 模块路径前缀归到 Unit，按 `PlacementPlan` 里分片 Unit 的顺序逐个 Unit 产出，Unit 内按键名的自然顺序，归不到 Unit 的键最后产出。每个 Unit 的每个类型组最多两个边界张量，所以同一时刻没写完的边界张量不超过两个，瘦路径的冷启动额外占用不超过释放阈值加最大的两个张量（总体设计 6.4，[03](./03-host-storage.md) 第 9.2 节）。
+- 规划给这个组件选了瘦路径（04 的冷启动路径）时，读取器同样不开线程池，按 Unit 的顺序产出：加前缀之后的 checkpoint 张量名按最长的 Unit 模块路径前缀归到 Unit，按 `PlacementPlan.units` 里这个组件 `allgather` Unit 的规划顺序逐个 Unit 产出（Unit 的模块路径取 `Unit.roots`，04 第 2 节），Unit 内按键名的自然顺序，归不到 Unit 的键最后产出。每个 Unit 的每个类型组最多两个边界张量，所以同一时刻没写完的边界张量不超过两个，瘦路径的冷启动额外占用不超过释放阈值加最大的两个张量（总体设计 6.4，[03](./03-host-storage.md) 第 9.2 节）。
 - 读取器产出的是延迟张量（7.3）；融合和规则表转换都作用在延迟张量上，真正的读取发生在写进最终存储的那一刻。
 
 #### 7.3 延迟张量
@@ -977,7 +977,7 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 |---|---|
 | [01](./01-startup-transaction.md) | `StartupContext`（含 `memory_pools`）、`Loader` 协议、错误类型；总开关取自 `weight_stack.startup` 的 `WeightStack` 和 `process_weight_stack()`；驱动不进入任何睡眠池，常驻加速卡的张量（包括收尾里新建、替换的张量和 HSDP 的本地分片）由 Loader 自己在 `ctx.memory_pools.weights()` 里分配；驱动在第 10 步成功之后立即调用 `loader.close()`；必改行和 D06 的位置文件放在 `tests/diffusion/weight_stack/coexistence/sites/` 下，D06 用 `NEW_ROW` 声明，不修改 `registry.py`；T6 不检查 `weight_stack/`、`model_loader/construct.py` 和 `model_loader/hub_prefetch.py` 内部；测试替身（全部常驻的规划、空的 host 存储）用于对比框架。单进程执行器在同一进程里依次进行各 worker 的 `unified` 启动（3.1）。 |
 | [03](./03-host-storage.md) | `HostStorage.view(name)` 对瘦路径下本 rank 范围之外的张量、以及等待者的共享张量返回形状和类型正确的 meta 张量；`seal()` 在每个 worker、每种后端上都被调用一次：私有存储和分片在其中定稿，共享存储在其中封存、交接并用 `final_manifest.live()` 重新绑定；`layout()` 只读 `ExpectedManifest` 的条目。 |
-| [04](./04-unified-offloader.md) | `plan()` 第一步调用 `catalog.require_complete()`，并经 `set_discovered_blocks()` 记录自动发现的重复块；`PlacementPlan` 给出每个组件的冷启动路径（供预检核对）和分片后端 Unit 的张量规范名（供收尾第 7 步换成占位）；`transaction.target()` 的语义同 01；`prepare_materialization()` 分配叠加层槽位，`commit()` 调用 `bind_overlay_slot()` 并把槽位交给动态 LoRA 管理器；`repeated_block_paths` 返回 `set_discovered_blocks()` 记录的结果；`setup_compile` 经查询接口选目标。 |
+| [04](./04-unified-offloader.md) | `plan()` 第一步调用 `catalog.require_complete()`，并经 `set_discovered_blocks()` 记录自动发现的重复块；`PlacementPlan` 给出每个组件的冷启动路径 `cold_start(component)`（供预检核对）、分片后端 Unit 的张量规范名 `sharded_tensor_names()`（供收尾第 7 步换成占位），以及按规划顺序排列的 `units` 和每个 Unit 的 `roots`、`transport`（供瘦路径的读取器按 Unit 产出，7.2）；`transaction.target()` 的语义同 01；`prepare_materialization()` 分配叠加层槽位，`commit()` 调用 `bind_overlay_slot()` 并把槽位交给动态 LoRA 管理器；`repeated_block_paths` 返回 `set_discovered_blocks()` 记录的结果；`setup_compile` 经查询接口选目标。 |
 | [05](./05-configuration.md) | 解析 `--diffusion-max-lora-rank` 并检查合法值；HSDP 预分片配 LoRA 或量化在参数解析阶段报错；支持矩阵文档收录 5.7 的结果。 |
 
 ## 代码组织
