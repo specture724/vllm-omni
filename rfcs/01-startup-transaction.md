@@ -914,8 +914,9 @@ class ExecutionOffloadFacts:
 | C16 | LoRA 管理器提交后才包装 PEFT 层，以及 worker 提交后融合蒸馏 LoRA。 | 由 [02](./02-unified-loader.md) 承担。 |
 | C17 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad`；`unified` 下改读 `OffloadRuntime.grad_mode()`。 | 由 [04](./04-unified-offloader.md) 承担。 |
 | C18 | diffusers 适配器的 `_raise_unsupported_features` 在 `__init__` 里拒绝 `diffusion_offload_config`；`unified` 下这项拒绝不执行，旧配置由 05 翻译。 | 由 [02](./02-unified-loader.md) 承担。 |
+| C19 | DreamZero 的 `DreamZeroVideoExportWorkerExtension` 经 collective RPC 在 `execution()` 之外调用 VAE 解码；`unified` 下 worker 执行扩展类定义的方法时包在 `execution()` 里，`re_init_pipeline` 除外。 | 由 [04](./04-unified-offloader.md) 承担。 |
 
-C01 到 C18 是 umbrella RFC Job 1 共存期必改清单的各行，按原顺序一一编号。C18 是表里的最后一行：`DiffusersAdapterPipeline` 的构造函数调用 `_raise_unsupported_features`，后者在 `od_config.diffusion_offload_config` 不是 `None` 时抛出 `NotImplementedError`；这项拒绝只为现有后端存在（总体设计 7.7），而 `unified` 下旧的 `--diffusion-offload-config` 由兼容层翻译（总体设计 8.4）。
+C01 到 C19 是 umbrella RFC Job 1 共存期必改清单的各行，按原顺序一一编号。C18 是表里的倒数第二行：`DiffusersAdapterPipeline` 的构造函数调用 `_raise_unsupported_features`，后者在 `od_config.diffusion_offload_config` 不是 `None` 时抛出 `NotImplementedError`；这项拒绝只为现有后端存在（总体设计 7.7），而 `unified` 下旧的 `--diffusion-offload-config` 由兼容层翻译（总体设计 8.4）。
 
 本 RFC 自己的分发点也读总开关，同样登记，随 `legacy` 删除。01-2、01-3、01-6 合入时登记表还不存在，这五行的位置文件由 01-7 建立登记表时一并新增：
 
@@ -942,7 +943,7 @@ tests/diffusion/weight_stack/coexistence/
 # tests/diffusion/weight_stack/coexistence/registry.py
 @dataclass(frozen=True)
 class CoexistenceRow:
-    row_id: str                  # "C01" 到 "C18"、"D01" 到 "D05"，或者其他子 RFC 用 NEW_ROW 声明的 "D06" 起的编号
+    row_id: str                  # "C01" 到 "C19"、"D01" 到 "D05"，或者其他子 RFC 用 NEW_ROW 声明的 "D06" 起的编号
     title: str
     carrier: str                 # 承担的子 RFC，"01" 到 "05" 之一
     legacy_removal: str          # 删除 legacy 时要删的语句
@@ -956,7 +957,7 @@ SITES: tuple[str, ...]                    # 这个 PR 新增的读总开关或�
 NEW_ROW: CoexistenceRow | None = None     # 其他子 RFC 自己的分发点在这里声明新的一行，编号从 D06 起
 ```
 
-- `registry.py` 由 01-7 建立，`ROWS` 含 C01 到 C18 和 D01 到 D05，之后只在 Job 6 删除 legacy 时修改。必改 PR 不修改 `registry.py` 和其他已有测试文件，只在 `sites/` 下新增自己的文件，因此满足 9.3 第 3 条。
+- `registry.py` 由 01-7 建立，`ROWS` 含 C01 到 C19 和 D01 到 D05，之后只在 Job 6 删除 legacy 时修改。必改 PR 不修改 `registry.py` 和其他已有测试文件，只在 `sites/` 下新增自己的文件，因此满足 9.3 第 3 条。
 - 02、03、04、05 自己的分发点（例如 02 在 `models/utils.py` 的分发点）不在 `ROWS` 里，由承担它的 PR 在位置文件里用 `NEW_ROW` 声明，`ROW` 等于 `NEW_ROW.row_id`。`NEW_ROW` 的编号不能与 `ROWS` 和其他位置文件的 `NEW_ROW` 重复。
 - 位置文件不以 `test_` 开头，pytest 不收集它们；静态测试（第 11 节 T6）按路径加载 `sites/` 下的全部文件。
 - 每个位置文件的 `ROW` 必须在 `ROWS` 里或者等于本文件 `NEW_ROW` 的编号，`PR` 不为空；`SITES` 里的每个位置必须存在，即文件存在并且限定名能在这个文件的语法树里找到。一个 PR 没有新增读总开关的位置时，`SITES` 为空，文件照样新增，用来记录这一行已由这个 PR 完成。
@@ -1064,7 +1065,7 @@ commit              point3_commit     compile_setup     close
 |---|---|
 | [02](./02-unified-loader.md) | `vllm_omni.diffusion.weight_stack.loader` 导出 `create_loader(ctx: StartupContext) -> Loader`，以及 `Preflight`（含 `content_identities: Mapping[str, str]` 和 `expected_manifest`）、`ExpectedManifest`、`FinalManifest`。`vllm_omni.diffusion.weight_stack.components` 导出 `ComponentCatalog` 和 `is_unified_stack()`。组件声明在 `Loader.close()` 之后仍然可以查询。Loader 自己在 `ctx.memory_pools.weights()` 里分配常驻加速卡的张量。`Loader.finalize()` 在第 6 步调用 `storage.seal()`，在此之前完成收尾里的全部集合通信。`model_loader/construct.py` 的 `is_building_structure()` 是构造上下文的判断函数，模型代码对它的调用按 T6 登记。02 承担 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。 |
 | [03](./03-host-storage.md) | `vllm_omni.diffusion.weight_stack.host` 导出 `create_host_weight_manager(ctx: StartupContext) -> HostWeightManager`，以及 `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`。`LocalRecord` 和 `ElectionRecord` 可以 pickle。`HostWeightManager.deployment_id()` 按第 2 节的规范实现。`elect()` 在每个 rank 上都可以调用，非代表返回空的 `Election`。`Election.close()`、`HostStorage.close()` 可以多次调用。`allocate()` 成功时接管 `Election`，失败时不接管。`HostStorage.connect_writer()` 在第 2 点之后由驱动调用。`HostLayout.plan_fingerprint` 只依赖配置和并行布局。03 给 `OmniDiffusionConfig` 增加 `init=False` 的 `deployment_id` 字段，没有下发时为 `None`。 |
-| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`。 |
+| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17、C19，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`；C19 让 worker 扩展类的方法经过 `execution()`。 |
 | [05](./05-configuration.md) | `vllm_omni.diffusion.weight_stack.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把 `startup_policy()` 的结果填进 `StartupContext.policy`。05-6 提供 `observability.bind_context()` 和 `log_startup_summary()`，由 runner 在 8.1 写明的位置调用，并在 03、04 的代码里加入日志和字节登记的调用（05 第 15、16 节）。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
 
 ## 代码组织
@@ -1232,7 +1233,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 - `unified` 下 `offloader/config.py` 的每个查询函数的结果等于 legacy 下不含 offload 设置时的结果；`legacy` 下 `execution_offload_facts` 与原表达式逐项相同。
 - `unified` 下 `re_init_pipeline` 关闭旧的运行时和 host 存储映射之后才开始新的启动流程，所有 rank 都经过第 0 到第 3 点。
 - `unified` 下睡眠前调用 `before_sleep()`，唤醒时连同 `weight_slots` 一起唤醒并调用 `after_wake()`。
-- 静态依赖测试 T1 到 T8 通过；四个白名单的摘要与冻结时相同；`registry.py` 列出 C01 到 C18 和 D01 到 D05，每一行写明承担的子 RFC；D01 到 D05 各有位置文件，`vllm_omni/` 里每个读总开关的位置都已登记。
+- 静态依赖测试 T1 到 T8 通过；四个白名单的摘要与冻结时相同；`registry.py` 列出 C01 到 C19 和 D01 到 D05，每一行写明承担的子 RFC；D01 到 D05 各有位置文件，`vllm_omni/` 里每个读总开关的位置都已登记。
 
 ## 删除 legacy 时
 

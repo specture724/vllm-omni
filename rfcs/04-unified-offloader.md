@@ -2,7 +2,7 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 7 节（7.1～7.8），以及 4.1～4.5 里 Offloader 的步骤、8.5 和 8.6 里归规划和 `prepare_materialization()` 的校验、9.3、第 10 节的加速卡部分、第 11 节、第 12 节第 9、11、12、13、14、15 条。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/offload/`；`vllm_omni/diffusion/compile.py`；`vllm_omni/platforms/` 的内存登记接口；`vllm_omni/diffusion/cache/exact_projection_cache.py`；`vllm_omni/diffusion/worker/diffusion_model_runner.py` 的前向梯度模式和执行作用域；共存期必改清单里由本 RFC 承担的 C01、C03、C06、C07、C08、C12、C14、C17 所在的模型文件。
+> 范围：`vllm_omni/diffusion/weight_stack/offload/`；`vllm_omni/diffusion/compile.py`；`vllm_omni/platforms/` 的内存登记接口；`vllm_omni/diffusion/cache/exact_projection_cache.py`；`vllm_omni/diffusion/worker/diffusion_model_runner.py` 的前向梯度模式和执行作用域；共存期必改清单里由本 RFC 承担的 C01、C03、C06、C07、C08、C12、C14、C17、C19 所在的文件。
 >
 > 依赖：[子 RFC 01](./01-startup-transaction.md)（`interfaces.py` 的 `Offloader`、`LoadTransaction`、`OffloadRuntime`、`Topology`、`RankCoordinates`、`AllGatherGroups`、`StartupContext`、`MemoryPools`；`errors.py`；`ResourceKind`、`ResourceLedger`、`FaultPlan`；第 1 点的 `Point1Payload.unmatched_policy_keys`；登记表和测试替身）；[子 RFC 02](./02-unified-loader.md)（`ComponentCatalog` 及其 `declaration_order`、`require_complete()` 和三个写方法、`CatalogEntry`、`TensorDecl`、`OverlaySlotDecl`、`TransientNeed`、`ShardGroupSpec`、`FinalManifest`、查询接口 `component_paths`、`repeated_block_paths`、`fully_resident`、`catalog`、`execution_device`、`is_unified_stack`、`weight_generation`，以及“本 RFC 依赖的约定”里要求 02 提供的 `pipeline_of(catalog)`）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view`、`ranges`、`close`，`MemoryRange`、`Mapping`、`HostRequest` 协议、`flatten_shard_unit`、`LocalRecord.machine` 和 `available_bytes`）；[子 RFC 05](./05-configuration.md)（`OffloadPolicy`、`HostPolicy`、`resolve_selection`、`ComponentRef`、`Selection`、启动日志事件和 `record_device_resources`）。
 
@@ -652,6 +652,7 @@ def host_range_is_pinned(cls, address: int) -> bool: ...         # 默认 False
 | C12 | 见下文 | 经 `fully_resident` 门控，编译模式改走 6.3 的通用编译函数。 | 04-8 |
 | C14 | `models/cosmos3/mixed_precision/strategy.py` 的 `Nvfp4W4A4W4A16Strategy` | `validate_after_processing` 不搬动查找表；`materialize()` 在反量化之前，`kE2M1ToFloat_handle.val` 的设备与 `layer.weight` 的设备不同时，换成按设备缓存在模块级字典里的那一份。 | 04-9 |
 | C17 | `worker/diffusion_model_runner.py` 的 `_execute_request_list` 和 `_execute_stepwise_core` | 不调用 `resolve_offload_strategy`；HSDP 时用 `no_grad`，否则用 `self.weight_stack.runtime.grad_mode()`；现有 `with grad_context:` 包住的整段（请求准备、缓存刷新、`pipeline.forward` 和分步执行的各步）同时包在 `runtime.execution()` 里；`execute_model`、`execute_model_batch`、`execute_stepwise`、两种执行模式下的 `profile_run` 和 `ARDiffusionModelRunner` 的预热都经这两个方法，所以走同一条路径（01 第 8.1 节）。没有运行时（`load_format` 为 `dummy`）时与 `legacy` 相同。 | 04-6 |
+| C19 | `worker/diffusion_worker.py` 的 `WorkerWrapperBase.execute_method`；`models/dreamzero/video_export_worker.py` 的 `DreamZeroVideoExportWorkerExtension` | `unified` 下，`execute_method` 解析到 worker 扩展类定义的方法时，在 `self.worker.model_runner.weight_stack.runtime.execution()` 里调用；`CustomPipelineWorkerExtension.re_init_pipeline` 会关闭并重建运行时，不包。DreamZero 的两个解码方法因此经过 `execution()`，VAE 被 offload 时按使用触发装入。扩展类的代码不改；没有运行时（`load_format` 为 `dummy`）和 `legacy` 下与现有行为相同。 | 04-6 |
 
 C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，由 pipeline 的构造函数在 `unified` 一支注入一个零参数的判断函数，函数持有 pipeline 的弱引用，第一次捕获之前求值，组件名由 `catalog(pipeline).module_owner(<模块路径>)` 给出：
 
@@ -735,6 +736,7 @@ tests/diffusion/weight_stack/offload/
 | `vllm_omni/platforms/interface.py`、`vllm_omni/platforms/cuda/platform.py` | 第 7 节的四个方法和异常类型。 |
 | `vllm_omni/diffusion/cache/exact_projection_cache.py` | 6.4。 |
 | `vllm_omni/diffusion/worker/diffusion_model_runner.py` | C17。 |
+| `vllm_omni/diffusion/worker/diffusion_worker.py` | C19。 |
 | 第 8 节列出的模型文件 | C01、C03、C06、C07、C08、C12、C14。 |
 
 ## 实现拆分
@@ -748,7 +750,7 @@ tests/diffusion/weight_stack/offload/
 | 04-3 | 选择、Unit 划分、`units`、常驻层、共用存储、让出关系、Transport、AllGather 组推算、冷启动路径、占用估算、`host_request()`、`collective_signature()`、`unmatched_policy_keys()`、`bind_groups()`、`describe()`。 | `planner.py`、`layout.py`、`plan.py` | `test_planner.py`、`test_layout_device.py`、`test_collective_signature.py` | 04-2、03-3 | L | 无 |
 | 04-4 | 平台的内存登记接口和 CUDA 实现。 | `platforms/interface.py`、`platforms/cuda/` | `test_registration.py` 里的平台用例 | 无 | S | 无 |
 | 04-5 | 启动事务的完整实现：登记计划、准入的全部项、`slots()` 池里的固定槽位、流和事件、暂存区、块环视图、`commit()` 的内存登记、Unit 记录和占位。 | `transaction.py`、`registration.py`、`staging.py` | `test_transaction.py`、`test_registration.py` | 04-3、04-4 | L | 无 |
-| 04-6 | 运行期：钩子、使用触发与让出、`rank-local` 块环、单次执行、梯度模式、关闭、睡眠；runner 改读 `grad_mode()` 并经过 `execution()`。 | `hooks.py`、`ring.py`、`transport.py`、`runtime.py`、`diffusion_model_runner.py` | `test_hooks.py`、`test_ring_rank_local.py`、`test_use_trigger.py`、`test_runtime_lifecycle.py`、`test_sleep.py` | 04-5 | L | C17 |
+| 04-6 | 运行期：钩子、使用触发与让出、`rank-local` 块环、单次执行、梯度模式、关闭、睡眠；runner 改读 `grad_mode()` 并经过 `execution()`。 | `hooks.py`、`ring.py`、`transport.py`、`runtime.py`、`diffusion_model_runner.py`、`diffusion_worker.py` | `test_hooks.py`、`test_ring_rank_local.py`、`test_use_trigger.py`、`test_runtime_lifecycle.py`、`test_sleep.py`、`test_worker_extension_scope.py` | 04-5 | L | C17、C19 |
 | 04-7 | `allgather`：分片槽位、编号断言、拼接流、不可用标记、跨组件的预取限制。 | `transport.py`、`ring.py` | `test_ring_allgather_multiproc.py` | 04-6 | M | 无 |
 | 04-8 | 编译设置、驻留表、`resolve_compile_mode`、`regionally_compile` 的 `unified` 一支、`compile_module_forward`、`compile_callable`；C12 的七个位置。 | `compile_setup.py`、`compile.py`、第 8 节的 C12 文件 | `test_compile_setup.py`、`test_compile_downgrade.py`，每个位置一个 `unified` 用例 | 04-6、02-10、02-14、02-15、02-16 | M | C12 |
 | 04-9 | 以权重为键的缓存签名和写入代数的绑定；Cosmos3 NVFP4 查找表。 | `exact_projection_cache.py`、`adaln_cache.py`、`cosmos3/mixed_precision/strategy.py`、`transaction.py` | `test_cache_signature_unified.py`，NVFP4 查找表的 `unified` 用例 | 04-5、02-10 | S | C07、C14 |
@@ -829,7 +831,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 - 不是 `fully_resident` 的组件不进 CUDA graph，cudagraph 编译模式降为 `default` 并记日志；钩子在 graph 捕获期间需要动作时报错。
 - 关闭不恢复 CPU 权重，不发起集合通信；每个资源句柄只释放一次。
 - 睡眠再唤醒后输出一致，常驻部分和固定槽位的加速卡地址不变，host 存储不变。
-- C01、C03、C06、C07、C08、C12、C14、C17 都有位置文件和 `unified` 用例，`legacy` 下已有测试全部通过。
+- C01、C03、C06、C07、C08、C12、C14、C17、C19 都有位置文件和 `unified` 用例，`legacy` 下已有测试全部通过。
 
 ## 删除 legacy 时
 
@@ -837,7 +839,7 @@ umbrella RFC Job 6 删除 `legacy` 时，本 RFC 范围内删除：
 
 - `vllm_omni/diffusion/offloader/` 整个包：三个后端、`block_discovery.py`、`component_utils.py`、`module_collector.py`、`module_residency.py`（`PinnedModuleStager`）、`offload_plan.py`（`OffloadPlan`）、`plan_resolver.py`、`startup.py`、`config.py` 的查询函数、`host_registration.py`、`cuda_host_registration.py`、`tensor_utils.py`；runner 里的 `enable_offload_backend` 和 `offload_backend.shutdown()`。
 - `regionally_compile` 的 `legacy` 一支（按 `_repeated_blocks` 类名和 `_layerwise_offload_blocks_attrs` 匹配）。删除之前，只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类补进 `_repeated_blocks`（总体设计 9.3 列出的九个类），一个测试对比删除前后被编译的模块集合。
-- `ExactProjectionCache._signature` 的地址签名；C07、C08、C12、C14、C17 和 C01、C03、C06 的 `legacy` 一支，按各行的 `legacy_removal`；`QwenImage21DecodeGraphManager._offload_reason` 对 `SequentialOffloadHook` 的读取。
+- `ExactProjectionCache._signature` 的地址签名；C07、C08、C12、C14、C17、C19 和 C01、C03、C06 的 `legacy` 一支，按各行的 `legacy_removal`；`QwenImage21DecodeGraphManager._offload_reason` 对 `SequentialOffloadHook` 的读取。
 - 模型里的 offload 专用声明：`_layerwise_offload_blocks_attrs`、模型声明的 `OffloadPlan`、常驻路径声明、`SupportsModelCpuOffload`；MAGI-2 的分阶段组件和内存窗口、MiniMax H3 的 AdaLN Host 暂存和 SM120 默认、放大器和 VAE 两半的搬运。
 - 01 的 `HOOK_NAME_ALLOWLIST` 清空后，T4 只读 `HOOK_NAMES`。
 

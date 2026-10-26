@@ -980,6 +980,7 @@ offload 策略 = Unit + Trigger + Transport
 | LoRA 管理器提交后才包装 PEFT 层；worker 提交后融合蒸馏 LoRA | 提交后改结构、改基础权重 | `unified` 下包装挪到只建结构（2f），融合挪到 checkpoint 读取器（2c）；`legacy` 下不变 |
 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad` | `unified` 下没有分布式逐层后端 | `unified` 下这一项改读 `OffloadRuntime` 给出的梯度模式，runner 不读 offload 策略；HSDP 下照旧用 `no_grad`；`legacy` 下不变 |
 | diffusers 适配器的 `DiffusersAdapterPipeline` 在构造函数里调用 `_raise_unsupported_features`，`diffusion_offload_config` 不是 `None` 时报 `NotImplementedError` | 旧的 `--diffusion-offload-config` 在 `unified` 下由兼容层翻译成策略，这项拒绝让 diffusers 格式在 `unified` 下无法用 offload 启动 | 只在 `legacy` 下执行；`unified` 下 offload 由策略和 Offloader 承担（2f） |
+| DreamZero 的 `DreamZeroVideoExportWorkerExtension` 经 collective RPC 调用 VAE 解码（`decode_video_latents_to_uint8`、`decode_accumulated_video_latents_to_uint8`） | 调用不在 `OffloadRuntime.execution()` 里，VAE 被 offload 时钩子报错 | `unified` 下 worker 执行 worker 扩展类定义的方法时包在 `execution()` 里，改变运行时生命周期的 `re_init_pipeline` 除外；`legacy` 下不变 |
 
 ### Job 2：Loader
 
