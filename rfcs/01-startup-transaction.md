@@ -915,7 +915,7 @@ class ExecutionOffloadFacts:
 | C17 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad`；`unified` 下改读 `OffloadRuntime.grad_mode()`。 | 由 [04](./04-unified-offloader.md) 承担。 |
 | C18 | diffusers 适配器的 `_raise_unsupported_features` 在 `__init__` 里拒绝 `diffusion_offload_config`；`unified` 下这项拒绝不执行，旧配置由 05 翻译。 | 由 [02](./02-unified-loader.md) 承担。 |
 
-C01 到 C17 是 umbrella RFC Job 1 表里的各行，按原顺序编号。C18 是本 RFC 新增的一行：`DiffusersAdapterPipeline` 的构造函数调用 `_raise_unsupported_features`，后者在 `od_config.diffusion_offload_config` 不是 `None` 时抛出 `NotImplementedError`；这项拒绝只为现有后端存在（总体设计 7.7），而 `unified` 下旧的 `--diffusion-offload-config` 由兼容层翻译（总体设计 8.4）。
+C01 到 C18 是 umbrella RFC Job 1 共存期必改清单的各行，按原顺序一一编号。C18 是表里的最后一行：`DiffusersAdapterPipeline` 的构造函数调用 `_raise_unsupported_features`，后者在 `od_config.diffusion_offload_config` 不是 `None` 时抛出 `NotImplementedError`；这项拒绝只为现有后端存在（总体设计 7.7），而 `unified` 下旧的 `--diffusion-offload-config` 由兼容层翻译（总体设计 8.4）。
 
 本 RFC 自己的分发点也读总开关，同样登记，随 `legacy` 删除。01-2、01-3、01-6 合入时登记表还不存在，这五行的位置文件由 01-7 建立登记表时一并新增：
 
