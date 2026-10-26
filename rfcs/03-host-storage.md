@@ -827,7 +827,7 @@ tests/diffusion/weight_stack/host/
 
 **布局**（`test_layout.py`）：头部可以被 safetensors 的格式规则解析，`8 + H` 是 8 的倍数，偏移按名字排序且连续；同一重复块的张量相邻；非连续步长写进元数据；规划指纹只随布局变化，改变 `LocalRecord` 的 pid 和可用内存时不变；三种 `plan_fingerprint` 形式；`flatten_shard_unit` 的补零、对齐和本 rank 范围；`bind_groups` 在组大小或位置不同时报错。
 
-**共享计划与协议**（`test_share_plan.py`、`test_protocol.py`）：相同共享指纹的 rank 分到一组、代表是最小 rank；本机键不同或 `plan_fingerprint` 带 `/private` 的 rank 不进组；`deployment_scoped` 为假且组只有一个 rank 时使用私有内存；消息编码和长度上限；描述符超过 64 个时分批，接收端按 `seq` 收齐。
+**共享计划与协议**（`test_share_plan.py`、`test_protocol.py`）：相同共享指纹的 rank 分到一组、代表是最小 rank；同一个部署两个 stage 的 worker 内容身份和规划指纹都相同时分到同一个共享集合；本机键不同或 `plan_fingerprint` 带 `/private` 的 rank 不进组；`deployment_scoped` 为假且组只有一个 rank 时使用私有内存；消息编码和长度上限；描述符超过 64 个时分批，接收端按 `seq` 收齐。
 
 **选举与交接，多进程**（`test_election_multiproc.py`、`test_local_storage.py`）：
 
@@ -864,7 +864,7 @@ tests/diffusion/weight_stack/host/
 - 每个 03 注入点的 `raise` 和 `hang`：失败在预期的阶段报出，不留下映射和描述符。
 - 单进程执行器方式下，`close()` 和 `gc.collect()` 之后本进程没有 HWM 的映射、描述符和线程。
 
-**端到端**（`test_host_e2e.py`，03-9）。L2，标记 `core_model`、`diffusion`，`@hardware_test(res={"cuda": "L4"}, num_cards=2)`：一个小 DiT 在两个单卡副本上以 `layerwise` 启动，两个副本共用一份共享内存，输出与只启动一个副本时相同；`distributed-layerwise` 在两卡上每个 rank 只持有 `W / 2`。
+**端到端**（`test_host_e2e.py`，03-9）。L2，标记 `core_model`、`diffusion`、`parallel`，`@hardware_test(res={"cuda": "L4"}, num_cards=2)`：一个小 DiT 在两个单卡副本上以 `layerwise` 启动，两个副本共用一份共享内存，输出与只启动一个副本时相同；`distributed-layerwise` 在两卡上每个 rank 只持有 `W / 2`。对两个单卡副本之一执行 `kill -9`：另一个副本的映射和输出不受影响；对两卡 `distributed-layerwise` 副本的一个 worker 执行 `kill -9`：这个副本的另一个 worker 随之退出。
 
 ## 验收标准
 
@@ -875,7 +875,7 @@ tests/diffusion/weight_stack/host/
 - 权重大于 `/dev/shm` 时正常加载，`/dev/shm` 的用量不变；定稿之后任何进程对内存文件的写入和可写映射都被拒绝。
 - 等待者绑定后，已绑定的字节和存储地址在 `eval()` 前后不变。
 - 分片后端稳定后每个 rank 占 `W / N`（含补零和页的取整）；瘦路径冷启动的额外占用在任何写入速度下都严格小于“释放阈值 + 最大的两个张量”。
-- 对任意一个 worker 执行 `kill -9` 后，其他副本的映射和服务不受影响；对一个部署的全部 worker 执行 `kill -9` 或 OOM 终止后，机器的共享内存用量回到这个部署启动前。
+- 对任意一个 worker 执行 `kill -9` 后，它所在副本的全部 worker 退出，其他副本的映射和服务不受影响；对一个部署的全部 worker 执行 `kill -9` 或 OOM 终止后，机器的共享内存用量回到这个部署启动前。
 - 写入进程在封存前被杀，等待者所在副本启动失败，没有残留。
 - 写入进程所在的副本退出后，已绑定的副本照常服务；之后加入的副本重新选举、重新构建，并能正常服务。
 - 几个副本互为对方某个共享集合的等待者时，启动不死锁。

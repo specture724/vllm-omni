@@ -528,7 +528,7 @@ s = os.environ.get("OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE")
 - 环境变量优先于配置里的字段，与 `resolve_prompt_embed_cache_config` 的优先级相同。`legacy` 不经过这一步，worker 照旧调用 `resolve_prompt_embed_cache_config`，非法取值照旧被忽略。
 - 折叠在构建配置的进程里做：编排进程或 headless 启动器。之后两个值作为普通字段随 `od_config` 下发并冻结；`unified` 一支的 `_load_model_unified` 只读字段（01 第 8.1 节），worker 不读这两个环境变量。
 - 同一个进程里由投影重建配置时折叠再做一次，结果相同。
-- 这一步取代 01 第 1.3 节里“设置了这两个环境变量就报错”的临时检查。
+- 这一步取代 01 第 1.3 节里“设置了这两个环境变量就报错”的检查。
 
 ### 11. 选择的解析
 
@@ -620,7 +620,7 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
   ctx = StartupContext(..., policy=startup_policy(self.od_config, log=(rank == 0)), ...)
 ```
 
-- `parse_unified_config` 放在 `legacy` 调用 `materialize_legacy_offload_flags` 的位置，因为 P25 到 P27 要读 DP 归一化之后的 `data_parallel_size`，与 `resolve_offload` 的时机相同。这一步取代 01 第 1.3 节的临时拒绝。
+- `parse_unified_config` 放在 `legacy` 调用 `materialize_legacy_offload_flags` 的位置，因为 P25 到 P27 要读 DP 归一化之后的 `data_parallel_size`，与 `resolve_offload` 的时机相同。这一步取代 01 第 1.3 节的拒绝。
 - `startup_policy(config, *, log)` 用缓存或重新解析得到策略（不读环境变量），调用 `resolve_for_model(config.model_class_name)`；`log` 为真时记 `policy`、`legacy_vae_hint`、`legacy_resident_ignored` 三类启动日志（第 15.2 节）。`model_class_name` 在 `enrich_config` 之后已经确定，`DiffusionModelRegistry` 按它构造 pipeline。
 - D20、D21、D22 是本 RFC 的分发点，在登记表里用 `NEW_ROW` 声明（01 第 9.4 节）；`__post_init__` 里的改动在 01 的 D01 已登记的位置之内。
 
@@ -656,6 +656,8 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
 | `policy` | 05 | `kind`、`preset`、`legacy_fields`、`canonical`、`pin_cpu_memory`、`registration_limit_bytes`。 |
 | `legacy_vae_hint` | 05，`WARNING` | `model`、`recipe`、`suggested`（选中 `vae` 的规范 JSON）。 |
 | `legacy_resident_ignored` | 05，`WARNING` | `model`、`resident_layers`。 |
+| `meta_materialized` | 02 | `component`、`bytes`（目标为 meta 却被读取器物化的字节数，为 0 时也输出）（02 第 7.3 节）。 |
+| `write_transient_peak` | 02 | 含量化层的组件每个一条，字段 `component`、`peak_bytes`（写入期间临时张量的峰值）、`quant_layer_bytes`。 |
 | `component_plan` | 04 | `component`、`role`、`key`、`mode`、`transfer`、`units`（Unit 数）、`unit_kinds`、`trigger`、`backend`（`local`、`shard`、`none`）、`cold_path`（`thin`、`full_then_trim`、`none`）。 |
 | `component_skipped` | 04 | `component`、`reason`（例如 `no_repeated_blocks`）。 |
 | `unit_resident` | 04 | `component`、`unit`、`reason`（`no_yielding_component` 或 `resident_layers_cover_all_blocks`）。 |
@@ -665,7 +667,7 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
 | `fully_resident` | 04 | `commit()` 时每个组件一条，字段 `component`、`value`；编译模式被降成 `default` 时再输出一条，另带 `compile_mode`（降级后的模式）和 `downgraded_from`（原模式）（04 第 6.3 节）。 |
 | `startup_summary` | 05，`IN_SERVICE` 之前 | `host_private_bytes`、`host_shared_bytes`、`host_shard_bytes`、`registered_bytes`、`staging_bytes`、`device_slot_bytes`、`startup_s`。 |
 
-- 03 第 14 节和 04 第 9 节的启动日志按这张表的事件名和字段输出。03、04 的 PR 先于 05-6 合入，期间用各自的 logger（`vllm_omni.diffusion.weight_stack.host`、`.offload`）按同样的事件名和字段输出；05-6 把这些调用点改成 `log_event`，事件名和字段不变。
+- 02 第 7.3 节、03 第 14 节和 04 第 9 节的启动日志按这张表的事件名和字段输出。02、03、04 的 PR 先于 05-6 合入，期间用各自的 logger（`vllm_omni.diffusion.weight_stack.loader`、`.host`、`.offload`）按同样的事件名和字段输出；05-6 把这些调用点改成 `log_event`，事件名和字段不变。
 - `startup_summary` 由 runner 在 `run_unified_startup` 返回之后、`mark_in_service()` 之前调用 `observability.log_startup_summary(handle)` 输出。
 
 ### 16. 指标
@@ -754,7 +756,7 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | `docs/user_guide/diffusion_features.md` | 链接支持矩阵，写明非 CUDA 平台的 Unit 走暂存区（总体设计第 13 节）。 |
 | `docs/design/metrics.md` | 第 16 节的指标。 |
 | `docs/design/feature/offloader/README.md`、`docs/design/module/diffusion/offloader.md` | 指向总体设计和本 RFC，写明现有三个后端只用于 `legacy`。 |
-| 新增 `docs/user_guide/diffusion/weight_stack_migration.md` | 迁移说明：第 6 节的翻译和迁移报错、总体设计第 9 节第 3 步列出的门槛例外、写入进程退出后新副本重建一份的影响（总体设计第 13 节）。 |
+| 新增 `docs/user_guide/diffusion/weight_stack_migration.md` | 迁移说明：第 6 节的翻译和迁移报错、总体设计第 9 节第 3 步列出的门槛例外、写入进程退出后新副本重建一份的影响（总体设计第 13 节）、默认值翻转之后的一个版本里主干外没有迁移的 pipeline（`register_diffusion_model` 注册的、`load_format="custom_pipeline"` 的）必须显式传 `--diffusion-weight-stack legacy`（总体设计第 9 节第 5 步）。 |
 | 新增 `docs/user_guide/diffusion/weight_stack_support_matrix.md` | 支持矩阵，见第 17.3 节。 |
 
 #### 17.3 支持矩阵
@@ -773,10 +775,10 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | `resolve_selection(policy, refs, *, pipeline) -> Selection` | 04 | 第 11 节。04 的 `plan()` 按 `declaration_order` 用目录的组件名、角色和 `hsdp_managed` 调用，报 L02 到 L05；`Selection.unmatched` 只按本 rank 判断，经 `PlacementPlan.unmatched_policy_keys()` 交给 01 做 L01 的跨 rank 判断。 |
 | L01 的判断规则和报错文本 | 01 | 第 11 节和第 8.2 节。01 在全组确认第 1 点第一轮收集 `Point1Payload.unmatched_policy_keys`，取交集，不为空时每个 rank 报 `PlanningError`。 |
 | `OffloadPolicy.execution_facts()`、`cached_policy(config)` | 01 的 `execution_offload_facts` | 第 12 节；只读策略，不读环境变量。 |
-| `parse_unified_config`、`check_late`、`check_migration`、`reject_unified_only_fields` | `OmniDiffusionConfig`、`_DiffusionConfigProjection` | 第 13 节，取代 01 第 1.3 节的临时拒绝。 |
+| `parse_unified_config`、`check_late`、`check_migration`、`reject_unified_only_fields` | `OmniDiffusionConfig`、`_DiffusionConfigProjection` | 第 13 节，取代 01 第 1.3 节的拒绝。 |
 | `startup_policy(config, *, log)` | 01 的 `_load_model_unified` | 第 13 节。 |
 | `HostPolicy` | 04 | `pin_cpu_memory` 为假时不查询平台能力、不登记，暂存区不锁页；`registration_limit_bytes` 为 0 表示不设上限。 |
-| `observability` 的 `bind_context`、`format_event`、`log_event`、`log_startup_summary`、`record_host_mapping`、`forget_host_mapping`、`record_device_resources`、`WeightStackMemoryReport` | 01 的 runner、03、04 | 第 15、16 节。runner 调用 `bind_context` 和 `log_startup_summary`（01 第 8.1 节）；03 调用 `log_event`、`record_host_mapping`、`forget_host_mapping`；04 调用 `log_event`、`record_device_resources`。这些调用由 05-6 加入。 |
+| `observability` 的 `bind_context`、`format_event`、`log_event`、`log_startup_summary`、`record_host_mapping`、`forget_host_mapping`、`record_device_resources`、`WeightStackMemoryReport` | 01 的 runner、02、03、04 | 第 15、16 节。runner 调用 `bind_context` 和 `log_startup_summary`（01 第 8.1 节）；02 调用 `log_event`；03 调用 `log_event`、`record_host_mapping`、`forget_host_mapping`；04 调用 `log_event`、`record_device_resources`。这些调用由 05-6 加入。 |
 | 新字段列表 `diffusion_offload`、`diffusion_offload_policy`、`host_registration_limit_gib`、`max_lora_rank` | 01 的 T5 | 05-2 把它们加进 `test_static_dependencies.py` 的 T5 字段表。 |
 | `max_lora_rank` 的解析和合法值、HSDP 预分片配 LoRA 或量化的拒绝、支持矩阵文档 | 02 | 第 9 节、P28、第 17.3 节。 |
 
@@ -785,7 +787,7 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | 子 RFC | 约定 |
 |---|---|
 | [01](./01-startup-transaction.md) | `is_unified(config)`；`ConfigError`、`PlanningError` 和报错格式；`execution_offload_facts` 的 `unified` 一支调用 `cached_policy(config).execution_facts()`，策略为 `None` 时三个字段为假；`_load_model_unified` 把 `startup_policy()` 的结果填进 `StartupContext.policy`；登记表接受 D20、D21、D22 的 `NEW_ROW`；T1 不禁止 `loader/`、`host/`、`offload/`、`policy.py` import `observability.py`，`observability.py` 只 import 标准库和 `errors.py`。全组确认第 1 点第一轮收集 `Point1Payload.unmatched_policy_keys`，对各 rank 的集合取交集，不为空时每个 rank 以同样的内容报 `PlanningError`，文本按第 8.2 节的 L01（01 第 7.2 节）。 |
-| [02](./02-unified-loader.md) | 组件目录给出每个组件的名字、角色、`hsdp_managed` 和 `declaration_order`；编码器的角色符合总体设计 8.4 的对应；`DynamicLoraSpec` 读 `od_config.max_lora_rank`；`test_structure_matrix.py` 按第 17.3 节的格式输出 `structure_matrix.json`；动态 LoRA 未启用时 `DiffusionWorker.add_lora` 的报错提示 `--diffusion-max-lora-rank`。 |
+| [02](./02-unified-loader.md) | 组件目录给出每个组件的名字、角色、`hsdp_managed` 和 `declaration_order`；编码器的角色符合总体设计 8.4 的对应；`DynamicLoraSpec` 读 `od_config.max_lora_rank`；`test_structure_matrix.py` 按第 17.3 节的格式输出 `structure_matrix.json`；动态 LoRA 未启用时 `DiffusionWorker.add_lora` 的报错提示 `--diffusion-max-lora-rank`；`meta_materialized`、`write_transient_peak` 事件按第 15.2 节的事件名和字段输出，05-6 把调用点改成 `log_event`。 |
 | [03](./03-host-storage.md) | `Mapping.kind` 取 `shared`、`private`、`shard`；05-6 在 `allocate()`、`seal()` 返回之前加入 `record_host_mapping` 调用，在 `close()` 里加入 `forget_host_mapping` 调用；`host_share`、`host_admission` 事件按第 15.2 节的事件名和字段输出，`socket` 里的 `\0` 写成 `@`。HWM 不读 host 策略。 |
 | [04](./04-unified-offloader.md) | `plan()` 只经 `resolve_selection()` 解释策略，`refs` 按 `declaration_order` 构造，按 `if_no_blocks` 处理找不到重复块的组件，按 `Selection.resident_layers` 计数常驻层；`PlacementPlan.unmatched_policy_keys()` 原样返回 `Selection.unmatched`，`policy` 为 `None` 时为空集合；`policy` 为 `None` 时不做 offload；从 `policy.host` 读 `pin_cpu_memory` 和登记上限；05-6 在 `commit()` 的第 8 步和 `close()` 的最后一步之后加入 `record_device_resources` 调用（04 第 9 节）；第 15.2 节里 04 的事件；HSDP 组件的报错用 L03 的文本；`DeviceCapacityError` 的 `fix` 指向 recipe；承担 C08（`offload_vae_during_denoise` 忽略并记警告）。 |
 
@@ -801,6 +803,7 @@ docs/user_guide/diffusion/weight_stack_migration.md
 docs/user_guide/diffusion/weight_stack_support_matrix.md
 tests/diffusion/weight_stack/policy/                  第“测试计划”节的测试
 tests/diffusion/weight_stack/observability/
+tests/diffusion/weight_stack/gate/                    门槛矩阵（05-9）
 tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_05_6.py
 ```
 
@@ -814,7 +817,7 @@ tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_0
 | `vllm_omni/diffusion/worker/diffusion_worker.py` | `weight_stack_memory_report()`。 |
 | `vllm_omni/diffusion/stage_diffusion_proc.py`、`vllm_omni/diffusion/inline_stage_diffusion_client.py` | D21 的报告采集。 |
 | `vllm_omni/engine/orchestrator.py`、`vllm_omni/metrics/definitions.py`、`vllm_omni/metrics/prometheus.py` | 第 16 节。 |
-| `vllm_omni/diffusion/weight_stack/host/`、`offload/` 的日志和字节登记调用点 | 05-6 把日志改用 `log_event`，事件名和字段不变；加入 `record_host_mapping`、`forget_host_mapping`、`record_device_resources` 的调用（第 16.2 节）。 |
+| `vllm_omni/diffusion/weight_stack/loader/`、`host/`、`offload/` 的日志和字节登记调用点 | 05-6 把日志改用 `log_event`，事件名和字段不变；加入 `record_host_mapping`、`forget_host_mapping`、`record_device_resources` 的调用（第 16.2 节）。 |
 | `tests/diffusion/weight_stack/test_static_dependencies.py` | T5 字段表加入四个新字段（01 允许的改动）。 |
 | `recipes/`、`docs/` | 第 17 节。 |
 
@@ -825,13 +828,14 @@ tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_0
 | PR | 内容 | 主要文件 | 测试 | 依赖 | 大小 | 必改行 |
 |---|---|---|---|---|---|---|
 | 05-1 | 数据类型、JSON schema、`parse_policy_document`、预设、规范 JSON、`resolve_selection`、旧配置的解析和旧开关的翻译（纯函数）、P02 到 P18、L01 到 L05 的文本。 | `policy.py` | `test_policy_parse.py`、`test_resolve_selection.py`、`test_legacy_schema_equivalence.py` | 01-1 到 01-7 | M | 无 |
-| 05-2 | 新字段和五个参数的传递链、来源优先级和整体替换、P01、T5 字段表；`unified` 下新字段的临时拒绝（见下文）。 | `serve.py`、`arg_utils.py`、`stage_config.py`、`omni_config.py`、`data.py` | `test_policy_sources.py`、`test_policy_legacy_stack.py` | 05-1 | M | 无 |
-| 05-3 | `parse_unified_config`、`check_late`、`check_migration`、环境变量折叠、P19 到 P33（P30 除外）、全量编译检查、`startup_policy`、`resolve_for_model`、`cached_policy` 和执行事实；取代 01 第 1.3 节和 05-2 的临时拒绝（`max_lora_rank` 除外）；D20、D22。 | `policy.py`、`data.py`、`omni_config.py`、`diffusion_model_runner.py` | `test_policy_checks.py`、`test_env_folding.py`、`test_execution_facts_unified.py`、`test_unmatched_keys_multiproc.py` | 05-2、03-5、03-6、03-7、04-3、04-5、04-6、04-7 | L | D20、D22 |
-| 05-4 | `--diffusion-max-lora-rank` 的检查（P30），取消 `max_lora_rank` 的临时拒绝；P28 的 `max_lora_rank` 部分。 | `policy.py` | `test_lora_rank_flag.py` | 05-3、02-8 | S | 无 |
+| 05-2 | 新字段和五个参数的传递链、来源优先级和整体替换、P01、T5 字段表；`unified` 下新字段在 05-3 合入之前的拒绝（见下文）。 | `serve.py`、`arg_utils.py`、`stage_config.py`、`omni_config.py`、`data.py` | `test_policy_sources.py`、`test_policy_legacy_stack.py` | 05-1 | M | 无 |
+| 05-3 | `parse_unified_config`、`check_late`、`check_migration`、环境变量折叠、P19 到 P33（P30 除外）、全量编译检查、`startup_policy`、`resolve_for_model`、`cached_policy` 和执行事实；取代 01 第 1.3 节和 05-2 的拒绝（`max_lora_rank` 除外）；D20、D22。 | `policy.py`、`data.py`、`omni_config.py`、`diffusion_model_runner.py` | `test_policy_checks.py`、`test_env_folding.py`、`test_execution_facts_unified.py`、`test_unmatched_keys_multiproc.py` | 05-2、03-5、03-6、03-7、04-3、04-5、04-6、04-7 | L | D20、D22 |
+| 05-4 | `--diffusion-max-lora-rank` 的检查（P30），取消 05-2 对 `max_lora_rank` 的拒绝；P28 的 `max_lora_rank` 部分。 | `policy.py` | `test_lora_rank_flag.py` | 05-3、02-8 | S | 无 |
 | 05-5 | 翻译测试和豁免、`LEGACY_RESIDENT_DIT_MODELS` 的派生测试。 | 只有测试 | `test_legacy_translation.py`、`test_resident_gate_table.py` | 05-3、02-2、04-2 | M | 无 |
-| 05-6 | `observability.py`、启动日志事件、03 和 04 日志调用点的改写和字节登记调用、`weight_stack_memory_report`、D21、指标族和编排器的处理、`docs/design/metrics.md`。 | `observability.py`、`host/`、`offload/`、`diffusion_worker.py`、`stage_diffusion_proc.py`、`inline_stage_diffusion_client.py`、`orchestrator.py`、`metrics/` | `test_events.py`、`test_memory_report.py`、`test_metrics_absorb.py`、`test_memory_report_multiproc.py`、`test_metrics_e2e.py` | 05-3、03-8、04-5 | L | D21 |
+| 05-6 | `observability.py`、启动日志事件、02、03 和 04 日志调用点的改写、03 和 04 的字节登记调用、`weight_stack_memory_report`、D21、指标族和编排器的处理、`docs/design/metrics.md`。 | `observability.py`、`loader/`、`host/`、`offload/`、`diffusion_worker.py`、`stage_diffusion_proc.py`、`inline_stage_diffusion_client.py`、`orchestrator.py`、`metrics/` | `test_events.py`、`test_memory_report.py`、`test_metrics_absorb.py`、`test_memory_report_multiproc.py`、`test_metrics_e2e.py` | 05-3、02-5、03-8、04-5 | L | D21 |
 | 05-7 | 第 17.1 节的 recipe、第 17.2 节的文档和迁移说明。 | `recipes/`、`docs/` | `test_recipe_policies.py` | 05-4、05-5、05-6、02-11、02-12、02-14、02-18 | M | 无 |
 | 05-8 | 支持矩阵的渲染工具、文档和一致性测试。 | `tools/weight_stack/`、`docs/` | `test_support_matrix_doc.py` | 02-2、05-7 | S | 无 |
+| 05-9 | 门槛矩阵：组合清单、对比基准、Host 和加速卡内存峰值的采集、原始数据的保存。 | `tests/diffusion/weight_stack/gate/` | `test_gate_matrix.py` | 05-7、03-9、04-13 | M | 无 |
 
 ```text
 01-1..01-7
@@ -843,6 +847,7 @@ tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_0
         05-6（另依赖 03-8、04-5）
           05-7（依赖 05-4、05-5、05-6，另依赖 02-11、02-12、02-14、02-18）
             05-8（另依赖 02-2）
+            05-9（另依赖 03-9、04-13）
 ```
 
 - 05-1、05-2 不改变已有配置的行为，只做解析和传递。05-2 合入后、05-3 合入前，`unified` 下给出 `diffusion_offload`、`diffusion_offload_policy`、`max_lora_rank`，或 `host_registration_limit_gib` 大于 0，在参数解析阶段按 01 第 1.3 节的格式报 `ConfigError`，提示改用 `--diffusion-weight-stack legacy`，新字段不被静默忽略；`max_lora_rank` 的这项拒绝留到 05-4。新参数在 `legacy` 下按 P01 报错。05-3 合入时 `unified` 开始接受 offload 配置，05-4 合入时开始接受 `--diffusion-max-lora-rank`。
@@ -861,7 +866,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 | `test_policy_checks.py` | P19 到 P33；`__post_init__` 和 `enrich_config` 末尾的 P28；P29 的文本与现有格式一致。 | L1 |
 | `test_env_folding.py` | 用 `monkeypatch` 设置两个环境变量；折叠后 worker 一侧（runner 的 `unified` 一支）不读环境变量：在 worker 里改变环境变量，结果不变。 | L1 |
 | `test_resolve_selection.py` | 角色键、组件名键整体覆盖、`null`、三种来源的 `if_absent` 和 `if_no_blocks`、L02 到 L05、`unmatched` 的内容、按角色的常驻层数。 | L1 |
-| `test_unmatched_keys_multiproc.py` | 经 01 的驱动和测试替身，在两个 rank 上按 rank 声明不同的组件：一个键只在一个 rank 上有匹配时不报错；两个 rank 都没有匹配时两个 rank 同时报 L01 的 `PlanningError`，文本相同；world size 为 1 时同样报错。 | L1，`cpu` |
+| `test_unmatched_keys_multiproc.py` | 经 01 的驱动和测试替身，在两个 rank 上按 rank 声明不同的组件：一个键只在一个 rank 上有匹配时不报错；两个 rank 都没有匹配时两个 rank 同时报 L01 的 `PlanningError`，文本相同；world size 为 1 时同样报错。 | L1，`cpu`、`parallel` |
 | `test_execution_facts_unified.py` | 第 12 节三个字段的每种组合；策略为 `None` 时三个字段为假。 | L1 |
 | `test_legacy_schema_equivalence.py`、`test_legacy_translation.py`、`test_resident_gate_table.py` | 第 6.3、6.6 节。 | L1 |
 | `test_lora_rank_flag.py` | 合法值与 `DiffusionLoRAManager._VALID_MAX_RANKS` 相同；P30；`legacy` 下 P01。 | L1 |
@@ -872,6 +877,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 | `test_recipe_policies.py` | 解析第 17.1 节每条 recipe 命令的策略，在只建结构的上下文里调用 `resolve_selection()`，`unmatched` 为空。 | L1 |
 | `test_support_matrix_doc.py` | 第 17.3 节。 | L1 |
 | recipe 的端到端 | 第 17.1 节改动的 recipe 在已有每晚例行测试的硬件上以 `unified` 写法运行，输出与 `legacy` 一致，显存峰值不高于 `legacy`。 | L4 |
+| `test_gate_matrix.py` | umbrella“上线方式”第 3 步的门槛矩阵：有端到端测试或每晚例行测试的每个“模型 × offload 策略”组合在 `legacy` 和 `unified` 下各运行一次，`unified` 的输出与 `legacy` 一致，Host 和加速卡的内存峰值不高于 `legacy`。结构或类型随 offload 变化的组合（Flux2-Klein TP 大于 1 配 offload、DreamZero 的 VAE 类型）以 `legacy` 不做 offload 的输出为基准；按空闲显存选择分块大小的 VAE 固定分块；融合适配器的组合逐张量对比融合结果，蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1 的组合以“完整加载、融合、再量化”的参考结果为基准；迁移说明列出的门槛例外只记录结果，不做断言。每个组合的输出对比和两项峰值的原始数据保存为测试产物。 | L4，`full_model`、`diffusion`、`hardware_test(res=...)`，每晚运行 |
 
 ## 验收标准
 
@@ -884,11 +890,12 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 - 启动日志对每个组件写明 Unit 划分、后端、是否共享及原因、冷启动路径；共享时写明角色、写入进程的 pid 和套接字名；每个 Unit 写明登记还是走暂存区；每个组件写明 `fully_resident` 和编译模式的降级。
 - 第 16.1 节的指标在 `--log-stats` 打开时导出；同一部署在一台机器上的 worker 数从 1 增加到 k 时，`diffusion_machine_pss_bytes` 里共享部分不随 k 增长。
 - 第 17.1 节的 recipe 和第 17.2 节的文档已更新；支持矩阵文档与当前结果一致。
+- 门槛矩阵的每个组合都保存了输出对比和 Host、加速卡内存峰值的原始数据；门槛例外以外的组合输出与 `legacy` 一致，峰值不高于 `legacy`。
 
 ## 删除 legacy 时
 
 - `policy.py` 里的兼容层：`parse_legacy_offload_config`、旧开关的翻译、`LEGACY_RESIDENT_DIT_MODELS`、`LEGACY_VAE_LIFECYCLE_MODELS`、`pending_resident_layers` 和 `resolve_for_model`、规则 P01、P19 到 P23、P32、P33，以及翻译测试和等价测试。
-- 旧字段和它们的命令行参数：`enable_cpu_offload`、`enable_layerwise_offload`、`enable_distributed_layerwise_offload`、`dlo_use_allgather`（`--dlo-use-allgather`、`--dlo-no-use-allgather`）、`dlo_resident_layers`、`dlo_host_registration_limit_gib`、`diffusion_offload_config`、`host_weight_runtime_mode`、`host_weight_runtime_root`，涉及第 1 节的五个文件；`validate_host_weight_runtime_options`、`validate_dlo_host_registration_options`、`_DiffusionConfigProjection.from_kwargs` 里对 `parse_diffusion_offload_config` 的调用、`__post_init__` 里对 `materialize_legacy_offload_flags` 的调用。删除之后传入这些参数，由 argparse 和 `validate_omni_diffusion_kwargs` 报未知参数。
+- 旧字段和它们的命令行参数：`enable_cpu_offload`、`enable_layerwise_offload`、`enable_distributed_layerwise_offload`、`dlo_use_allgather`（`--dlo-use-allgather`、`--dlo-no-use-allgather`）、`dlo_resident_layers`、`dlo_host_registration_limit_gib`、`diffusion_offload_config`、`host_weight_runtime_mode`、`host_weight_runtime_root`，涉及第 1 节的五个文件；`validate_host_weight_runtime_options`、`validate_dlo_host_registration_options`、`_DiffusionConfigProjection.from_kwargs` 里对 `parse_diffusion_offload_config` 的调用；`__post_init__` 里对 `materialize_legacy_offload_flags` 的调用随 01 的 D01 删除。删除之后传入这些参数，由 argparse 和 `validate_omni_diffusion_kwargs` 报未知参数。
 - D20、D21、D22 只保留 `unified` 一支，删除对应的登记行。
 - 文档里旧开关的页面并入迁移说明。`pin_cpu_memory` 和本 RFC 新增的参数保留。
 

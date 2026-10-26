@@ -911,7 +911,7 @@ class ExecutionOffloadFacts:
 | C13 | Wan VAE 快路径的 `tensor.data=` 恢复。 | 由 [02](./02-unified-loader.md) 承担。 |
 | C14 | Cosmos3 混合精度的 NVFP4 查找表。 | 由 [04](./04-unified-offloader.md) 承担。 |
 | C15 | LTX2 vocoder 在 mps、xpu、cpu 上的 `.float()` 往返。 | 由 [02](./02-unified-loader.md) 承担。 |
-| C16 | LoRA 管理器提交后才包装 PEFT 层，以及 worker 提交后融合蒸馏 LoRA。 | 由 [02](./02-unified-loader.md) 承担。 |
+| C16 | LoRA 管理器提交后才包装 PEFT 层，以及 worker 提交后融合蒸馏 LoRA。 | 由 [02](./02-unified-loader.md) 承担：融合由 02-7 承担，包装由 02-8 承担，两个 PR 各有位置文件。 |
 | C17 | runner 在分布式逐层 offload 下把 `inference_mode` 换成 `no_grad`；`unified` 下改读 `OffloadRuntime.grad_mode()`。 | 由 [04](./04-unified-offloader.md) 承担。 |
 | C18 | diffusers 适配器的 `_raise_unsupported_features` 在 `__init__` 里拒绝 `diffusion_offload_config`；`unified` 下这项拒绝不执行，旧配置由 05 翻译。 | 由 [02](./02-unified-loader.md) 承担。 |
 | C19 | DreamZero 的 `DreamZeroVideoExportWorkerExtension` 经 collective RPC 在 `execution()` 之外调用 VAE 解码；`unified` 下 worker 执行扩展类定义的方法时包在 `execution()` 里，`re_init_pipeline` 除外。 | 由 [04](./04-unified-offloader.md) 承担。 |
@@ -1083,6 +1083,7 @@ vllm_omni/diffusion/weight_stack/
   host/                  03
   offload/               04
   policy.py              05
+  observability.py       05
 
 tests/diffusion/weight_stack/
   __init__.py
@@ -1237,7 +1238,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 
 ## 删除 legacy 时
 
-- 模型里按 offload 策略改变行为的分支按总体设计 9.3 删除，读查询函数的调用随之消失；`offloader/config.py` 随现有的三个后端一起删除。
+- 模型里按 offload 策略改变行为的分支由 04 删除（04 的“删除 legacy 时”），读查询函数的调用随之消失；`offloader/config.py` 由 04 随现有的三个后端一起删除。
 - `execution_offload_facts` 只保留读 05 策略的一支。
 - `OmniDiffusionConfig.__post_init__` 不再调用 `materialize_legacy_offload_flags`。
 - `DiffusionModelRunner.load_model` 只保留 `unified` 一支，删除 `offload_backend` 属性和对 `enable_offload_backend`、`DiffusersPipelineLoader` 的调用。`DiffusionWorker.shutdown` 删除对 `offload_backend.shutdown()` 的调用；`re_init_pipeline`、`sleep`、`wake_up` 只保留 `unified` 一支。加载不再经 `_maybe_get_memory_pool_context` 进入 `weights` 池，由 8.2 的睡眠池取代；`kv_cache` 池照旧经它进入。

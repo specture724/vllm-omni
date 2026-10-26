@@ -551,7 +551,7 @@ checkpoint 适配器 get_checkpoint_adapter 选中的格式转换（例如 Model
 - `narrow`、`chunk`、`split`、切片、`view`、`reshape`、`t`、`permute`、`to(dtype)` 返回新的延迟张量，不读数据。
 - 目标是 meta 张量的 `copy_` 什么都不做，也不读数据：瘦路径下完全落在本 rank 范围之外的张量（03 的 `view()` 返回 meta 张量）和同机共享时等待者写进共享存储的张量（同样是 meta）走这一条。
 - 其他任何操作先物化：safetensors 用 `get_slice` 只读视图覆盖的范围，torch 格式从 mmap 的张量取；有待融合的 Δ 时在这一步计算并融合（8.2）；然后执行原操作。
-- 读取器在启动日志里报告目标为 meta 却被物化的字节数。瘦路径测试对门槛矩阵里的家族断言这个数为 0。
+- 读取器在启动日志里报告目标为 meta 却被物化的字节数（05 第 15.2 节的 `meta_materialized` 事件）。瘦路径测试对门槛矩阵里的家族断言这个数为 0。
 
 #### 7.4 存储绑定
 
@@ -900,7 +900,7 @@ class LegacyReader:
 | 编译目标 | `DiffusionModelRunner.load_model` 读 `_dit_modules`，默认 `("transformer", "transformer_2")`；`regionally_compile`（`vllm_omni/diffusion/compile.py`）读 `_repeated_blocks` 和 `_layerwise_offload_blocks_attrs`。 | `unified` 下 runner 不运行这段代码，编译由 04 的 `setup_compile` 在提交后完成，它经 `component_paths(pipeline, "dit", ...)` 和 `repeated_block_paths` 选目标。legacy 不变。 |
 | 缓存加速 | `cache/cachedit/backend.py` 的 `_dit_module_names` 读 `_dit_modules`，默认 `("transformer",)`。 | 改为 `component_paths(pipeline, "dit", legacy=<原函数体>)`。 |
 | 动态 LoRA | `DiffusionLoRAManager._replace_layers_with_lora` 读默认组件、`_dit_modules`、`_lora_components`。 | 改为 `lora_target_paths(pipeline, legacy=<原表达式>)`；`unified` 下包装在 Loader 里完成（11.2）。 |
-| 模型注册表 | `registry.py` 的 `initialize_model` 读 `model.vae` 设置 slicing、tiling 和 VAE 并行。 | `unified` 下对 `component_paths(pipeline, "vae", ...)` 的每个组件设置；这些设置只改属性，在构造上下文里执行。 |
+| 模型注册表 | `registry.py` 的 `initialize_model` 读 `model.vae` 设置 VAE 的切片、分块和 VAE 并行。 | `unified` 下对 `component_paths(pipeline, "vae", ...)` 的每个组件设置；这些设置只改属性，在构造上下文里执行。 |
 | 序列并行钩子 | `_apply_sequence_parallel_if_enabled` 读 `_dit_modules`，默认 `("transformer", "transformer_2", "dit", "unet")`。 | 改为 `component_paths(pipeline, "dit", legacy=<原表达式>)`；钩子不读写权重，照常在构造上下文里安装。 |
 | VAE 快路径 | `_apply_wan_vae_fastpath_if_enabled` 经 `ModuleDiscovery.discover` 取 VAE；`install_wan_vae_fastpath` 在 `channels_last` 级别用 `Module.to(memory_format=...)` 转换卷积权重，撤销（`_restore_module_layouts`）和回滚用 `tensor.data=` 换回原布局。 | 改为 `component_paths(pipeline, "vae", ...)`；`unified` 下布局由 Wan VAE 规则表的 `memory_format` 表达，Loader 按这个步长分配，安装时只绑定前向，不转换布局，也不登记布局的撤销和回滚（C13）。 |
 | 模型代码里的组件发现 | `ltx2_components._place_aux_components`、`SanaWMPipeline` 的同类函数经 `ModuleDiscovery.discover` 搬运辅助组件。 | 只服务于 legacy 的放置；`unified` 下其中的 `.to(device)` 在构造上下文里只改类型，不迁移，随 legacy 删除。 |
@@ -920,10 +920,10 @@ class LegacyReader:
 | Ming-Image | `ming_image/condition.py`：`MingImageConditioning.__init__` 调用 `query_encoder.load_from_checkpoint` 和 `_load_direct_weights`（`load_file` 加改键后的 `direct_projector.load_state_dict`）。 | 两处都改成 `declare_weights`，改键写进 `writer`。 |
 | π0 | `pi0/pipeline_pi0.py`：`Pi0Pipeline._initialize_model` 调用 `_load_checkpoint`（`safetensors.torch.load_file`）。 | `declare_weights(model, sources=..., writer=<_load_checkpoint 的键映射>)`。 |
 | π0.5 | `pi05/pipeline_pi05.py`：`Pi05Pipeline._initialize_model` 调用 `_load_checkpoint`（`load_file`）；`pi05/config.py`：`Pi05Config.from_pretrained` 调用 `load_lerobot_norm_stats`（`load_file`）；`_set_inference_dtype` 在加载后改类型。 | 模型同 π0；归一化统计量登记为 pipeline 上的非持久 buffer 来源，处理器在 `eval()` 里由它们建立 `NormStats`，这些 buffer 列入对比例外表；`_set_inference_dtype` 由规则表的类型取代。 |
-| InternVLA-A1 | `internvla_a1/pipeline_internvla_a1.py`：`InternVLAA1Pipeline._initialize_policy` 调用 `internvla_a1/model_internvla_a1.py` 里自定义的 `InternVLAA1Policy.from_pretrained`（`safe_open` 加 `get_tensor` 交给带 `ignore_unexpected_prefixes` 的 `AutoWeightsLoader`）；`internvla_a1/model_cosmos.py` 的 `_load_native_cosmos_component`（`load_file` 加 `load_state_dict(strict=False)`）；`InternVLAA1Policy.to` 的覆写把 `model.cosmos` 改成 bf16、`model.action_out_proj` 改成 fp32。 | policy 只用配置构造，`declare_weights(policy, sources=model.safetensors, writer=<同样参数的 AutoWeightsLoader>)`；Cosmos 组件用 `declare_weights`；`.to` 覆写的类型效果由规则表的 `runtime_dtype` 表达。 |
+| InternVLA-A1 | `internvla_a1/pipeline_internvla_a1.py`：`InternVLAA1Pipeline._initialize_policy` 调用 `internvla_a1/model_internvla_a1.py` 里自定义的 `InternVLAA1Policy.from_pretrained`（`safe_open` 加 `get_tensor` 交给带 `ignore_unexpected_prefixes` 的 `AutoWeightsLoader`）；`internvla_a1/model_cosmos.py` 的 `_load_native_cosmos_component`（`load_file` 加 `load_state_dict(strict=False)`）；`InternVLAA1Policy.to` 的覆写把 `model.cosmos` 改成 bf16、`model.action_out_proj` 改成 fp32。 | `InternVLAA1Policy` 只用配置构造，`declare_weights(policy, sources=model.safetensors, writer=<同样参数的 AutoWeightsLoader>)`；Cosmos 组件用 `declare_weights`；`.to` 覆写的类型效果由规则表的 `runtime_dtype` 表达。 |
 | Gr00t | `gr00t/policy.py`：`Gr00tPolicy.__init__` 调用 `AutoModel.from_pretrained(model_dir, torch_dtype=torch.bfloat16)`。 | 改成 `hf_component`，需要 `Gr00tN1d7` 的规则表；组件路径 `policy.model`（2.3）。 |
-| OmniVoice | `omnivoice/pipeline_omnivoice.py`：`OmniVoicePipeline.__init__` 调用 `HiggsAudioV2TokenizerModel.from_pretrained`；`load_weights` 丢弃流，调用 `self.generator.load_weights(self.model_path, device)` 和 `self.decoder.load_weights(...)`（`vllm_omni/model_executor/models/omnivoice/` 里自己读文件）。 | 分词器模型经 `hf_component`；generator、decoder 用 `declare_weights` 登记模型目录的来源，键映射（`llm.*`、`audio_tokenizer.*`）写进 `writer`；`weights_sources` 的 unified 一支为空。`load_weights(model_dir, device)` 还被自回归路径使用，保留。 |
-| LTX2 | `ltx2/ltx2_components.py`：`_load_ltx_latent_upsampler_single_file`（`safe_open` 读元数据，`load_file` 加 `load_state_dict`）、`_load_ltx25_native_diffusion_decoder`（经 `ltx2/vae/decoder.py` 的 `load_ltx25_native_diffusion_decoder_state_dict` 用 `get_tensor`）；`ltx2/ltx2_runtime.py` 的 `eval()` 调用 `phase_adapter.finalize()`，经 `ltx2_adapter_parser.iter_adapter_tensors` 读 A/B。 | upsampler、diffusion decoder 用 `declare_weights`；相位适配器声明为 `overlay` 固定适配器（`format="ltx_phase"`），A/B 在写入阶段写入，`eval()` 里的物化只在 legacy 一支执行；只在对应 profile 下声明 `diffusion_decoder`、`latent_upsampler`。 |
+| OmniVoice | `omnivoice/pipeline_omnivoice.py`：`OmniVoicePipeline.__init__` 调用 `HiggsAudioV2TokenizerModel.from_pretrained`；`load_weights` 丢弃流，调用 `self.generator.load_weights(self.model_path, device)` 和 `self.decoder.load_weights(...)`（`vllm_omni/model_executor/models/omnivoice/` 里自己读文件）。 | 分词器模型经 `hf_component`；`generator`、`decoder` 用 `declare_weights` 登记模型目录的来源，键映射（`llm.*`、`audio_tokenizer.*`）写进 `writer`；`weights_sources` 的 unified 一支为空。`load_weights(model_dir, device)` 还被自回归路径使用，保留。 |
+| LTX2 | `ltx2/ltx2_components.py`：`_load_ltx_latent_upsampler_single_file`（`safe_open` 读元数据，`load_file` 加 `load_state_dict`）、`_load_ltx25_native_diffusion_decoder`（经 `ltx2/vae/decoder.py` 的 `load_ltx25_native_diffusion_decoder_state_dict` 用 `get_tensor`）；`ltx2/ltx2_runtime.py` 的 `eval()` 调用 `phase_adapter.finalize()`，经 `ltx2_adapter_parser.iter_adapter_tensors` 读 A/B。 | `latent_upsampler`、`diffusion_decoder` 用 `declare_weights`；相位适配器声明为 `overlay` 固定适配器（`format="ltx_phase"`），A/B 在写入阶段写入，`eval()` 里的物化只在 legacy 一支执行；只在用到它们的 LTX2 配置档下声明 `diffusion_decoder`、`latent_upsampler`。 |
 | SeedVR2 | `seedvr2/pipeline_seedvr2.py`：`SeedVR2Pipeline.__init__` 用 `torch.load` 读 `pos_emb.pt`。 | `pos_emb` 注册为 meta 非持久 buffer，形状来自配置，用 `BufferSource(format="torch")` 登记。 |
 | MAGI-2 | `magi2/turbo_vae.py`：`Magi2TurboVAEDecoder.__init__` 用 `torch.load` 加 `load_state_dict`；`magi2/audio_decoder.py`：`Magi2AudioDecoder.__init__` 用 `safe_open` 加 `get_tensor`；`magi2/conditioning.py`：`Magi2Qwen35TextEncoder.__init__` 调用 `Qwen3_5TextModel.from_pretrained`；图像 VAE 用 Lance 的 `LanceWanVAE`。 | 两个解码器用 `declare_weights`；文本编码器经 `hf_component`；MoE 的 `W13` 见 C02（第 17 节）；按 rank 声明见 2.5。 |
 | DreamZero | `dreamzero/pipeline_dreamzero.py`：`DreamZeroPipeline.__init__` 直接调用 `DistributedAutoencoderKLWan.from_pretrained`。 | 改成 `hf_component`，`init_distributed` 写进规则表的 `post_construct`；VAE 类型随 offload 变化的现象由对比基准处理（总体设计 9 第 3 步）。 |
@@ -1040,7 +1040,7 @@ tests/diffusion/weight_stack/baseline/
 | 02-3 | 2b | 规则表的格式和执行、`generate` 工具、逐表测试框架，以及主干 pipeline 用到的 Hugging Face 类的第一批表 | `loader/rules/` | `rules/test_rule_tables.py` | 02-2 | L | 无 |
 | 02-4 | 2c | 来源解析、读取流水线、延迟张量、预检的来源核对、内容身份、预期清单 | `loader/reader.py`、`loader/identity.py` | `test_reader.py`、`test_lazy_tensor.py`、`test_content_identity.py` | 02-2 | L | 无 |
 | 02-5 | 2c | 存储绑定、写入入口选择、写入跟踪、逐层在线量化、收尾顺序、最终清单、HSDP 组件的物化和分片 | `loader/writer.py`、`loader/quant.py`、`loader/finalize.py`、`loader/hsdp.py` | `test_write_tracking.py`、`test_online_quant.py`、`test_finalize.py`、`test_manifests.py`、`test_hsdp.py` | 02-3、02-4 | L | 无 |
-| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架和 `export_legacy_hashes`、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_stack/baseline/`、`loader/fingerprints.py` | 框架自测（用一个已按新写法构造的 pipeline，例如 Z-Image） | 02-5 | M | 无 |
+| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架和 `export_legacy_hashes`、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_stack/baseline/`、`loader/fingerprints.py` | `baseline/test_compare_framework.py`（用一个已按新写法构造的 pipeline，例如 Z-Image，自测对比框架）、`test_legacy_fingerprints.py` | 02-5 | M | 无 |
 | 02-7 | 2c | 适配器格式转换器（diffusers、kohya、fasth3、vdn）、读取器里的融合、预检的键核对、`fuse` 固定适配器、worker 的 distill 分支 | `loader/adapters/`、`diffusion_worker.py` | `test_adapters.py`；融合后在线量化在 TP 为 1 和 2 时与参考一致 | 02-5 | L | C16（融合） |
 | 02-8 | 2f | 动态 LoRA 包装、`base_layer` 名字规则、槽位声明、`overlay` 固定适配器（ltx_phase、longcat_dmd 转换器）、管理器的 `unified` 一支 | `loader/overlay.py`、`lora/manager.py`、`diffusion_worker.py` | `test_overlay.py`；加载、切换、卸载动态 LoRA 前后结构和基础权重地址不变 | 02-5 | M | C16（包装） |
 | 02-9 | 2f | `load_format="diffusers"` 的 `unified` 一支、`attach_structure_only_pipeline`、C18 | `loader/diffusers_format.py`、`pipeline_diffusers_adapter.py` | `test_diffusers_format.py`；SDXL fp16 的 `upcast_vae` 由规则表固定类型 | 02-3、02-5 | M | C18 |
@@ -1056,7 +1056,7 @@ tests/diffusion/weight_stack/baseline/
 
 - 每个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变，不修改已有测试文件；承担必改行的 PR 新增自己的位置文件（第 17 节），PR 描述写明行编号和这一行的 `legacy_removal`。
 - 02-11 到 02-16、02-18 可以并行；它们合入之前，对应的 pipeline 在 `unified` 下启动报 `ConstructionError`。
-- 本 RFC 的 PR 之间的依赖如下，都在 01 的全部 PR 之上，与 03、04 的 PR 互不依赖（umbrella 的依赖图）：
+- 本 RFC 的 PR 之间的依赖如下，都在 01 的全部 PR 之上，不依赖 03、04、05 的 PR；03-9 和 04、05 的部分 PR 依赖本 RFC 的 PR（umbrella 的依赖图）：
 
 ```text
 01-1..01-7
@@ -1067,11 +1067,11 @@ tests/diffusion/weight_stack/baseline/
       02-4
         02-5                  依赖 02-3、02-4
           02-6、02-7、02-8
-          02-9                依赖 02-3、02-5
             02-11             依赖 02-6、02-7
             02-12、02-15、02-16  依赖 02-6
             02-13、02-14      依赖 02-6、02-8
             02-18             依赖 02-3、02-6
+          02-9                依赖 02-3、02-5
 ```
 
 ## 测试计划
@@ -1107,6 +1107,7 @@ tests/diffusion/weight_stack/baseline/
 - 写入跟踪：重复写入报 `WriteError`；`writer`、`AutoWeightsLoader`、`load_state_dict` 的写入都被计数；包装后的 `weight_loader` 与原函数对同一输入写出相同的字节，没有 `weight_loader` 的参数走 `default_weight_loader`；改绑参数（`param.data = ...`、替换 `Parameter` 对象）在收尾第 4 步被报出。
 - 预检：名字映射由 Loader 决定的来源缺少 `required` 张量时报 `PreflightError`；经模型 `load_weights` 写入的来源不做这项核对，缺写的张量在收尾第 4 步报出。
 - 逐层量化：用一个 fp8 在线量化的小模型，量化在每层写完时立即发生，量化前的临时张量随即释放，最终字节与 legacy 的 `_process_weights_after_loading` 一致；输出声明与实际不符时报错；不经过 `weight_loader` 写量化层量化前的参数时报 `WriteError`；输出目标全是 meta 的层不读 checkpoint，层上的运行期属性与目标为真实存储时相同。
+- 逐层量化的峰值（`test_online_quant.py`，L2，`core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`）：同一个 fp8 在线量化的小模型分别在 `legacy` 和 `unified` 下加载，记录 Host 的 RSS 峰值和 `torch.cuda.max_memory_allocated`，`unified` 的两项都不高于 `legacy`。
 - 收尾：第 2 步的注册表为空时跳过；第 2 步替换的张量的别名在第 3 步改指向新张量；`tied` 核对；常驻加速卡的新张量在 `weights()` 池里分配（用记录进入次数的替身 `MemoryPools`）；`eval()` 读分片后端 Unit 的参数时报错；`eval()` 改了参数时按第 6 步之后的快照报 `FinalizeError`，`seal()` 的只读重绑定本身不报错；不调用 `post_load_weights` 等钩子（用替身模型记录调用）；读取陷阱在收尾结束时最后核对一次违例。
 
 **内容身份和清单**（`test_content_identity.py`、`test_manifests.py`）
@@ -1120,12 +1121,12 @@ tests/diffusion/weight_stack/baseline/
 - 预检 8.6 表里的每一行。
 - 融合后在线量化：TP 为 1 时在 CPU 上比较；TP 为 2 时是 L2，标记 `core_model`、`diffusion`、`parallel`，`hardware_test(res={"cuda": "L4"}, num_cards=2)`，与“完整加载、融合、再量化”的参考一致。
 - 动态 LoRA：包装发生在 `build_structure()` 里；`base_layer` 名字规则；槽位声明的形状；管理器在 `unified` 下拒绝大于 `slot_rank` 的适配器并提示参数；没有启用时 `DiffusionWorker.add_lora` 报错。
-- L2（`core_model`、`diffusion`，CUDA 单卡）：加载、切换、卸载动态 LoRA 前后，模块结构和基础权重的 `data_ptr` 不变，写入代数每次写槽位加一。
+- L2（`core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`）：加载、切换、卸载动态 LoRA 前后，模块结构和基础权重的 `data_ptr` 不变，写入代数每次写槽位加一。
 
 **load_format 和 HSDP**（`test_diffusers_format.py`、`test_hsdp.py`）
 
-- 用测试资源里缩小到几层、由 `save_pretrained` 生成的 diffusers 格式模型目录：`unified` 下不调用 `load_weights()`，组件声明来自 `model_index.json`，前向输出与 legacy 一致（L2，CUDA 单卡）。
-- HSDP：物化只为 meta 参数分配，RoPE 表等非持久 buffer 保持构造时的值，不调用 `to_empty`；分片在 `weights()` 池里进行；`pre_sharded` 不调用 `_materialize_pre_sharded_hsdp_state` 和 `_finalize_pre_sharded_hsdp_loaded_weights`；L2，`parallel`，2 卡，两种策略的输出都与 legacy 的 HSDP 一致。
+- 用测试资源里缩小到几层、由 `save_pretrained` 生成的 diffusers 格式模型目录：`unified` 下不调用 `load_weights()`，组件声明来自 `model_index.json`，前向输出与 legacy 一致（L2，`core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`）。
+- HSDP：物化只为 meta 参数分配，RoPE 表等非持久 buffer 保持构造时的值，不调用 `to_empty`；分片在 `weights()` 池里进行；`pre_sharded` 不调用 `_materialize_pre_sharded_hsdp_state` 和 `_finalize_pre_sharded_hsdp_loaded_weights`；L2，`core_model`、`diffusion`、`parallel`，`hardware_test(res={"cuda": "L4"}, num_cards=2)`，两种策略的输出都与 legacy 的 HSDP 一致。
 
 **查询接口**（`test_query_api.py`）
 
@@ -1139,7 +1140,7 @@ tests/diffusion/weight_stack/baseline/
 **逐张量对比**（`tests/diffusion/weight_stack/baseline/`）
 
 - 结构可以配置的家族：合成 checkpoint，L2，标记 `core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`，在改动对应家族目录或 `weight_stack/loader/` 的 PR 上运行。
-- 结构固定的家族（MiniMax H3、MAGI-2、LTX2 等真实 checkpoint）：L4，标记 `full_model`、`diffusion`，每晚运行，接入 `.buildkite/cuda/test-nightly.yml`。
+- 结构固定的家族（MiniMax H3、MAGI-2、LTX2 等真实 checkpoint）：L4，标记 `full_model`、`diffusion` 和 `hardware_test(res=...)`（SKU 按 checkpoint 所需的显存选择），每晚运行，接入 `.buildkite/cuda/test-nightly.yml`。
 - 规则表的逐表测试：L1，固定库版本。
 
 ## 验收标准
@@ -1165,14 +1166,16 @@ tests/diffusion/weight_stack/baseline/
 
 ## 删除 legacy 时
 
-- 每个 `build_component` 调用只留 unified 一支，`build_component` 删除；`is_building_structure()` 的调用点（C02、D06）只留上下文里的一支。
-- 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 generator、decoder 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留；`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删。
+- 每个 `build_component` 调用只留 unified 一支，`build_component` 删除；`is_building_structure()` 的调用点（C02、D06）只留上下文里的一支；C04、C05、C09、C10、C11、C13、C15、C16、C18 的 `legacy` 一支按各行的 `legacy_removal` 删除。
+- 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 `generator`、`decoder` 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留；`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删。
 - HF 组件入口里加载带权重组件的 legacy 一支；`create_transformers_model` 里的 `init_parameters`、`create_transformers_model_with_vllm_linears` 里的 `init_parameters_preserving_vllm_linear`。
 - 只服务于 legacy 的 `load_weights` 主体：自己读文件的（OmniVoice 的 pipeline `load_weights`）、空操作的、替没有写入的组件声明“已加载”的（MiniMax H3 pipeline 对 VAE 和放大器的声明）。
+- 模型加载后钩子里只为现有实现存在的部分：`flux2_klein/flux2_klein_transformer.py` 和 `minimax_h3/minimax_h3_transformer.py` 的 `validate_restored_host_weights` 等（总体设计 9.3）。
 - 规则表取代的运行期改类型代码：LingBot-Video 和 InternVLA-A1 的 `.to()` 覆写、π0.5 的 `_set_inference_dtype`、LTX2 vocoder 的 `.float()` 往返；LTX2 在 `eval()` 里物化相位适配器的代码；MiniMax H3 pipeline 对 FastH3、VDN 的流包装。
 - `_maybe_fuse_distilled_lora`、pipeline 上会融合权重的 `load_lora_weights`、worker 里的第二个蒸馏 LoRA 融合点，以及 LoRA 管理器里读 offload 策略的代码和运行期重建槽位的 `_ensure_max_lora_rank` 分支。
 - `SupportsComponentDiscovery`、`_dit_modules`、`_encoder_modules`、`_vae_modules` 和 2.2 的默认推导：删除之前，每个注册的 pipeline 都改成显式调用 `declare_components`；第 15 节查询函数的 `legacy` 参数一并删除。
 - `DiffusersAdapterPipeline.load_weights()` 和它对 diffusers 自带 offload 的调用。
+- 现有的非 HSDP 加载路径：`model_loader/diffusers_loader.py` 里 `DiffusersPipelineLoader` 的非 HSDP 加载流程，以及其中对 Host Weight Runtime 的接入：`model_loader/host_weight_loader.py`（`HWRLoaderMixin`）、`model_loader/host_weight_plan.py`、`model_loader/host_weights/` 和 `diffusers_loader.py` 里对它们的调用。第 13 节沿用的 HSDP 函数有其他使用方时保留。`vllm_omni/host_weight_runtime/` 包本身不改动（总体设计 1.2）。
 - 删除之前，逐张量对比测试的 legacy 结果存成逐张量的哈希；删除之后，对比测试改为与这份哈希对比，对比例外表保留。
 - 指纹清单 `LEGACY_READERS` 和指纹测试。
 
@@ -1187,7 +1190,7 @@ tests/diffusion/weight_stack/baseline/
 | 写入期间把包装层临时换回 `base_layer`。 | 模型 `load_weights` 持有包装层引用时找不到原来的层。 | 换回的是同一个 `base_layer` 对象；`test_overlay.py` 对启用动态 LoRA 的 pipeline 跑一遍写入，主干里 `_lora_components` 声明的 pipeline 都覆盖。 |
 | 规则表跟不上 transformers 或 diffusers 的升级。 | 升级后 `from_pretrained` 的行为变化没有反映到表里，字节不一致。 | 逐表测试断言库版本，升级时全部表重新验证。 |
 | 量化方法缺少输出声明。 | 使用这种量化方法的模型在 `unified` 下构造失败。 | 报错写明方法名并提示 `legacy`；支持矩阵按量化方法列出。 |
-| checkpoint 里同一层的张量不相邻，或多线程读取让几层交错写入。 | 几层量化前的临时张量同时存在，写入期间的显存峰值超过 `write_transient.quant_layer_bytes`，准入通过后在写入阶段显存不足。 | 读取器对含量化层的组件按键名的自然顺序产出张量，不对这些组件开多线程；Loader 记录写入期间临时张量的峰值并写进启动日志，在线量化的测试断言峰值不超过 `quant_layer_bytes`。 |
+| checkpoint 里同一层的张量不相邻，或多线程读取让几层交错写入。 | 几层量化前的临时张量同时存在，写入期间的显存峰值超过 `write_transient.quant_layer_bytes`，准入通过后在写入阶段显存不足。 | 读取器对含量化层的组件按键名的自然顺序产出张量，不对这些组件开多线程；Loader 记录写入期间临时张量的峰值并写进启动日志（`write_transient_peak` 事件），在线量化的测试断言峰值不超过 `quant_layer_bytes`。 |
 | 陷阱的补丁对整个进程生效。 | 上下文打开期间同一进程里的其他加载（例如同进程里另一个 stage 的加载）被拦截。 | 同一进程同一时刻只有一个上下文（3.1）；报错写明调用位置，便于定位。 |
 | `pre_sharded` 的物化经 `nn.Module._apply` 只替换 meta 张量（第 13 节）。 | 与 HSDP 在 meta 上分片之后的内部状态不配合时，本地分片没有被 HSDP 登记。 | `test_hsdp.py` 的 2 卡用例对 `pre_sharded` 比较输出和每个分片的字节，这个用例是 02-5 合入的条件。 |
 

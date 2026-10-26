@@ -780,7 +780,7 @@ tests/diffusion/weight_stack/offload/
 
 ## 测试计划
 
-CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproject.toml`：L1 是 `core_model` 加 `cpu`，L2 是 `core_model` 加 `hardware_test(res=...)`，L3 是 `advanced_model`，L4 是 `full_model`；本 RFC 的测试都带 `diffusion`，多卡测试带 `parallel` 和 `cards_<n>`。
+CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproject.toml`：L1 是 `core_model` 加 `cpu`，L2 是 `core_model` 加 `hardware_test(res=...)`，L3 是 `advanced_model` 加 `hardware_test(res=...)`，L4 是 `full_model` 加 `hardware_test(res=...)`；本 RFC 的测试都带 `diffusion`，多卡测试另带 `parallel`，卡数经 `hardware_test(res=..., num_cards=<n>)` 给出，`cards_<n>` 由它自动加上。
 
 **单元测试（L1）**
 
@@ -796,7 +796,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 - 编译：`resolve_compile_mode` 的降级表；`regionally_compile` 的两个分支；提交之前调用报错。
 - 缓存签名：换绑参数存储、参数指向零元素占位时签名不变；`eval()` 里算的签名在提交之后仍然匹配；`bump_weight_generation` 之后签名改变；`legacy` 下签名不变；`offload/` 不 import `cache/`。
 
-**GPU 测试（L2，`cards_1`）**
+**GPU 测试（L2，`hardware_test(res={"cuda": "L4"})`，单卡）**
 
 - 合成 DiT 上 `rank-local` 块环的输出与完整加载逐位一致，覆盖预测错（跳块、切换两个 DiT）和异常退出。
 - 登记和暂存区两条路径的输出一致；`pin_cpu_memory` 为假时不登记、暂存区不锁页。
@@ -805,7 +805,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 - 睡眠再唤醒后输出一致，常驻部分和固定槽位的地址不变，host 存储不变。
 - 每个必改行一个 `unified` 用例；对应的已有测试在 `legacy` 下不变。
 
-**多进程测试（L2 和 L3，`parallel`，`cards_2`、`cards_4`）**
+**多进程测试（L2 和 L3，`parallel`，`hardware_test(res={"cuda": "L4"}, num_cards=2)` 和 `num_cards=4`）**
 
 - `allgather` 块环的输出与完整加载一致，覆盖每次前向第一个块的拼接、预测错、两个组件各自的 AllGather 组。
 - 只在部分 rank 上声明的 `rank-local` 流式 Unit 不打乱 `allgather` 的拼接顺序。
@@ -815,8 +815,11 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 
 **端到端测试（L3 和 L4）**
 
+端到端测试经 01 的 `run_unified_startup` 启动，策略经 `UnifiedOffloader` 的 `select` 参数注入，不经过命令行解析，因此不依赖 05-3。
+
 - 每个支持的 pipeline 一个“全部组件做 offload”的冒烟测试，覆盖编译和异常路径（L3，合成或小模型；L4，真实 checkpoint）。
 - 有端到端或每晚测试的“模型 × offload 策略”组合在 `unified` 下与完整加载的输出一致，记录 Host 和加速卡的峰值（L4）。
+- 删除 `legacy` 之前（umbrella Job 6）：每个注册的 pipeline 另做一次重复块组件选 `layer` 的冒烟测试（L3）；`test_compile_targets.py`（L1）对每个注册的 pipeline 在只建结构的上下文里分别求出 `regionally_compile` 的 `legacy` 一支和 `unified` 一支选出的被编译模块集合，断言两者相同，九个块类补进 `_repeated_blocks` 之后这个测试必须通过。
 
 ## 验收标准
 
@@ -837,11 +840,13 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 
 umbrella RFC Job 6 删除 `legacy` 时，本 RFC 范围内删除：
 
-- `vllm_omni/diffusion/offloader/` 整个包：三个后端、`block_discovery.py`、`component_utils.py`、`module_collector.py`、`module_residency.py`（`PinnedModuleStager`）、`offload_plan.py`（`OffloadPlan`）、`plan_resolver.py`、`startup.py`、`config.py` 的查询函数、`host_registration.py`、`cuda_host_registration.py`、`tensor_utils.py`；runner 里的 `enable_offload_backend` 和 `offload_backend.shutdown()`。
+- `vllm_omni/diffusion/offloader/` 整个包：三个后端、`block_discovery.py`、`component_utils.py`、`module_collector.py`、`module_residency.py`（`PinnedModuleStager`）、`offload_plan.py`（`OffloadPlan`）、`plan_resolver.py`、`startup.py`、`config.py` 的查询函数、`host_registration.py`、`cuda_host_registration.py`、`tensor_utils.py`。runner 和 worker 里对 `enable_offload_backend`、`offload_backend.shutdown()` 的调用由 01 删除。
 - `regionally_compile` 的 `legacy` 一支（按 `_repeated_blocks` 类名和 `_layerwise_offload_blocks_attrs` 匹配）。删除之前，只靠 `_layerwise_offload_blocks_attrs` 回退被编译的块类补进 `_repeated_blocks`（总体设计 9.3 列出的九个类），一个测试对比删除前后被编译的模块集合。
 - `ExactProjectionCache._signature` 的地址签名；C07、C08、C12、C14、C17、C19 和 C01、C03、C06 的 `legacy` 一支，按各行的 `legacy_removal`；`QwenImage21DecodeGraphManager._offload_reason` 对 `SequentialOffloadHook` 的读取。
-- 模型里的 offload 专用声明：`_layerwise_offload_blocks_attrs`、模型声明的 `OffloadPlan`、常驻路径声明、`SupportsModelCpuOffload`；MAGI-2 的分阶段组件和内存窗口、MiniMax H3 的 AdaLN Host 暂存和 SM120 默认、放大器和 VAE 两半的搬运。
-- 01 的 `HOOK_NAME_ALLOWLIST` 清空后，T4 只读 `HOOK_NAMES`。
+- 模型里的 offload 专用声明：`_layerwise_offload_blocks_attrs`、模型声明的 `OffloadPlan`、常驻路径声明、`SupportsModelCpuOffload`；MAGI-2 的分阶段组件和内存窗口；MiniMax H3 的驻留控制器、分配器缓存、AdaLN Host 暂存和 SM120 默认、放大器和 VAE 两半的搬运；Cosmos3 的阶段上下文（`cosmos3/transformer_cosmos3.py` 的 `_offload_context`、`_model_cpu_offload_context`）；其他模型自己的搬运代码。
+- 模型里按 offload 策略改变行为的分支，以及只为现有后端存在的拒绝：01 的 `OFFLOADER_IMPORT_ALLOWLIST` 和 `CONFIG_FIELD_ALLOWLIST` 里的模型文件读查询函数和 offload 配置字段的代码；LoRA 管理器和 diffusers 适配器里的这类代码由 02 删除。
+- `cache/seacache/hook.py` 按字符串名读分布式逐层 offload 钩子的代码。
+- `HOOK_NAMES` 保留；01 清空 `HOOK_NAME_ALLOWLIST` 之后，T4 只从它读钩子名（01 的“删除 legacy 时”）。
 
 ## 风险
 
