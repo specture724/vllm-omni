@@ -948,7 +948,17 @@ offload 策略 = Unit + Trigger + Transport
 
 ### 子 RFC
 
-本 RFC 之下有五份子 RFC：启动事务、统一加载、host 存储、统一 Offloader、配置。
+本 RFC 之下有五份子 RFC，合入顺序和里程碑见[路线图](./ROADMAP.md)：
+
+| 子 RFC | 对应的 Job |
+|---|---|
+| [01 启动事务、总开关与共存期](./01-startup-transaction.md) | Job 1 |
+| [02 统一加载](./02-unified-loader.md) | Job 2 |
+| [03 Host 存储](./03-host-storage.md) | Job 3 |
+| [04 统一 Offloader](./04-unified-offloader.md) | Job 4 |
+| [05 配置与可观测性](./05-configuration.md) | Job 5，以及 Job 6 的门槛矩阵 |
+
+Job 6 删除的内容由各子 RFC 的“删除 legacy 时”一节分别承担。
 
 ## 实现拆分
 
@@ -1038,7 +1048,7 @@ offload 策略 = Unit + Trigger + Transport
 
 ### Job 6：达标、翻转、删除
 
-- 跑完门槛矩阵。
+- 跑完门槛矩阵（05-9）。
 - 翻转前确认三件事：
   - 主干里注册的 pipeline 全部能在只建结构的上下文里构造；
   - 迁移家族的逐张量对比全部通过，对比例外都已列入门槛例外；
@@ -1048,7 +1058,7 @@ offload 策略 = Unit + Trigger + Transport
 - 删除 `legacy` 和模型侧代码。其中构造代码：
   - 每个注册的 pipeline 都显式调用 `declare_components`，从 `_dit_modules` 等属性推出组件声明的默认推导随之删除；
   - 每个 `build_component` 调用只留 unified 一支，`build_component` 删除；
-  - 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 generator、decoder 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留。`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删；
+  - 指纹清单登记的 legacy 读取和转换函数，只删没有其他使用方的。OmniVoice 的 `generator`、`decoder` 的 `load_weights(model_dir, device)` 还被自回归路径使用，保留。`LanceWanVAE` 的读取同时被 Lance 和 MAGI-2 使用，两个家族都只剩 unified 一支后才删；
   - HF 组件入口里加载带权重组件的 legacy 一支，以及 `create_transformers_model` 里的 `init_parameters`、`create_transformers_model_with_vllm_linears` 里的 `init_parameters_preserving_vllm_linear`；
   - 只服务于 legacy 的 `load_weights` 主体；
   - 指纹清单和指纹测试。
@@ -1073,7 +1083,7 @@ Job 之间的边以各子 RFC“实现拆分”里的 PR 编号为准。每条�
 - Job 4 依赖 Job 2：04-1 用 02-1 的组件目录和 `pipeline_of`；04-2 在 02-2 的只建结构的上下文里构造 pipeline；04-8、04-9 用 02-10 的查询接口，04-8 的用例另要求 02-14、02-15、02-16 迁移过的家族；04-10、04-11、04-12 修改的模型文件分别在 02-12、02-11、02-18 之后修改；04-13 用 02-5 的 Loader。
 - Job 4 依赖 Job 3：04-3 用 03-3 的 `HostRequest` 和 `flatten_shard_unit`；04-13 用 03-5、03-6 的 host 存储。
 - 03-9 只含 Job 3 的端到端测试，依赖 02-5 和 04-5；Job 3 的其余 PR 只依赖 Job 1。
-- 05-1、05-2 只做解析和传递，不改变已有配置的行为，只依赖 Job 1；05-3 起的 PR 改变 `unified` 的行为，依赖 Job 2、Job 3、Job 4 的相应 PR。
+- 05-1、05-2 只做解析和传递，不改变已有配置的行为，只依赖 Job 1；05-3 起的 PR 改变 `unified` 的行为，依赖 Job 2、Job 3、Job 4 的相应 PR；05-9 是门槛矩阵的测试，依赖 05-7、03-9、04-13，Job 6 用它跑门槛。
 - Job 2 不依赖 Job 3、Job 4、Job 5；Job 2、Job 3、Job 4 都不依赖 Job 5。
 
 ## 验收标准

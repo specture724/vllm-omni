@@ -4,7 +4,7 @@
 >
 > 范围：`vllm_omni/diffusion/weight_stack/policy.py`、`vllm_omni/diffusion/weight_stack/observability.py`；配置传递链上的 `vllm_omni/entrypoints/cli/serve.py`、`vllm_omni/engine/arg_utils.py`、`vllm_omni/config/stage_config.py`、`vllm_omni/config/omni_config.py`、`vllm_omni/diffusion/data.py`；指标链上的 `vllm_omni/diffusion/worker/diffusion_worker.py`、`vllm_omni/diffusion/stage_diffusion_proc.py`、`vllm_omni/diffusion/inline_stage_diffusion_client.py`、`vllm_omni/engine/orchestrator.py`、`vllm_omni/metrics/`；`recipes/`、`docs/`。
 >
-> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关 `is_unified()`、`ConfigError` 等错误类型和报错格式、`ExecutionOffloadFacts` 和 `execution_offload_facts`、`StartupContext.policy`、全组确认第 1 点的 `Point1Payload.unmatched_policy_keys`、登记表和静态测试 T1、T5、T6）；[子 RFC 02](./02-unified-loader.md)（组件目录的组件名、角色、`hsdp_managed` 和 `declaration_order`，`DynamicLoraSpec`，支持矩阵测试 `test_structure_matrix.py` 的结果）；[子 RFC 03](./03-host-storage.md)（`Mapping.kind`、`host_share` 和 `host_admission` 事件的调用点）；[子 RFC 04](./04-unified-offloader.md)（`plan()` 经本 RFC 的 `resolve_selection()` 读取策略，`PlacementPlan.unmatched_policy_keys()`，内存登记、暂存区和加速卡槽位的字节数）。
+> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关 `is_unified()`、`ConfigError` 等错误类型和报错格式、`ExecutionOffloadFacts` 和 `execution_offload_facts`、`StartupContext.policy`、全组确认第 1 点的 `Point1Payload.unmatched_policy_keys`、登记表和静态测试 T1、T5、T6）；[子 RFC 02](./02-unified-loader.md)（组件目录的组件名、角色、`hsdp_managed` 和 `declaration_order`，`DynamicLoraSpec`，支持矩阵测试 `test_structure_matrix.py` 的结果，`meta_materialized`、`write_transient_peak` 事件的调用点）；[子 RFC 03](./03-host-storage.md)（`Mapping.kind`、`host_share` 和 `host_admission` 事件的调用点）；[子 RFC 04](./04-unified-offloader.md)（`plan()` 经本 RFC 的 `resolve_selection()` 读取策略，`PlacementPlan.unmatched_policy_keys()`，内存登记、暂存区和加速卡槽位的字节数）。
 
 ## 摘要
 
@@ -877,7 +877,7 @@ CI 等级和标记按 `docs/contributing/ci/test_system_overview.md` 和 `pyproj
 | `test_recipe_policies.py` | 解析第 17.1 节每条 recipe 命令的策略，在只建结构的上下文里调用 `resolve_selection()`，`unmatched` 为空。 | L1 |
 | `test_support_matrix_doc.py` | 第 17.3 节。 | L1 |
 | recipe 的端到端 | 第 17.1 节改动的 recipe 在已有每晚例行测试的硬件上以 `unified` 写法运行，输出与 `legacy` 一致，显存峰值不高于 `legacy`。 | L4 |
-| `test_gate_matrix.py` | umbrella“上线方式”第 3 步的门槛矩阵：有端到端测试或每晚例行测试的每个“模型 × offload 策略”组合在 `legacy` 和 `unified` 下各运行一次，`unified` 的输出与 `legacy` 一致，Host 和加速卡的内存峰值不高于 `legacy`。结构或类型随 offload 变化的组合（Flux2-Klein TP 大于 1 配 offload、DreamZero 的 VAE 类型）以 `legacy` 不做 offload 的输出为基准；按空闲显存选择分块大小的 VAE 固定分块；融合适配器的组合逐张量对比融合结果，蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1 的组合以“完整加载、融合、再量化”的参考结果为基准；迁移说明列出的门槛例外只记录结果，不做断言。每个组合的输出对比和两项峰值的原始数据保存为测试产物。 | L4，`full_model`、`diffusion`、`hardware_test(res=...)`，每晚运行 |
+| `test_gate_matrix.py` | umbrella“上线方式”第 3 步的门槛矩阵：有端到端测试或每晚例行测试的每个“模型 × offload 策略”组合在 `legacy` 和 `unified` 下各运行一次，`unified` 的输出与 `legacy` 一致，Host 和加速卡的内存峰值不高于 `legacy`。结构或类型随 offload 变化的组合（Flux2-Klein TP 大于 1 配 offload、DreamZero 的 VAE 类型）以 `legacy` 不做 offload 的输出为基准；按空闲显存选择分块大小的 VAE 固定分块；融合适配器的组合逐张量对比融合结果，蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1 的组合以“完整加载、融合、再量化”的参考结果为基准；迁移说明列出的门槛例外只记录结果，不做断言。矩阵包含一台双路 8 卡机器，记录跨路 H2D 的带宽（总体设计第 13 节）。每个组合的输出对比和两项峰值的原始数据保存为测试产物。 | L4，`full_model`、`diffusion`、`hardware_test(res=...)`，每晚运行 |
 
 ## 验收标准
 
