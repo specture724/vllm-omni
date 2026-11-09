@@ -2,7 +2,7 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 6 节、第 10 节，以及第 4.1、4.5、9.3、11、12 节中与 host 存储有关的部分。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/host/`；部署标识经过的 `vllm_omni/engine/stage_runtime.py`、`vllm_omni/engine/stage_engine_startup.py`、`vllm_omni/engine/stage_init_utils.py`；`vllm_omni/diffusion/data.py` 的 `OmniDiffusionConfig`，以及 `vllm_omni/config/omni_config.py` 的 `_DIFFUSION_INTERNAL_FIELDS`；`tests/diffusion/weight_stack/host/`。
+> 范围：`vllm_omni/diffusion/weight_management/host/`；部署标识经过的 `vllm_omni/engine/stage_runtime.py`、`vllm_omni/engine/stage_engine_startup.py`、`vllm_omni/engine/stage_init_utils.py`；`vllm_omni/diffusion/data.py` 的 `OmniDiffusionConfig`，以及 `vllm_omni/config/omni_config.py` 的 `_DIFFUSION_INTERNAL_FIELDS`；`tests/diffusion/weight_management/host/`。
 >
 > 依赖：[子 RFC 01](./01-startup-transaction.md)（`interfaces.py` 的 `HostWeightManager`、`HostStorage`、`Topology`、`RankFingerprints`、`Elections`、`AllGatherGroups`、`StartupContext`；`errors.py` 的错误类型；全组确认第 0、1、2 点的调用顺序；`FaultPlan`；测试替身）；[子 RFC 02](./02-unified-loader.md)（`ExpectedManifest`、`FinalManifest` 的条目和 `digest()`、`live()`；`Loader.write()` 对 meta 目标的空操作；`WriteTracker` 在每个张量写完时调用 `HostStorage.note_written()`；`finalize()` 第 6 步调用一次 `seal()`）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan.host_request()`、`Unit.unit_id`；启动事务持有和关闭 host 存储；按 `MemoryRange` 做内存登记）；[子 RFC 05](./05-configuration.md)（`host_share`、`host_admission` 事件的字段，`observability.record_host_mapping()`；同机共享没有配置项）。
 
@@ -52,7 +52,7 @@ HWM 不需要加速卡，也不调用 `torch.distributed`。它的全部测试�
 #### 2.1 数据类型
 
 ```python
-# vllm_omni/diffusion/weight_stack/host/record.py
+# vllm_omni/diffusion/weight_management/host/record.py
 @dataclass(frozen=True)
 class LocalKey:
     boot_id: str
@@ -190,7 +190,7 @@ deployment_id: str | None = field(default=None, init=False, repr=False, compare=
 - `expected_manifest.entries` 里每个 `ManifestEntry` 的 `name`、`component`、`shape`、`dtype`、`stride`、`nbytes`、`aliases`、`replaced_at_finalize`，以及 `expected_manifest.digest(names)`。
 
 ```python
-# vllm_omni/diffusion/weight_stack/host/layout.py
+# vllm_omni/diffusion/weight_management/host/layout.py
 class HostUnitRequest(Protocol):
     unit_id: str
     component: str
@@ -256,7 +256,7 @@ Unit 补零后的大小 = Σ_g P_g
 ```
 
 - 按元素数取上整等分，与现有 `DistributedLayerwiseOffloadHook._shard_and_pin` 的切分方式一致（`(total_numel + dp_size - 1) // dp_size`）。
-- `flatten_shard_unit(tensors, group_size) -> ShardUnitLayout` 是纯函数，从 `weight_stack.host` 导出，只给出组的划分、组内偏移、`E_g`、`seg_g`、`S_g` 和 `P_g`，不含任何对齐。04 用同一个函数决定块环缓冲区里 AllGather 结果的布局，再按自己的规则把组的起点对齐到 256 字节（04 第 3.8 节）；主机上按页对齐只属于分片后端。两边不各写一份切分规则。
+- `flatten_shard_unit(tensors, group_size) -> ShardUnitLayout` 是纯函数，从 `weight_management.host` 导出，只给出组的划分、组内偏移、`E_g`、`seg_g`、`S_g` 和 `P_g`，不含任何对齐。04 用同一个函数决定块环缓冲区里 AllGather 结果的布局，再按自己的规则把组的起点对齐到 256 字节（04 第 3.8 节）；主机上按页对齐只属于分片后端。两边不各写一份切分规则。
 
 #### 4.4 共享资格
 
@@ -693,7 +693,7 @@ note_written(name)：
 
 ### 14. 启动日志与故障注入点
 
-- HWM 用 logger `vllm_omni.diffusion.weight_stack.host` 输出 05 第 15.2 节的两个事件，事件名和字段按 05 的表：
+- HWM 用 logger `vllm_omni.diffusion.weight_management.host` 输出 05 第 15.2 节的两个事件，事件名和字段按 05 的表：
   - `host_share`：每个有本机部分的组件一条，字段 `component`、`shared`、`reason`、`role`（`writer`、`waiter`、`private`，由 `resolve_roles` 的结果映射）、`writer_pid`、`socket`（`\0` 写成 `@`）。
   - `host_admission`：每台机器一条，字段 `machine`、第 10 节新增占用的每一项、`available_bytes`、`memory_source`。
 - 03 的 PR 先于 05-6 合入，期间用这个 logger 按上面的事件名和字段输出；05-6 把这些调用点改成 `observability.log_event`，并在 `allocate()` 和 `seal()` 返回之前对每个新建的 `Mapping` 调用 `observability.record_host_mapping(mapping)`、在 `HostStorage.close()` 里调用 `forget_host_mapping(mapping)`（05 第 16.2 节）。HWM 不读 host 策略（05 第 7 节）。
@@ -717,7 +717,7 @@ note_written(name)：
 
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
-| `weight_stack.host.create_host_weight_manager(ctx: StartupContext) -> HostWeightManager` | 01 | 由 01 的 `EntryPointFactory` 经 `importlib` 取得。非 Linux 平台报 `StackUnavailableError`。 |
+| `weight_management.host.create_host_weight_manager(ctx: StartupContext) -> HostWeightManager` | 01 | 由 01 的 `EntryPointFactory` 经 `importlib` 取得。非 Linux 平台报 `StackUnavailableError`。 |
 | `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`、`Mapping` | 01、04；05 读 `Mapping.kind` | 字段见设计第 2、4、5、7 节。`LocalRecord`、`ElectionRecord`、`HostDemand` 可以 pickle。`Election.record()`、`Election.close()` 按 01 第 2 节实现，`close()` 可以多次调用。 |
 | `HostWeightManager` 的七个方法 | 01 | `deployment_id()` 按 3.6；`layout()` 只读预期清单的条目（4.1）；`plan_fingerprint` 只依赖配置和并行布局（4.5）；`share_plan()`、`admit()` 是纯函数；`elect()` 每个 rank 都调用，非代表返回空的 `Election`；`allocate()` 成功时接管 `Election`，失败时不接管；超出容量时 `admit()` 报 `HostCapacityError`。 |
 | `HostLayout.bind_groups(groups)` | 01 | 第 1 点之后调用；组的大小或位置与规划的推算不同时报 `GroupConfirmationError`。 |
@@ -739,7 +739,7 @@ note_written(name)：
 新增文件：
 
 ```text
-vllm_omni/diffusion/weight_stack/host/
+vllm_omni/diffusion/weight_management/host/
   __init__.py        导出 create_host_weight_manager 和“本 RFC 提供”表里的类型
   sysapi.py          SysApi：/proc 与 cgroup 根目录、geteuid、memfd_create、madvise
   record.py          LocalKey、LocalRecord、本机键读取、cgroup 定位、可用内存
@@ -754,7 +754,7 @@ vllm_omni/diffusion/weight_stack/host/
   admission.py       admit()
   forksafe.py        进程级登记表和 os.register_at_fork
   manager.py         HostWeightManagerImpl、create_host_weight_manager
-tests/diffusion/weight_stack/host/
+tests/diffusion/weight_management/host/
   conftest.py        假的 /proc 和 cgroup 树、SysApi 替身、多进程夹具
   test_record.py  test_deployment_id.py  test_layout.py  test_share_plan.py
   test_protocol.py  test_election_multiproc.py  test_local_storage.py
@@ -807,7 +807,7 @@ tests/diffusion/weight_stack/host/
 
 ## 测试计划
 
-测试放在 `tests/diffusion/weight_stack/host/`。除特别写明的以外，都是 L1 测试，标记 `core_model`、`diffusion` 和 `cpu`，不需要加速卡，也不调用 `torch.distributed`。多进程测试用 `multiprocessing` 的 spawn 方式启动进程，标记同样是 L1。
+测试放在 `tests/diffusion/weight_management/host/`。除特别写明的以外，都是 L1 测试，标记 `core_model`、`diffusion` 和 `cpu`，不需要加速卡，也不调用 `torch.distributed`。多进程测试用 `multiprocessing` 的 spawn 方式启动进程，标记同样是 L1。
 
 **本机记录**（`test_record.py`）。在 `tmp_path` 里构造假的 `/proc/self/cgroup`、`/proc/self/mountinfo`、cgroup 目录和 `/proc/meminfo`，由 `SysApi` 指向它们：
 

@@ -8,7 +8,7 @@
 
 | 子 RFC | umbrella 的 Job | 范围 | PR | 承担的必改行和分发点 |
 |---|---|---|---|---|
-| [01 启动事务、总开关与共存期](./01-startup-transaction.md) | Job 1 | `weight_stack/` 的接口、错误类型、启动驱动和全组确认；总开关；查询函数的共存；worker 和 runner 的分发；静态依赖测试、冻结白名单和必改清单的登记表 | 01-1 到 01-7 | D01 到 D05 |
+| [01 启动事务、总开关与共存期](./01-startup-transaction.md) | Job 1 | `weight_management/` 的接口、错误类型、启动驱动和全组确认；总开关；查询函数的共存；worker 和 runner 的分发；静态依赖测试、冻结白名单和必改清单的登记表 | 01-1 到 01-7 | D01 到 D05 |
 | [02 统一加载](./02-unified-loader.md) | Job 2（2a 到 2f） | 组件声明、只建结构的构造上下文、规则表、读取器和延迟张量、先分配后写入、收尾、内容身份、适配器融合、动态 LoRA 包装、`load_format="diffusers"`、19 个构造期读张量的家族迁移、查询接口 | 02-1 到 02-18 | C02、C04、C05、C09、C10、C11、C13、C15、C16、C18；D06 |
 | [03 Host 存储](./03-host-storage.md) | Job 3 | HWM 的本机后端和分片后端、部署标识、选举和封存、容量准入、fork 处理 | 03-1 到 03-9 | 无 |
 | [04 统一 Offloader](./04-unified-offloader.md) | Job 4 | 重复块发现、Unit 规划、两种 Trigger、两种 Transport、块环、内存登记和暂存区、守卫、编译设置、缓存签名、睡眠模式 | 04-1 到 04-13 | C01、C03、C06、C07、C08、C12、C14、C17、C19 |
@@ -58,7 +58,7 @@ M1 启动事务与共存期骨架
 
 | PR | 内容 | 依赖 | 大小 | 必改行 |
 |---|---|---|---|---|
-| 01-1 | `weight_stack` 包骨架、数据类型、Protocol、错误类型、`ResourceLedger` | 无 | M | 无 |
+| 01-1 | `weight_management` 包骨架、数据类型、Protocol、错误类型、`ResourceLedger` | 无 | M | 无 |
 | 01-2 | 总开关和进程级状态、传递链、参数解析检查 | 01-1 | S | D01 |
 | 01-3 | 查询函数的共存、`execution_offload_facts` | 01-2 | S | D02 |
 | 01-4 | 全组确认、`Topology`、AllGather 组 | 01-1 | M | 无 |
@@ -213,7 +213,7 @@ M1 启动事务与共存期骨架
 1. 分发点（01）：`DiffusionModelRunner.load_model`、`DiffusionWorker` 的 `re_init_pipeline`、`sleep`、`wake_up` 只保留 `unified` 一支，`__post_init__` 不再调用 `materialize_legacy_offload_flags`，`execution_offload_facts` 只保留读 05 策略的一支；`--diffusion-weight-stack legacy` 在参数解析阶段报 `ConfigError`。这一步之后，`legacy` 的代码都不可达。
 2. 模型侧和加载路径（02、04）：04 删除三个现有后端、`offloader/` 包（包括 `config.py`）、模型里的 offload 专用声明和生命周期代码、按 offload 策略改变行为的分支、SeaCache 按名字读钩子的代码；02 删除每个 `build_component` 的 legacy 一支和 `build_component` 本身、HF 组件入口的 legacy 一支、现有的非 HSDP 加载路径和其中对 Host Weight Runtime 的接入、只服务于 legacy 的 `load_weights` 主体、指纹清单和指纹测试。
 3. 配置（05）：`policy.py` 里的兼容层和它的规则、翻译测试、等价测试；旧字段、它们的命令行参数和校验函数；D20、D21、D22 只保留 `unified` 一支。
-4. 共存期设施（01）：登记表的每一行按 `legacy_removal` 删除 legacy 一支之后，删除这一行和它的位置文件；全部行删除之后，删除 `tests/diffusion/weight_stack/coexistence/`、进程级状态、`is_unified()` 和 `weight_stack.components.is_unified_stack()`；四个冻结白名单清空，T6、T7 删除。
+4. 共存期设施（01）：登记表的每一行按 `legacy_removal` 删除 legacy 一支之后，删除这一行和它的位置文件；全部行删除之后，删除 `tests/diffusion/weight_management/coexistence/`、进程级状态、`is_unified()` 和 `weight_management.components.is_unified_stack()`；四个冻结白名单清空，T6、T7 删除。
 
 每一步的 PR 里，删除一个登记行的 legacy 一支和删除这一行在同一个 PR 里完成，静态依赖测试在每一步之后都通过。
 
@@ -284,8 +284,8 @@ C01 到 C19、D01 到 D05 在 01-7 的 `registry.py` 里；D06、D20、D21、D22
 M1 到 M6 期间，每个 PR 都满足：
 
 - 只改变 `unified` 下的行为；`legacy` 下的行为和已有测试不变；不修改已有测试文件（05-2 给 T5 字段表加入新字段除外，01 允许）。
-- 承担必改行或分发点的 PR 在描述里写明行编号和这一行的 `legacy_removal`，新增 `tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py`，把新增的每个读总开关或构造上下文的位置写进 `SITES`；`legacy` 一支是原来的语句，diff 只显示把它们移进分支；不往冻结的白名单里加条目。
-- 模型代码读总开关只用 `weight_stack.components.is_unified_stack()`；`models/`、`lora/`、`cache/` 里的 `unified` 一支不 import Offloader，不读 offload 和 host 的配置字段，不按名字读钩子，不调用 `OffloadRuntime` 的方法。
+- 承担必改行或分发点的 PR 在描述里写明行编号和这一行的 `legacy_removal`，新增 `tests/diffusion/weight_management/coexistence/sites/<行编号>_<PR 编号>.py`，把新增的每个读总开关或构造上下文的位置写进 `SITES`；`legacy` 一支是原来的语句，diff 只显示把它们移进分支；不往冻结的白名单里加条目。
+- 模型代码读总开关只用 `weight_management.components.is_unified_stack()`；`models/`、`lora/`、`cache/` 里的 `unified` 一支不 import Offloader，不读 offload 和 host 的配置字段，不按名字读钩子，不调用 `OffloadRuntime` 的方法。
 - 共存期间不合入构造期读张量的新 pipeline；新增的 pipeline 按 Z-Image、Kandinsky6 的写法，两个栈共用一份构造代码。
 - legacy 一支的修复按 umbrella“共存期 legacy 修复的同步”一节同步到 unified 一支：改变最终张量的修复由逐张量对比测试发现，不改变最终张量的修复由指纹测试发现，两者都在同一个 PR 里改 unified 一支。
 - 评审按 `docs/contributing/` 里由 01-7 写入的评审清单逐项核对。

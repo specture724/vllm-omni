@@ -2,7 +2,7 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 3、4、8.1、9（第 1、2 步）、11、12 节。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/` 里的 `interfaces.py`、`errors.py`、`group.py`、`startup.py`；总开关经过的配置与参数文件；扩散 worker 与模型运行器的分发；`vllm_omni/diffusion/offloader/config.py` 的查询函数；引擎和执行器读 offload 事实的调用点；`tests/diffusion/weight_stack/` 里的静态依赖测试、冻结白名单和共存期必改清单的登记；`weight_stack/` 的模块文档和 `.github/CODEOWNERS` 规则。
+> 范围：`vllm_omni/diffusion/weight_management/` 里的 `interfaces.py`、`errors.py`、`group.py`、`startup.py`；总开关经过的配置与参数文件；扩散 worker 与模型运行器的分发；`vllm_omni/diffusion/offloader/config.py` 的查询函数；引擎和执行器读 offload 事实的调用点；`tests/diffusion/weight_management/` 里的静态依赖测试、冻结白名单和共存期必改清单的登记；`weight_management/` 的模块文档和 `.github/CODEOWNERS` 规则。
 >
 > 依赖：无前置子 RFC。[子 RFC 02](./02-unified-loader.md)、[子 RFC 03](./03-host-storage.md)、[子 RFC 04](./04-unified-offloader.md)、[子 RFC 05](./05-configuration.md) 依赖本 RFC 定义的接口、错误类型和启动驱动。
 
@@ -11,7 +11,7 @@
 本 RFC 定义新栈的骨架：
 
 - 总开关 `--diffusion-weight-stack {legacy,unified}` 的定义、传递和进程级状态；
-- `vllm_omni/diffusion/weight_stack/` 包的公共接口（`interfaces.py`）和错误类型（`errors.py`）；
+- `vllm_omni/diffusion/weight_management/` 包的公共接口（`interfaces.py`）和错误类型（`errors.py`）；
 - 把 Loader、HWM、Offloader 串起来的启动驱动（`startup.py`），包括状态机、资源账本、所有权的转移和失败时的释放、故障注入点；
 - 副本内多个 rank 的全组确认（`group.py`），即总体设计 4.5 的第 0 点到第 3 点；
 - 扩散 worker 和模型运行器在两个栈之间的分发：加载、关闭、睡眠和唤醒、`custom_pipeline` 的重新初始化；
@@ -58,7 +58,7 @@ vllm_omni/diffusion/data.py          OmniDiffusionConfig                   diffu
 #### 1.2 `startup.py` 里的总开关函数
 
 ```python
-# vllm_omni/diffusion/weight_stack/startup.py
+# vllm_omni/diffusion/weight_management/startup.py
 class WeightStack(str, enum.Enum):
     LEGACY = "legacy"
     UNIFIED = "unified"
@@ -76,7 +76,7 @@ def execution_offload_facts(config: object) -> ExecutionOffloadFacts: ...   # �
 - `startup.py` 在模块级只 import 标准库、`torch`、`interfaces.py` 和 `errors.py`；`group.py`、平台和分布式模块在函数内 import。`data.py`、`offloader/config.py`、引擎和执行器在函数内 import 它，不引入循环 import。
 - 读总开关有两个入口：参数解析、引擎、执行器和 `offloader/config.py` 拿得到配置，用 `is_unified(config)`；构造上下文、读取陷阱和模型代码看进程级状态（总体设计 5.2）。
 - 进程级状态由 `DiffusionWorker.__init__` 设置，位置在 `init_device()` 之后、构造 model runner 之前，放在 `__init__` 已有的 `try` 块里；`try` 块的 `except` 一支调用的 `shutdown()` 和正常关闭时的 `DiffusionWorker.shutdown` 都清除它。状态记录取值和持有它的 worker 集合，最后一个持有者清除之后回到未设置。同一个进程里已经有一个存活的 worker 持有另一个取值时，`set_process_weight_stack` 报 `ConfigError`，报错写明两个 stage 的编号和取值。单进程执行器把几个 stage 的 worker 放在同一个进程里时，这些 stage 必须使用同一个取值。
-- 模型代码只经 `weight_stack.components.is_unified_stack()` 读总开关（02 提供，返回 `process_weight_stack() is WeightStack.UNIFIED`），只在共存期必改清单登记的位置读（9.3、9.4）。
+- 模型代码只经 `weight_management.components.is_unified_stack()` 读总开关（02 提供，返回 `process_weight_stack() is WeightStack.UNIFIED`），只在共存期必改清单登记的位置读（9.3、9.4）。
 
 #### 1.3 参数解析阶段的检查
 
@@ -97,7 +97,7 @@ def execution_offload_facts(config: object) -> ExecutionOffloadFacts: ...   # �
 `interfaces.py` 只依赖标准库和 `torch`。其他子 RFC 拥有的数据类型只在 `if TYPE_CHECKING:` 里引用，运行期不 import。
 
 ```python
-# vllm_omni/diffusion/weight_stack/interfaces.py
+# vllm_omni/diffusion/weight_management/interfaces.py
 from __future__ import annotations
 
 import enum
@@ -113,14 +113,14 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from vllm.config import VllmConfig
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.weight_stack.components import ComponentCatalog                     # 02
-    from vllm_omni.diffusion.weight_stack.loader import ExpectedManifest, FinalManifest, Preflight  # 02
-    from vllm_omni.diffusion.weight_stack.host import (                                         # 03
+    from vllm_omni.diffusion.weight_management.components import ComponentCatalog                     # 02
+    from vllm_omni.diffusion.weight_management.loader import ExpectedManifest, FinalManifest, Preflight  # 02
+    from vllm_omni.diffusion.weight_management.host import (                                         # 03
         Election, ElectionRecord, HostLayout, LocalRecord, MemoryRange, SharePlan,
     )
-    from vllm_omni.diffusion.weight_stack.offload import PlacementPlan, Unit                     # 04
-    from vllm_omni.diffusion.weight_stack.policy import OffloadPolicy                            # 05
-    from vllm_omni.diffusion.weight_stack.startup import FaultPlan                               # 01
+    from vllm_omni.diffusion.weight_management.offload import PlacementPlan, Unit                     # 04
+    from vllm_omni.diffusion.weight_management.policy import OffloadPolicy                            # 05
+    from vllm_omni.diffusion.weight_management.startup import FaultPlan                               # 01
 
 
 class LoadState(enum.Enum):
@@ -413,7 +413,7 @@ AllGather 进程组按成员和后端记在进程级的表里。同一个进程�
 启动事务和 `OffloadRuntime` 把持有的每个资源登记在 `startup.py` 的 `ResourceLedger` 里。账本的关闭顺序就是总体设计 7.5 的关闭顺序：
 
 ```python
-# vllm_omni/diffusion/weight_stack/startup.py
+# vllm_omni/diffusion/weight_management/startup.py
 class ResourceKind(enum.IntEnum):    # 关闭时按数值从小到大
     EXECUTION = 1                    # 停止接受新的执行
     INFLIGHT = 2                     # 等加速卡上的拷贝和集合通信做完
@@ -443,14 +443,14 @@ class ResourceLedger:
 #### 6.1 入口
 
 ```python
-# vllm_omni/diffusion/weight_stack/startup.py
+# vllm_omni/diffusion/weight_management/startup.py
 class StackFactory(Protocol):
     def create(self, ctx: StartupContext) -> tuple[Loader, HostWeightManager, Offloader]: ...
 
 class EntryPointFactory:          # 默认工厂
-    LOADER = "vllm_omni.diffusion.weight_stack.loader:create_loader"
-    HOST = "vllm_omni.diffusion.weight_stack.host:create_host_weight_manager"
-    OFFLOADER = "vllm_omni.diffusion.weight_stack.offload:create_offloader"
+    LOADER = "vllm_omni.diffusion.weight_management.loader:create_loader"
+    HOST = "vllm_omni.diffusion.weight_management.host:create_host_weight_manager"
+    OFFLOADER = "vllm_omni.diffusion.weight_management.offload:create_offloader"
 
 class WeightStackHandle:
     state: LoadState
@@ -686,7 +686,7 @@ def exchange(self, point, message):
 #### 7.2 各个确认点
 
 ```python
-# vllm_omni/diffusion/weight_stack/group.py
+# vllm_omni/diffusion/weight_management/group.py
 @dataclass(frozen=True)
 class Point0Payload:
     record: LocalRecord                      # HostWeightManager.local_record()
@@ -863,7 +863,7 @@ WorkerWrapperBase.__init__（uses_custom_pipeline 为真），或者经 collecti
 `unified` 下查询函数报告“不做 offload”，这些调用点如果继续读查询函数，DP 下 `allgather` 需要的同步执行就会关掉（总体设计 6.4 的约束）。它们改读 `startup.execution_offload_facts(config)`。`ExecutionOffloadFacts` 是跨模块的数据类型，放在 `interfaces.py`：
 
 ```python
-# vllm_omni/diffusion/weight_stack/interfaces.py
+# vllm_omni/diffusion/weight_management/interfaces.py
 @dataclass(frozen=True)
 class ExecutionOffloadFacts:
     weight_collectives: bool        # 有 allgather 的 Unit，各 DP rank 必须以相同顺序执行相同的块
@@ -880,7 +880,7 @@ class ExecutionOffloadFacts:
 - 调用点上 DP 大小、请求数等其余条件不变，只把读查询函数的那一项换成对应的字段。`legacy` 下每个字段与原表达式逐项相同，引擎和执行器的行为不变。
 - `unified` 下的取值只读策略，不读规划：引擎和执行器所在的进程没有规划结果。策略选了某个组件、而模型里没有这个组件时，字段可能为真而实际没有 `allgather` 的 Unit，这时 DP 下多做的同步执行不影响正确性。
 - 在 05 的策略解析合入主干之前，`unified` 不接受 offload 配置（1.3），三个字段都为假。
-- `execution_offload_facts` 放在 `weight_stack/startup.py`，`legacy` 一支在函数内 import `offloader/config.py`，`unified` 一支在函数内 import `weight_stack.policy`。删除 `legacy` 时只删 `legacy` 一支，函数保留。
+- `execution_offload_facts` 放在 `weight_management/startup.py`，`legacy` 一支在函数内 import `offloader/config.py`，`unified` 一支在函数内 import `weight_management.policy`。删除 `legacy` 时只删 `legacy` 一支，函数保留。
 
 #### 9.3 共存期必改清单的规则
 
@@ -889,7 +889,7 @@ class ExecutionOffloadFacts:
 1. 清单里的每一项只改变 `unified` 下的行为。`legacy` 一支是原来的语句，原样移进分支，执行路径、参数和调用顺序不变。
 2. 每一项和启用对应策略的 Job 一起改，由表里写明的子 RFC 承担。
 3. 改动不修改已有测试文件。新增的测试覆盖 `unified` 一支，已有测试在 `legacy` 下全部通过。
-4. 模型代码只经 `weight_stack.components.is_unified_stack()` 读总开关，或者经 02 的构造上下文判断是否在只建结构的上下文里。PR 新增一个位置文件，登记这些位置（9.4）。
+4. 模型代码只经 `weight_management.components.is_unified_stack()` 读总开关，或者经 02 的构造上下文判断是否在只建结构的上下文里。PR 新增一个位置文件，登记这些位置（9.4）。
 5. 按总开关或构造上下文分出的 legacy 一支随 `legacy` 在 Job 6 删除。
 
 承担方：
@@ -933,14 +933,14 @@ C01 到 C19 是 umbrella RFC Job 1 共存期必改清单的各行，按原顺序
 登记表放在测试目录里，分成冻结的行表和每个 PR 新增的位置文件：
 
 ```text
-tests/diffusion/weight_stack/coexistence/
+tests/diffusion/weight_management/coexistence/
   __init__.py
   registry.py                   行表 ROWS 和四个冻结白名单（第 11 节），由 01-7 建立
   sites/<行编号>_<PR 编号>.py    每个必改 PR 新增一个，PR 编号里的连字符写成下划线
 ```
 
 ```python
-# tests/diffusion/weight_stack/coexistence/registry.py
+# tests/diffusion/weight_management/coexistence/registry.py
 @dataclass(frozen=True)
 class CoexistenceRow:
     row_id: str                  # "C01" 到 "C19"、"D01" 到 "D05"，或者其他子 RFC 用 NEW_ROW 声明的 "D06" 起的编号
@@ -950,7 +950,7 @@ class CoexistenceRow:
 
 ROWS: tuple[CoexistenceRow, ...]
 
-# tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py
+# tests/diffusion/weight_management/coexistence/sites/<行编号>_<PR 编号>.py
 ROW: str                                  # ROWS 里的一个 row_id，或者本文件 NEW_ROW 的 row_id
 PR: str                                   # 合入的 PR 编号
 SITES: tuple[str, ...]                    # 这个 PR 新增的读总开关或构造上下文的位置，写成 "<相对路径>::<限定名>"
@@ -961,7 +961,7 @@ NEW_ROW: CoexistenceRow | None = None     # 其他子 RFC 自己的分发点在�
 - 02、03、04、05 自己的分发点（例如 02 在 `models/utils.py` 的分发点）不在 `ROWS` 里，由承担它的 PR 在位置文件里用 `NEW_ROW` 声明，`ROW` 等于 `NEW_ROW.row_id`。`NEW_ROW` 的编号不能与 `ROWS` 和其他位置文件的 `NEW_ROW` 重复。
 - 位置文件不以 `test_` 开头，pytest 不收集它们；静态测试（第 11 节 T6）按路径加载 `sites/` 下的全部文件。
 - 每个位置文件的 `ROW` 必须在 `ROWS` 里或者等于本文件 `NEW_ROW` 的编号，`PR` 不为空；`SITES` 里的每个位置必须存在，即文件存在并且限定名能在这个文件的语法树里找到。一个 PR 没有新增读总开关的位置时，`SITES` 为空，文件照样新增，用来记录这一行已由这个 PR 完成。
-- T6 在 `vllm_omni/` 里找出 `weight_stack/`、`model_loader/construct.py`、`model_loader/hub_prefetch.py` 以外每个读总开关或构造上下文的位置，每个位置必须出现在某个位置文件的 `SITES` 里。一行拆成多个 PR 时有多个位置文件。
+- T6 在 `vllm_omni/` 里找出 `weight_management/`、`model_loader/construct.py`、`model_loader/hub_prefetch.py` 以外每个读总开关或构造上下文的位置，每个位置必须出现在某个位置文件的 `SITES` 里。一行拆成多个 PR 时有多个位置文件。
 - 测试在日志里输出每一行的状态：有哪些位置文件、对应哪些 PR。默认值翻转为 `unified` 之前，`ROWS` 里的每一行都至少有一个位置文件。
 - `ROWS`、各个 `NEW_ROW` 和位置文件就是 Job 6 删除 legacy 一支的清单：每个 `SITES` 位置只保留 `unified` 一支，按 `legacy_removal` 删除其余语句，然后删除这一行和它的位置文件。
 
@@ -970,7 +970,7 @@ NEW_ROW: CoexistenceRow | None = None     # 其他子 RFC 自己的分发点在�
 - PR 描述写明登记表的行编号和这一行的 `legacy_removal`。
 - `legacy` 一支是原来的语句，diff 只显示把它们移进分支。
 - 没有修改已有测试文件，包括 `registry.py`；新增的测试覆盖 `unified` 一支。
-- 模型代码读总开关只用 `weight_stack.components.is_unified_stack()`，不读 `od_config.diffusion_weight_stack`，不 import `weight_stack` 里 `components` 以外的模块。
+- 模型代码读总开关只用 `weight_management.components.is_unified_stack()`，不读 `od_config.diffusion_weight_stack`，不 import `weight_management` 里 `components` 以外的模块。
 - PR 新增了 `sites/<行编号>_<PR 编号>.py`，新增的每个读总开关或构造上下文的位置都写进了它的 `SITES`。
 - 模型代码（`models/`、`lora/`、`cache/`）里的 `unified` 一支不 import Offloader，不读 offload 或 host 的配置字段，不按名字读钩子，不调用 `OffloadRuntime` 的方法。
 - 没有往冻结的白名单里加条目。
@@ -998,19 +998,19 @@ commit              point3_commit     compile_setup     close
 
 | 编号 | 检查 | 范围和规则 |
 |---|---|---|
-| T1 | `weight_stack` 内部的 import 方向 | 用 AST 扫描运行期 import，包括函数内的 import，跳过 `if TYPE_CHECKING:` 的块。`weight_stack/` 里的任何模块都不 import `vllm_omni.host_weight_runtime`（总体设计 1.2）。`weight_stack/` 里只有 `startup.py` 的 `execution_offload_facts` 可以 import `vllm_omni.diffusion.offloader`，而且只在函数内 import `vllm_omni.diffusion.offloader.config`。`loader/` 不 import `host/`、`offload/`。`offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors` 和 `vllm.model_executor.model_loader`。`host/` 不 import `loader/`、`offload/` 和 `vllm_omni.diffusion.model_loader`。`policy.py` 不 import `loader/`、`host/`、`offload/`。`observability.py`（05）只 import 标准库和 `weight_stack.errors`，`loader/`、`host/`、`offload/`、`policy.py` 都可以 import 它。`interfaces.py`、`errors.py` 只 import 标准库、`torch` 和 `weight_stack.errors`。`group.py`、`startup.py` 不 import `loader/`、`host/`、`offload/`：三个工厂函数由 `EntryPointFactory` 经 `importlib` 按名字取得；`execution_offload_facts` 的 `unified` 一支在函数内 import `weight_stack.policy`。 |
-| T2 | 运行期的模块图 | 在子进程里以 `import vllm_omni` 之后已加载的模块为基线，分别 import `weight_stack.loader`、`weight_stack.host`、`weight_stack.offload`，只看新增的模块：不出现 T1 禁止的模块。 |
-| T3 | 模型代码对新栈和 Offloader 的 import | `models/`、`lora/`、`cache/` 只能 import 新栈里的 `model_loader.construct`、`model_loader.hub_prefetch` 和 `weight_stack.components`，`if TYPE_CHECKING:` 里的 import 同样计入。import `vllm_omni.diffusion.offloader`（任何子模块，绝对或相对写法）的文件必须在冻结白名单 `OFFLOADER_IMPORT_ALLOWLIST` 里：现有的 28 个模型文件和 `lora/manager.py`。 |
+| T1 | `weight_management` 内部的 import 方向 | 用 AST 扫描运行期 import，包括函数内的 import，跳过 `if TYPE_CHECKING:` 的块。`weight_management/` 里的任何模块都不 import `vllm_omni.host_weight_runtime`（总体设计 1.2）。`weight_management/` 里只有 `startup.py` 的 `execution_offload_facts` 可以 import `vllm_omni.diffusion.offloader`，而且只在函数内 import `vllm_omni.diffusion.offloader.config`。`loader/` 不 import `host/`、`offload/`。`offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors` 和 `vllm.model_executor.model_loader`。`host/` 不 import `loader/`、`offload/` 和 `vllm_omni.diffusion.model_loader`。`policy.py` 不 import `loader/`、`host/`、`offload/`。`observability.py`（05）只 import 标准库和 `weight_management.errors`，`loader/`、`host/`、`offload/`、`policy.py` 都可以 import 它。`interfaces.py`、`errors.py` 只 import 标准库、`torch` 和 `weight_management.errors`。`group.py`、`startup.py` 不 import `loader/`、`host/`、`offload/`：三个工厂函数由 `EntryPointFactory` 经 `importlib` 按名字取得；`execution_offload_facts` 的 `unified` 一支在函数内 import `weight_management.policy`。 |
+| T2 | 运行期的模块图 | 在子进程里以 `import vllm_omni` 之后已加载的模块为基线，分别 import `weight_management.loader`、`weight_management.host`、`weight_management.offload`，只看新增的模块：不出现 T1 禁止的模块。 |
+| T3 | 模型代码对新栈和 Offloader 的 import | `models/`、`lora/`、`cache/` 只能 import 新栈里的 `model_loader.construct`、`model_loader.hub_prefetch` 和 `weight_management.components`，`if TYPE_CHECKING:` 里的 import 同样计入。import `vllm_omni.diffusion.offloader`（任何子模块，绝对或相对写法）的文件必须在冻结白名单 `OFFLOADER_IMPORT_ALLOWLIST` 里：现有的 28 个模型文件和 `lora/manager.py`。 |
 | T4 | 按字符串名读 offload 钩子 | `models/`、`lora/`、`cache/` 里等于某个 offload 钩子名的字符串常量，只允许出现在冻结白名单 `HOOK_NAME_ALLOWLIST` 里：`cache/seacache/hook.py`。钩子名从 `SequentialOffloadHook`、`LayerwiseOffloadHook`、`DistributedLayerwiseOffloadHook` 的 `_HOOK_NAME` 和 04 导出的 `HOOK_NAMES` 读取。 |
 | T5 | 直接读 offload 和 host 配置字段 | `models/`、`lora/`、`cache/` 里对 `enable_cpu_offload`、`enable_layerwise_offload`、`enable_distributed_layerwise_offload`、`dlo_use_allgather`、`dlo_resident_layers`、`dlo_host_registration_limit_gib`、`diffusion_offload_config`、`pin_cpu_memory`、`host_weight_runtime_mode`、`host_weight_runtime_root`、`diffusion_weight_stack` 以及 05 新增字段的属性访问和 `getattr` 字符串读取，只允许出现在冻结白名单 `CONFIG_FIELD_ALLOWLIST` 里：`models/diffusers_adapter/pipeline_diffusers_adapter.py`、`models/joy_image/pipeline_joy_image_edit.py`、`models/magi2/pipeline_magi2.py`、`models/minimax_h3/pipeline_minimax_h3.py`。`diffusion_weight_stack` 不在任何白名单里。 |
-| T6 | 读总开关的位置 | `vllm_omni/` 里 `weight_stack/`、`model_loader/construct.py`、`model_loader/hub_prefetch.py` 以外，每个调用 `is_unified_stack`、`is_unified`、`process_weight_stack` 和 02 的构造上下文判断函数的位置，都必须出现在登记表某个位置文件的 `SITES` 里（9.4）。模型代码里只能调用 `is_unified_stack` 和构造上下文判断函数。直接读 `diffusion_weight_stack` 字段只允许出现在 1.1 列出的五个配置传递文件、`weight_stack/startup.py` 和 `DiffusionWorker.__init__` 里：前者只声明和传递这个字段，后两者只用它判断和设置总开关。 |
-| T7 | 模型以外对查询函数的调用 | `offloader/`、`models/`、`lora/`、`cache/` 以外，调用 9.1 表里的查询函数的位置必须在冻结白名单 `QUERY_CALLER_ALLOWLIST` 里：`OmniDiffusionConfig.__post_init__`、`DiffusionModelRunner.load_model`、`DiffusionModelRunner._execute_request_list`、`DiffusersPipelineLoader.load_model`、`weight_stack/startup.py` 的 `execution_offload_facts`。白名单按 01-3 合入之后的状态冻结，那时引擎和执行器已经改读 `execution_offload_facts`。新的非模型调用方必须读 `execution_offload_facts`。 |
+| T6 | 读总开关的位置 | `vllm_omni/` 里 `weight_management/`、`model_loader/construct.py`、`model_loader/hub_prefetch.py` 以外，每个调用 `is_unified_stack`、`is_unified`、`process_weight_stack` 和 02 的构造上下文判断函数的位置，都必须出现在登记表某个位置文件的 `SITES` 里（9.4）。模型代码里只能调用 `is_unified_stack` 和构造上下文判断函数。直接读 `diffusion_weight_stack` 字段只允许出现在 1.1 列出的五个配置传递文件、`weight_management/startup.py` 和 `DiffusionWorker.__init__` 里：前者只声明和传递这个字段，后两者只用它判断和设置总开关。 |
+| T7 | 模型以外对查询函数的调用 | `offloader/`、`models/`、`lora/`、`cache/` 以外，调用 9.1 表里的查询函数的位置必须在冻结白名单 `QUERY_CALLER_ALLOWLIST` 里：`OmniDiffusionConfig.__post_init__`、`DiffusionModelRunner.load_model`、`DiffusionModelRunner._execute_request_list`、`DiffusersPipelineLoader.load_model`、`weight_management/startup.py` 的 `execution_offload_facts`。白名单按 01-3 合入之后的状态冻结，那时引擎和执行器已经改读 `execution_offload_facts`。新的非模型调用方必须读 `execution_offload_facts`。 |
 | T8 | 白名单冻结 | 测试文件里记录四个白名单排序后内容的 sha256。白名单的内容变化时测试失败。 |
 
-- 四个白名单放在 `tests/diffusion/weight_stack/coexistence/registry.py` 里，T8 的摘要写在 `test_static_dependencies.py` 里。检查的规则是“实际出现的位置是白名单的子集”：白名单里的文件不再 import 时测试照样通过，必改 PR 不需要修改测试文件。
+- 四个白名单放在 `tests/diffusion/weight_management/coexistence/registry.py` 里，T8 的摘要写在 `test_static_dependencies.py` 里。检查的规则是“实际出现的位置是白名单的子集”：白名单里的文件不再 import 时测试照样通过，必改 PR 不需要修改测试文件。
 - T3 到 T5 的白名单写成相对 `vllm_omni/diffusion/` 的文件路径，T7 的白名单写成“<相对路径>::<限定名>”。
 - 冻结白名单只在 Job 6 删除 `legacy` 时清空，同时删除 T8 的摘要。
-- `.github/CODEOWNERS` 的源码规则由 `docs/design/module/` 下模块文档的前置元数据生成。01-7 新增 `docs/design/module/diffusion/weight_stack.md`，`primary_code_paths` 是 `vllm_omni/diffusion/weight_stack/**`，`validation_paths` 是 `tests/diffusion/weight_stack/**`，再生成 `CODEOWNERS` 里对应的规则；`tests/diffusion/weight_stack/coexistence/` 另加一条规则，登记表和白名单的改动由 weight-stack 的负责人评审。
+- `.github/CODEOWNERS` 的源码规则由 `docs/design/module/` 下模块文档的前置元数据生成。01-7 新增 `docs/design/module/diffusion/weight_management.md`，`primary_code_paths` 是 `vllm_omni/diffusion/weight_management/**`，`validation_paths` 是 `tests/diffusion/weight_management/**`，再生成 `CODEOWNERS` 里对应的规则；`tests/diffusion/weight_management/coexistence/` 另加一条规则，登记表和白名单的改动由 weight-stack 的负责人评审。
 
 ### 12. 不变量的落实
 
@@ -1038,7 +1038,7 @@ commit              point3_commit     compile_setup     close
 - `--diffusion-weight-stack unified` 可以在参数解析阶段选中。配置里有 offload 设置时，参数解析阶段报 `ConfigError`（1.3）。
 - 不做 offload 的配置在 `unified` 下进入启动驱动。02、03、04 的工厂函数还不存在时，每个 rank 在第 1 步报 `StackUnavailableError`，在第 0 点一起失败，报错写明缺少的模块并提示 `use --diffusion-weight-stack legacy`。驱动不退回 `legacy`。
 - `load_format` 为 `dummy` 时 `unified` 与 `legacy` 相同，直接返回；之后的 `re_init_pipeline` 在 `unified` 下走驱动，同样在第 1 步报错。
-- 启动驱动、确认点、资源账本、释放顺序、worker 的关闭、睡眠和唤醒、重新初始化，都由 `tests/diffusion/weight_stack/fakes.py` 里的测试替身沿“不做 offload”这条路径覆盖：替身的规划让所有 Unit 常驻加速卡，host 存储为空，提交返回的运行时只登记一个加速卡槽位。
+- 启动驱动、确认点、资源账本、释放顺序、worker 的关闭、睡眠和唤醒、重新初始化，都由 `tests/diffusion/weight_management/fakes.py` 里的测试替身沿“不做 offload”这条路径覆盖：替身的规划让所有 Unit 常驻加速卡，host 存储为空，提交返回的运行时只登记一个加速卡槽位。
 - 查询函数在 `unified` 下报告“不做 offload”，引擎和执行器改读 `execution_offload_facts`。
 - 静态依赖测试、冻结白名单和登记表生效，之后每个 `unified` 分支都受它们约束。
 
@@ -1051,27 +1051,27 @@ commit              point3_commit     compile_setup     close
 | `interfaces.py` 的数据类型和 Protocol | 02、03、04、05 使用。 | 各实现按第 2 节的签名和规范实现，不在 Protocol 之外互相调用。总体设计 4.1 列出的方法签名不变，其余方法是本 RFC 为驱动增加的。 |
 | `errors.py` 的错误类型和报错格式 | 02、03、04、05 使用。 | 各模块按第 3 节的表选择类型；不是 `WeightStackError` 的异常由驱动按步骤包装。 |
 | `startup.py` 的 `ResourceKind`、`ResourceLedger` | 04 使用。 | 启动事务和 `OffloadRuntime` 把每个资源登记在账本里，提交时用 `transfer()` 移交，叠加层槽位用 `hand_over()` 移出。 |
-| `startup.py` 的 `WeightStack`、`is_unified()`、`process_weight_stack()` | 02 和 05 使用。 | `weight_stack.components.is_unified_stack()` 返回 `process_weight_stack() is WeightStack.UNIFIED`；构造上下文和读取陷阱的分发读进程级状态；参数解析阶段用 `is_unified(config)`。 |
+| `startup.py` 的 `WeightStack`、`is_unified()`、`process_weight_stack()` | 02 和 05 使用。 | `weight_management.components.is_unified_stack()` 返回 `process_weight_stack() is WeightStack.UNIFIED`；构造上下文和读取陷阱的分发读进程级状态；参数解析阶段用 `is_unified(config)`。 |
 | `startup.execution_offload_facts` | 引擎和执行器使用，05 提供 `unified` 下的取值。 | `unified` 一支读 05 的策略。 |
 | `startup.py` 的驱动、`StartupContext`、`EntryPointFactory`、`FaultPlan` | 02、03、04 使用。 | 三个工厂函数各自接收 `StartupContext`；模块内部的故障注入点使用同一个 `FaultPlan`。 |
 | `group.py` 的 `AllGatherGroups` | 03、04 使用。 | 第 1 点之后经 `bind_groups()` 交给 `HostLayout` 和 `PlacementPlan`。 |
 | `MemoryPools` | 02、04 使用。 | 驱动不进入任何睡眠池。02 在 `weights()` 里分配常驻加速卡的张量，包括收尾里新建的；04 在 `prepare_materialization()` 里于 `slots()` 分配块环缓冲区和分片槽位，于 `weights()` 分配叠加层槽位、搬到执行设备的非持久 buffer 和 `allgather` Unit 的 order 张量（04 第 5.8 节）。 |
-| 登记表 `tests/diffusion/weight_stack/coexistence/` | 02、03、04、05 使用。 | 承担必改行或自己分发点的 PR 在 `sites/` 下新增位置文件，自己的分发点用 `NEW_ROW` 声明；不修改 `registry.py` 和白名单。 |
-| 测试替身 `tests/diffusion/weight_stack/fakes.py` | 02、03、04 使用。 | 各自的测试用替身替换另外两个模块，经 `run_unified_startup(ctx, factory)` 走完整的启动流程。替身的 host 存储实现 `note_written()`，什么都不做。 |
+| 登记表 `tests/diffusion/weight_management/coexistence/` | 02、03、04、05 使用。 | 承担必改行或自己分发点的 PR 在 `sites/` 下新增位置文件，自己的分发点用 `NEW_ROW` 声明；不修改 `registry.py` 和白名单。 |
+| 测试替身 `tests/diffusion/weight_management/fakes.py` | 02、03、04 使用。 | 各自的测试用替身替换另外两个模块，经 `run_unified_startup(ctx, factory)` 走完整的启动流程。替身的 host 存储实现 `note_written()`，什么都不做。 |
 
 ### 本 RFC 依赖的约定
 
 | 子 RFC | 约定 |
 |---|---|
-| [02](./02-unified-loader.md) | `vllm_omni.diffusion.weight_stack.loader` 导出 `create_loader(ctx: StartupContext) -> Loader`，以及 `Preflight`（含 `content_identities: Mapping[str, str]` 和 `expected_manifest`）、`ExpectedManifest`、`FinalManifest`。`vllm_omni.diffusion.weight_stack.components` 导出 `ComponentCatalog` 和 `is_unified_stack()`。组件声明在 `Loader.close()` 之后仍然可以查询。Loader 自己在 `ctx.memory_pools.weights()` 里分配常驻加速卡的张量。`Loader.finalize()` 在第 6 步调用 `storage.seal()`，在此之前完成收尾里的全部集合通信。`model_loader/construct.py` 的 `is_building_structure()` 是构造上下文的判断函数，模型代码对它的调用按 T6 登记。02 承担 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。 |
-| [03](./03-host-storage.md) | `vllm_omni.diffusion.weight_stack.host` 导出 `create_host_weight_manager(ctx: StartupContext) -> HostWeightManager`，以及 `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`。`LocalRecord` 和 `ElectionRecord` 可以 pickle。`HostWeightManager.deployment_id()` 按第 2 节的规范实现。`elect()` 在每个 rank 上都可以调用，非代表返回空的 `Election`。`Election.close()`、`HostStorage.close()` 可以多次调用。`allocate()` 成功时接管 `Election`，失败时不接管。`HostStorage.connect_writer()` 在第 2 点之后由驱动调用。`HostLayout.plan_fingerprint` 只依赖配置和并行布局。03 给 `OmniDiffusionConfig` 增加 `init=False` 的 `deployment_id` 字段，没有下发时为 `None`。 |
-| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_stack.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17、C19，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`；C19 让 worker 扩展类的方法经过 `execution()`。 |
-| [05](./05-configuration.md) | `vllm_omni.diffusion.weight_stack.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把 `startup_policy()` 的结果填进 `StartupContext.policy`。05-6 提供 `observability.bind_context()` 和 `log_startup_summary()`，由 runner 在 8.1 写明的位置调用，并在 03、04 的代码里加入日志和字节登记的调用（05 第 15、16 节）。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
+| [02](./02-unified-loader.md) | `vllm_omni.diffusion.weight_management.loader` 导出 `create_loader(ctx: StartupContext) -> Loader`，以及 `Preflight`（含 `content_identities: Mapping[str, str]` 和 `expected_manifest`）、`ExpectedManifest`、`FinalManifest`。`vllm_omni.diffusion.weight_management.components` 导出 `ComponentCatalog` 和 `is_unified_stack()`。组件声明在 `Loader.close()` 之后仍然可以查询。Loader 自己在 `ctx.memory_pools.weights()` 里分配常驻加速卡的张量。`Loader.finalize()` 在第 6 步调用 `storage.seal()`，在此之前完成收尾里的全部集合通信。`model_loader/construct.py` 的 `is_building_structure()` 是构造上下文的判断函数，模型代码对它的调用按 T6 登记。02 承担 C02、C04、C05、C09、C10、C11、C13、C15、C16、C18。 |
+| [03](./03-host-storage.md) | `vllm_omni.diffusion.weight_management.host` 导出 `create_host_weight_manager(ctx: StartupContext) -> HostWeightManager`，以及 `LocalRecord`、`SharePlan`、`Election`、`ElectionRecord`、`HostLayout`、`MemoryRange`。`LocalRecord` 和 `ElectionRecord` 可以 pickle。`HostWeightManager.deployment_id()` 按第 2 节的规范实现。`elect()` 在每个 rank 上都可以调用，非代表返回空的 `Election`。`Election.close()`、`HostStorage.close()` 可以多次调用。`allocate()` 成功时接管 `Election`，失败时不接管。`HostStorage.connect_writer()` 在第 2 点之后由驱动调用。`HostLayout.plan_fingerprint` 只依赖配置和并行布局。03 给 `OmniDiffusionConfig` 增加 `init=False` 的 `deployment_id` 字段，没有下发时为 `None`。 |
+| [04](./04-unified-offloader.md) | `vllm_omni.diffusion.weight_management.offload` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`。`PlacementPlan.collective_signature()` 只含有 `allgather` Unit 的组件；`PlacementPlan.unmatched_policy_keys()` 返回 05 的 `resolve_selection()` 在本 rank 上没有匹配的、`if_absent` 为 `error` 的键。`prepare_materialization()` 失败时不接管 `storage`；`commit()` 失败时资源全部留在启动事务里。`plan()` 收到的 `policy` 为 `None` 时按不做 offload 规划。启动事务和运行时用 `ResourceLedger`。04 实现 `setup_compile()`、`grad_mode()`、`execution()`、`before_sleep()`、`after_wake()`，并承担 C01、C03、C06、C07、C08、C12、C14、C17、C19，其中 C17 把 runner 前向的梯度模式改读 `grad_mode()`，同一个 PR 让前向经过 `execution()`；C19 让 worker 扩展类的方法经过 `execution()`。 |
+| [05](./05-configuration.md) | `vllm_omni.diffusion.weight_management.policy` 提供 `unified` 下在 `OmniDiffusionConfig.__post_init__` 里调用的解析入口，取代 1.3 的检查，并在解析时完成总体设计 8.5 的组合检查。`unified` 下 `diffusion_compile_granularity="full"` 与 offload 的冲突由 05 按策略检查，与 legacy 现有的检查等价。05 的策略对象提供 9.2 表里三个字段的取值，runner 把 `startup_policy()` 的结果填进 `StartupContext.policy`。05-6 提供 `observability.bind_context()` 和 `log_startup_summary()`，由 runner 在 8.1 写明的位置调用，并在 03、04 的代码里加入日志和字节登记的调用（05 第 15、16 节）。05 的 PR 把新增的配置字段加进 T5 的字段表（`test_static_dependencies.py`）；字段表是检查规则，不是冻结白名单，不受 T8 约束。 |
 
 ## 代码组织
 
 ```text
-vllm_omni/diffusion/weight_stack/
+vllm_omni/diffusion/weight_management/
   __init__.py            01  只导出 LoadState、WeightStack 和错误类型
   interfaces.py          01  数据类型和 Protocol（第 2 节），ExecutionOffloadFacts
   errors.py              01  错误类型（第 3 节）
@@ -1085,7 +1085,7 @@ vllm_omni/diffusion/weight_stack/
   policy.py              05
   observability.py       05
 
-tests/diffusion/weight_stack/
+tests/diffusion/weight_management/
   __init__.py
   fakes.py                         测试替身：Loader、HWM、Offloader、启动事务、运行时
   test_switch.py
@@ -1106,7 +1106,7 @@ tests/diffusion/weight_stack/
     registry.py                    行表和四个冻结白名单（9.4、第 11 节）
     sites/                         每个必改 PR 新增的位置文件；01-7 新增 D01 到 D05 的位置文件
 
-docs/design/module/diffusion/weight_stack.md     模块文档，前置元数据生成 CODEOWNERS 的规则
+docs/design/module/diffusion/weight_management.md     模块文档，前置元数据生成 CODEOWNERS 的规则
 docs/contributing/                                必改 PR 的评审清单（9.5）
 ```
 
@@ -1121,9 +1121,9 @@ docs/contributing/                                必改 PR 的评审清单（9.
 | `vllm_omni/diffusion/data.py` | `OmniDiffusionConfig` 增加字段和校验，`unified` 下跳过 `materialize_legacy_offload_flags` 并做 1.3 的检查；`CuMemTag` 增加 `WEIGHT_SLOTS`。 |
 | `vllm_omni/diffusion/offloader/config.py` | 查询函数的 `unified` 分支（9.1）。 |
 | `vllm_omni/diffusion/diffusion_engine.py`、`vllm_omni/diffusion/executor/multiproc_executor.py`、`vllm_omni/diffusion/executor/ray_executor.py` | 9.2 列出的调用点改读 `execution_offload_facts`。 |
-| `vllm_omni/diffusion/worker/diffusion_model_runner.py` | `load_model` 的分支和 `memory_pools` 参数、`_load_model_unified`、`_install_runtime_services`、`close_weight_stack`、`weight_stack` 属性。 |
+| `vllm_omni/diffusion/worker/diffusion_model_runner.py` | `load_model` 的分支和 `memory_pools` 参数、`_load_model_unified`、`_install_runtime_services`、`close_weight_stack`、`weight_management` 属性。 |
 | `vllm_omni/diffusion/worker/diffusion_worker.py` | 进程级状态的设置和清除、睡眠池、`shutdown`、`sleep`、`wake_up`、`re_init_pipeline` 的 `unified` 分支。 |
-| `.github/CODEOWNERS` | 由 `weight_stack.md` 的前置元数据生成 `weight_stack/` 的规则，另加 `tests/diffusion/weight_stack/coexistence/` 的规则。 |
+| `.github/CODEOWNERS` | 由 `weight_management.md` 的前置元数据生成 `weight_management/` 的规则，另加 `tests/diffusion/weight_management/coexistence/` 的规则。 |
 
 `OmniDiffusionConfig.deployment_id` 由 03 增加，本 RFC 不改它；`HostWeightManager.deployment_id()` 读它。
 
@@ -1133,13 +1133,13 @@ docs/contributing/                                必改 PR 的评审清单（9.
 
 | PR | 内容 | 文件 | 测试 | 依赖 | 大小 | 必改行 |
 |---|---|---|---|---|---|---|
-| 01-1 | `weight_stack` 包骨架；数据类型、Protocol、错误类型、`ResourceKind` 和 `ResourceLedger`。这个 PR 不改变任何已有行为。 | `weight_stack/__init__.py`、`interfaces.py`、`errors.py`、`startup.py`（只含账本） | `test_interfaces.py`、`test_errors.py`、`test_resources.py` | 不依赖其他 PR。 | 大小为 M。 | 不承担必改行。 |
+| 01-1 | `weight_management` 包骨架；数据类型、Protocol、错误类型、`ResourceKind` 和 `ResourceLedger`。这个 PR 不改变任何已有行为。 | `weight_management/__init__.py`、`interfaces.py`、`errors.py`、`startup.py`（只含账本） | `test_interfaces.py`、`test_errors.py`、`test_resources.py` | 不依赖其他 PR。 | 大小为 M。 | 不承担必改行。 |
 | 01-2 | 总开关：`WeightStack` 和进程级状态，1.1 的传递链，1.3 的参数解析检查，`DiffusionWorker.__init__` 和 `shutdown` 里进程级状态的设置和清除。 | `startup.py`、`serve.py`、`arg_utils.py`、`stage_config.py`、`omni_config.py`、`data.py`、`diffusion_worker.py` | `test_switch.py` | 依赖 01-1。 | 大小为 S。 | 承担 D01。 |
 | 01-3 | 查询函数的共存：`offloader/config.py` 的 `unified` 分支，`ExecutionOffloadFacts` 和 `execution_offload_facts`，引擎和执行器的调用点。 | `offloader/config.py`、`interfaces.py`、`startup.py`、`diffusion_engine.py`、`multiproc_executor.py`、`ray_executor.py` | `test_offload_query_coexistence.py`、`test_execution_facts.py` | 依赖 01-2。 | 大小为 S。 | 承担 D02。 |
 | 01-4 | 全组确认：确认点的协议和超时、`Topology` 的组装、部署标识的核对、坐标的读取、AllGather 组的计算、创建、复用和进程级表。 | `group.py` | `test_group.py`、`test_group_multiproc.py` | 依赖 01-1。 | 大小为 M。 | 不承担必改行。 |
-| 01-5 | 启动驱动：`run_unified_startup`、`EntryPointFactory`、`WeightStackHandle`、状态机、所有权链和释放、`FaultPlan`；测试替身和全部故障注入测试。 | `startup.py`、`tests/diffusion/weight_stack/fakes.py` | `test_startup.py`、`test_startup_faults.py`，以及 `test_group_multiproc.py` 里经驱动的用例 | 依赖 01-1 和 01-4。 | 大小为 L。 | 不承担必改行。 |
+| 01-5 | 启动驱动：`run_unified_startup`、`EntryPointFactory`、`WeightStackHandle`、状态机、所有权链和释放、`FaultPlan`；测试替身和全部故障注入测试。 | `startup.py`、`tests/diffusion/weight_management/fakes.py` | `test_startup.py`、`test_startup_faults.py`，以及 `test_group_multiproc.py` 里经驱动的用例 | 依赖 01-1 和 01-4。 | 大小为 L。 | 不承担必改行。 |
 | 01-6 | worker 和 runner 的分发：`load_model` 的分支和 `memory_pools` 参数、`_load_model_unified`、`_install_runtime_services`、`close_weight_stack`、睡眠池和 `CuMemTag.WEIGHT_SLOTS`、`shutdown`、`sleep`、`wake_up`、`re_init_pipeline`。 | `diffusion_model_runner.py`、`diffusion_worker.py`、`data.py` | `test_worker_dispatch.py`、`test_worker_sleep_pools.py` | 依赖 01-2 和 01-5。 | 大小为 M。 | 承担 D03、D04、D05。 |
-| 01-7 | 静态依赖测试 T1 到 T8，登记表 `registry.py` 和 D01 到 D05 的位置文件，四个冻结白名单，模块文档和 `CODEOWNERS`，写进 `docs/contributing/` 的评审清单。 | `tests/diffusion/weight_stack/coexistence/`、`docs/design/module/diffusion/weight_stack.md`、`.github/CODEOWNERS`、`docs/contributing/` | `test_static_dependencies.py` | 依赖 01-3 和 01-6。 | 大小为 M。 | 登记 D01 到 D05 的位置。 |
+| 01-7 | 静态依赖测试 T1 到 T8，登记表 `registry.py` 和 D01 到 D05 的位置文件，四个冻结白名单，模块文档和 `CODEOWNERS`，写进 `docs/contributing/` 的评审清单。 | `tests/diffusion/weight_management/coexistence/`、`docs/design/module/diffusion/weight_management.md`、`.github/CODEOWNERS`、`docs/contributing/` | `test_static_dependencies.py` | 依赖 01-3 和 01-6。 | 大小为 M。 | 登记 D01 到 D05 的位置。 |
 
 - 本 RFC 的 PR 不承担共存期必改清单的 C 行，只承担自己的分发点 D01 到 D05。每个 PR 只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变。
 - 01-2、01-3、01-6 的分发点在 01-7 建立登记表之前合入，01-7 合入时为它们新增位置文件，T6 从这时起生效。
@@ -1147,7 +1147,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 
 ## 测试计划
 
-测试放在 `tests/diffusion/weight_stack/`。除特别写明的以外，都是 L1 测试，标记 `core_model`、`diffusion` 和 `cpu`，不需要加速卡。
+测试放在 `tests/diffusion/weight_management/`。除特别写明的以外，都是 L1 测试，标记 `core_model`、`diffusion` 和 `cpu`，不需要加速卡。
 
 **总开关**（`test_switch.py`）
 
@@ -1242,7 +1242,7 @@ docs/contributing/                                必改 PR 的评审清单（9.
 - `execution_offload_facts` 只保留读 05 策略的一支。
 - `OmniDiffusionConfig.__post_init__` 不再调用 `materialize_legacy_offload_flags`。
 - `DiffusionModelRunner.load_model` 只保留 `unified` 一支，删除 `offload_backend` 属性和对 `enable_offload_backend`、`DiffusersPipelineLoader` 的调用。`DiffusionWorker.shutdown` 删除对 `offload_backend.shutdown()` 的调用；`re_init_pipeline`、`sleep`、`wake_up` 只保留 `unified` 一支。加载不再经 `_maybe_get_memory_pool_context` 进入 `weights` 池，由 8.2 的睡眠池取代；`kv_cache` 池照旧经它进入。
-- 登记表的每一行按 `legacy_removal` 删除 legacy 一支之后，从 `ROWS` 里删除这一行和它的位置文件；`NEW_ROW` 声明的行随它的位置文件一起删除。全部行删除之后，删除 `tests/diffusion/weight_stack/coexistence/`、`startup.py` 的进程级状态和 `is_unified()`，以及 `weight_stack.components.is_unified_stack()`。
+- 登记表的每一行按 `legacy_removal` 删除 legacy 一支之后，从 `ROWS` 里删除这一行和它的位置文件；`NEW_ROW` 声明的行随它的位置文件一起删除。全部行删除之后，删除 `tests/diffusion/weight_management/coexistence/`、`startup.py` 的进程级状态和 `is_unified()`，以及 `weight_management.components.is_unified_stack()`。
 - 四个冻结白名单清空，T8 的摘要删除。T6 随总开关的读取一起删除，T7 随 `offloader/config.py` 一起删除。T1 到 T5 的规则保留：模型代码不 import Offloader，不按名字读钩子，不读 offload 和 host 的配置字段；T4 只从 04 的 `HOOK_NAMES` 读钩子名。
 - `--diffusion-weight-stack legacy` 在参数解析阶段报 `ConfigError`，说明 `legacy` 已删除；`unified` 仍被接受，不起作用。
 

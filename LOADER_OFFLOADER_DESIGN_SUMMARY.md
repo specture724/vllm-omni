@@ -1,5 +1,7 @@
 # Loader / Offloader / HWM 设计摘要
 
+> 包名修订（2026-11-10）：永久模块路径为 `vllm_omni/diffusion/weight_management/`，保留在 `diffusion` 下。本次仅统一包名及代码、测试、工具和文档路径；总开关、配置字段、类型与函数名、指标键和故障注入环境变量沿用本文原有约定，职责、依赖和上线门槛不变。
+
 > 本文给出结论。机制和约束见 [总体设计](./LOADER_OFFLOADER_DESIGN.md)，RFC 正文见 [umbrella RFC](./rfcs/00-umbrella.md)。
 >
 > 范围：vllm-omni 的扩散加载代码（`vllm_omni/diffusion/model_loader/`、`vllm_omni/diffusion/offloader/`），以及下发部署标识要经过的编排代码。

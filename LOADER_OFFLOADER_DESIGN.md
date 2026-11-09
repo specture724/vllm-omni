@@ -1,5 +1,7 @@
 # Loader / Offloader / HWM 重构总体设计
 
+> 包名修订（2026-11-10）：永久模块路径为 `vllm_omni/diffusion/weight_management/`，保留在 `diffusion` 下。本次仅统一包名及代码、测试、工具和文档路径；总开关、配置字段、类型与函数名、指标键和故障注入环境变量沿用本文原有约定，职责、依赖和上线门槛不变。
+
 > 范围：vllm-omni 的扩散加载代码（`vllm_omni/diffusion/model_loader/`、`vllm_omni/diffusion/offloader/`），以及下发部署标识要经过的编排代码（`vllm_omni/engine/stage_runtime.py`、`stage_engine_startup.py`、`stage_init_utils.py`，`vllm_omni/diffusion/data.py`）。
 >
 > 基线：upstream `main@726b21a5e`。关联：#6648、#6414、#7204。

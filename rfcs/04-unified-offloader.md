@@ -2,7 +2,7 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 7 节（7.1～7.8），以及 4.1～4.5 里 Offloader 的步骤、8.5 和 8.6 里归规划和 `prepare_materialization()` 的校验、9.3、第 10 节的加速卡部分、第 11 节、第 12 节第 9、11、12、13、14、15 条。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/offload/`；`vllm_omni/diffusion/compile.py`；`vllm_omni/platforms/` 的内存登记接口；`vllm_omni/diffusion/cache/exact_projection_cache.py`；`vllm_omni/diffusion/worker/diffusion_model_runner.py` 的前向梯度模式和执行作用域；共存期必改清单里由本 RFC 承担的 C01、C03、C06、C07、C08、C12、C14、C17、C19 所在的文件。
+> 范围：`vllm_omni/diffusion/weight_management/offload/`；`vllm_omni/diffusion/compile.py`；`vllm_omni/platforms/` 的内存登记接口；`vllm_omni/diffusion/cache/exact_projection_cache.py`；`vllm_omni/diffusion/worker/diffusion_model_runner.py` 的前向梯度模式和执行作用域；共存期必改清单里由本 RFC 承担的 C01、C03、C06、C07、C08、C12、C14、C17、C19 所在的文件。
 >
 > 依赖：[子 RFC 01](./01-startup-transaction.md)（`interfaces.py` 的 `Offloader`、`LoadTransaction`、`OffloadRuntime`、`Topology`、`RankCoordinates`、`AllGatherGroups`、`StartupContext`、`MemoryPools`；`errors.py`；`ResourceKind`、`ResourceLedger`、`FaultPlan`；第 1 点的 `Point1Payload.unmatched_policy_keys`；登记表和测试替身）；[子 RFC 02](./02-unified-loader.md)（`ComponentCatalog` 及其 `declaration_order`、`require_complete()` 和三个写方法、`CatalogEntry`、`TensorDecl`、`OverlaySlotDecl`、`TransientNeed`、`ShardGroupSpec`、`FinalManifest`、查询接口 `component_paths`、`repeated_block_paths`、`fully_resident`、`catalog`、`execution_device`、`is_unified_stack`、`weight_generation`，以及“本 RFC 依赖的约定”里要求 02 提供的 `pipeline_of(catalog)`）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view`、`ranges`、`close`，`MemoryRange`、`Mapping`、`HostRequest` 协议、`flatten_shard_unit`、`LocalRecord.machine` 和 `available_bytes`）；[子 RFC 05](./05-configuration.md)（`OffloadPolicy`、`HostPolicy`、`resolve_selection`、`ComponentRef`、`Selection`、启动日志事件和 `record_device_resources`）。
 
@@ -28,7 +28,7 @@ umbrella RFC 的“背景与问题”已经说明总体问题，这里只列本 
 
 ### 1. 模块与入口
 
-`weight_stack/offload/__init__.py` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`，由 01 的 `EntryPointFactory` 按名字取用。`UnifiedOffloader` 实现 01 第 2 节的 `Offloader` 协议，对象本身不持有资源。
+`weight_management/offload/__init__.py` 导出 `create_offloader(ctx: StartupContext) -> Offloader`、`PlacementPlan`、`Unit` 和 `HOOK_NAMES`，由 01 的 `EntryPointFactory` 按名字取用。`UnifiedOffloader` 实现 01 第 2 节的 `Offloader` 协议，对象本身不持有资源。
 
 ```text
 启动步骤（总体设计 4.2）  调用                                                      结束时的状态
@@ -44,15 +44,15 @@ umbrella RFC 的“背景与问题”已经说明总体问题，这里只列本 
 
 依赖规则（01 的 T1、T2 检查）：
 
-- `offload/` 运行期只 import `weight_stack.interfaces`、`weight_stack.errors`、`weight_stack.startup`（`ResourceKind`、`ResourceLedger`、`FaultPlan`）、`weight_stack.components`（02 的数据类型和查询接口）、`weight_stack.policy`（`resolve_selection`、`ComponentRef`，只在 `plan()` 的函数体里 import）、`weight_stack.observability`（05-6 合入之后，第 9 节）、`weight_stack.host` 的 `flatten_shard_unit`、`vllm_omni.diffusion.hooks`、`vllm_omni.diffusion.compile`、`vllm_omni.platforms`。`MemoryRange`、`Mapping`、`HostRequest`、`OffloadPolicy`、`Selection` 只在 `if TYPE_CHECKING:` 里引用，运行期只读它们的属性。
+- `offload/` 运行期只 import `weight_management.interfaces`、`weight_management.errors`、`weight_management.startup`（`ResourceKind`、`ResourceLedger`、`FaultPlan`）、`weight_management.components`（02 的数据类型和查询接口）、`weight_management.policy`（`resolve_selection`、`ComponentRef`，只在 `plan()` 的函数体里 import）、`weight_management.observability`（05-6 合入之后，第 9 节）、`weight_management.host` 的 `flatten_shard_unit`、`vllm_omni.diffusion.hooks`、`vllm_omni.diffusion.compile`、`vllm_omni.platforms`。`MemoryRange`、`Mapping`、`HostRequest`、`OffloadPolicy`、`Selection` 只在 `if TYPE_CHECKING:` 里引用，运行期只读它们的属性。
 - `offload/` 不 import `loader/`、`vllm_omni.diffusion.model_loader`、`safetensors`、`vllm.model_executor.model_loader`、`vllm_omni.diffusion.offloader`，也不 import `vllm_omni.diffusion.cache`：写入代数的绑定按方法名识别缓存对象（6.4）。
-- import `weight_stack.host` 的 `flatten_shard_unit` 符合总体设计 3.2：第 1 条只约束 Loader 对 HWM 和 Offloader 的 import，第 2 条只禁止 Offloader import Loader 和 safetensors 读取器，第 3 条约束的是 HWM 的职责；01 的 T1 只禁止 `host/` 反向 import `offload/`，依赖方向无环。03 第 4.3 节规定 `flatten_shard_unit` 从 `weight_stack.host` 导出，是分片布局规则的唯一实现，所以这个函数不挪到别的模块。`host/` 不 import `safetensors`（03 第 4.2 节自己生成和解析头部），T2 对 `weight_stack.offload` 的运行期模块图检查会发现违例。
+- import `weight_management.host` 的 `flatten_shard_unit` 符合总体设计 3.2：第 1 条只约束 Loader 对 HWM 和 Offloader 的 import，第 2 条只禁止 Offloader import Loader 和 safetensors 读取器，第 3 条约束的是 HWM 的职责；01 的 T1 只禁止 `host/` 反向 import `offload/`，依赖方向无环。03 第 4.3 节规定 `flatten_shard_unit` 从 `weight_management.host` 导出，是分片布局规则的唯一实现，所以这个函数不挪到别的模块。`host/` 不 import `safetensors`（03 第 4.2 节自己生成和解析头部），T2 对 `weight_management.offload` 的运行期模块图检查会发现违例。
 - Offloader 不调用模型的任何加载后钩子（总体设计 3.2 第 2 条）。
 
 ### 2. 数据结构
 
 ```python
-# vllm_omni/diffusion/weight_stack/offload/plan.py
+# vllm_omni/diffusion/weight_management/offload/plan.py
 class UnitKind(enum.Enum):
     MODULE = "module"              # 整组件
     BLOCK = "block"                # 一个流式的重复块
@@ -281,7 +281,7 @@ shard_slot_bytes = 全部 allgather Unit 在分片槽位里的占用的最大值
 
 - 组件的 `fully_resident` 为真，当且仅当它不由 HSDP 管理、规划之后没有任何 Unit（总体设计 7.8）。只装触发钩子的组件仍然可以是 `fully_resident`。被 HSDP 管理的组件为假（02 第 13 节）。
 - `registration_order`：`BLOCK` 和 `GROUP` Unit 按组件的规划顺序和 `order`，然后 `RESIDENT_LAYERS`，然后 `MODULE` 和 `REMAINDER`，后两类内部按 `unit_id` 排序（总体设计 7.4）。
-- `describe()` 产生 05 第 15.2 节的 `component_plan`（每个组件一条；`backend` 按 05 的取值写 `local`、`shard` 或 `none`，`cold_path` 写 `thin`、`full_then_trim` 或 `none`）、`component_skipped`、`unit_resident` 事件，由 04 的 logger `vllm_omni.diffusion.weight_stack.offload` 在规划之后输出。
+- `describe()` 产生 05 第 15.2 节的 `component_plan`（每个组件一条；`backend` 按 05 的取值写 `local`、`shard` 或 `none`，`cold_path` 写 `thin`、`full_then_trim` 或 `none`）、`component_skipped`、`unit_resident` 事件，由 04 的 logger `vllm_omni.diffusion.weight_management.offload` 在规划之后输出。
 
 ### 4. 启动事务
 
@@ -378,7 +378,7 @@ resident_bytes + 非持久 buffer + overlay_bytes + ring_bytes + shard_slot_byte
 钩子经 `vllm_omni/diffusion/hooks/base.py` 的 `HookRegistry` 安装：`HookRegistry.get_or_create(module)` 第一次调用时把 `module.forward` 换成分发器 `_WrappedForward`，原来的 `forward` 存在 `module._omni_original_forward`；`register_hook(name, hook)` 登记钩子，`remove_hook(name)` 撤掉。不用 `register_forward_hook`。
 
 ```python
-# vllm_omni/diffusion/weight_stack/offload/hooks.py
+# vllm_omni/diffusion/weight_management/offload/hooks.py
 HOOK_NAMES: frozenset[str] = frozenset({"_weight_stack_ring", "_weight_stack_use", "_weight_stack_trigger"})
 ```
 
@@ -498,7 +498,7 @@ commit() 第 2 步：
 #### 5.6 单次执行、梯度模式与异常
 
 ```python
-# vllm_omni/diffusion/weight_stack/offload/runtime.py
+# vllm_omni/diffusion/weight_management/offload/runtime.py
 class UnifiedOffloadRuntime:   # 实现 01 的 OffloadRuntime
     def grad_mode(self) -> AbstractContextManager[None]: ...   # 有块环 Unit 时 torch.no_grad()，否则 torch.inference_mode()
     def execution(self) -> AbstractContextManager[None]: ...
@@ -603,7 +603,7 @@ def compile_callable(fn: Callable[..., Any], *, reads: Sequence[nn.Module], **co
 - `regionally_compile(model, ...)` 的 `unified` 一支：参数经 `resolve_compile_mode([model], ...)` 处理；目标是驻留表里落在 `model` 子树内的块；编译每个块的方式与 `legacy` 一支相同（有 `HookRegistry` 时编译 `_omni_original_forward` 并更新钩子的 `fn_ref`）；没有目标时记同样的 WARNING 并返回。`legacy` 一支原样保留。
 - `compile_module_forward(module, ...)`：`unified` 下参数经 `resolve_compile_mode([module], ...)`，模块有 `HookRegistry` 时编译 `_omni_original_forward`，钩子留在编译图之外；`legacy` 下执行 `module.forward = torch.compile(module.forward, **compile_kwargs)`。
 - `compile_callable(fn, reads=...)`：`legacy` 下返回 `torch.compile(fn, **compile_kwargs)`；`unified` 下返回一个包装，第一次调用时按 `reads` 解析模式并编译，此后直接调用编译结果。第一次调用总在提交之后。
-- `unified` 下，`regionally_compile`、`compile_module_forward` 在调用时、`compile_callable` 的包装在第一次调用时解析模式；这时驻留表为空（提交之前）报 `LifecycleError`。`compile_callable` 本身在构造函数里调用也不报错，它不读驻留表。这些函数经 `is_unified_stack()` 读总开关，位置登记在 C12 的位置文件里。`compile.py` 只在函数体里 import `weight_stack.components` 和 `weight_stack.errors`。
+- `unified` 下，`regionally_compile`、`compile_module_forward` 在调用时、`compile_callable` 的包装在第一次调用时解析模式；这时驻留表为空（提交之前）报 `LifecycleError`。`compile_callable` 本身在构造函数里调用也不报错，它不读驻留表。这些函数经 `is_unified_stack()` 读总开关，位置登记在 C12 的位置文件里。`compile.py` 只在函数体里 import `weight_management.components` 和 `weight_management.errors`。
 
 #### 6.4 以权重为键的缓存
 
@@ -640,7 +640,7 @@ def host_range_is_pinned(cls, address: int) -> bool: ...         # 默认 False
 
 ### 8. 共存期必改行
 
-每一行只改变 `unified` 下的行为，`legacy` 一支是原来的语句、原样移进分支，`legacy` 下的行为和已有测试不变（01 第 9.3 节）。模型代码只经 `weight_stack.components.is_unified_stack()` 读总开关，每个 PR 新增 `tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py`。
+每一行只改变 `unified` 下的行为，`legacy` 一支是原来的语句、原样移进分支，`legacy` 下的行为和已有测试不变（01 第 9.3 节）。模型代码只经 `weight_management.components.is_unified_stack()` 读总开关，每个 PR 新增 `tests/diffusion/weight_management/coexistence/sites/<行编号>_<PR 编号>.py`。
 
 | 行 | 位置 | `unified` 下的改动 | PR |
 |---|---|---|---|
@@ -667,7 +667,7 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 ### 9. 故障注入点与启动日志
 
 - 本 RFC 在模块内部增加的注入点，命名规则和 `FaultPlan` 与 01 第 10 节相同：名字以 `offload_` 开头：`offload_prepare_slots`（4.1 第 4 步之前）、`offload_commit_register`（4.3 第 2 步之前）、`offload_commit_hooks`（4.3 第 7 步之前）、`offload_runtime_load`（5.3 的装入之前）、`offload_runtime_gather`（5.4 发起拼接之前）。`offload_runtime_*` 的 `raise` 让这次 `execution()` 走异常退出。
-- 启动日志的事件名和字段按 05 第 15.2 节：`component_plan`、`component_skipped`、`unit_resident`、`unit_transfer`、`fully_resident`。05-6 合入之前，事件用 logger `vllm_omni.diffusion.weight_stack.offload` 按同样的事件名和字段输出；`record_device_resources` 的调用由 05-6 加进 `commit()` 的第 8 步和 `close()` 的最后一步之后（05 第 16.2 节）。
+- 启动日志的事件名和字段按 05 第 15.2 节：`component_plan`、`component_skipped`、`unit_resident`、`unit_transfer`、`fully_resident`。05-6 合入之前，事件用 logger `vllm_omni.diffusion.weight_management.offload` 按同样的事件名和字段输出；`record_device_resources` 的调用由 05-6 加进 `commit()` 的第 8 步和 `close()` 的最后一步之后（05 第 16.2 节）。
 
 ## 与其他子 RFC 的接口
 
@@ -675,7 +675,7 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
-| `weight_stack.offload.create_offloader(ctx)`、`PlacementPlan`、`Unit`、`HOOK_NAMES` | 01 | 第 1、2 节；`HOOK_NAMES` 供 01 的 T4。 |
+| `weight_management.offload.create_offloader(ctx)`、`PlacementPlan`、`Unit`、`HOOK_NAMES` | 01 | 第 1、2 节；`HOOK_NAMES` 供 01 的 T4。 |
 | `PlacementPlan.collective_signature()`、`unmatched_policy_keys()`、`bind_groups(groups)` | 01 | 第 2 节；`bind_groups` 组大小或位置不符时报 `GroupConfirmationError`。 |
 | `PlacementPlan.host_request()`、`Unit.unit_id` | 03 | 03 第 4.1 节的结构；Unit 划分不依赖 `LocalRecord` 的 pid、可用内存和空闲显存。 |
 | `PlacementPlan.cold_start(component)`、`sharded_tensor_names()`、`placement(name)`、`units`，以及 `Unit.roots`、`Unit.transport` | 02 | 预检核对冷启动路径；收尾第 7 步换占位；瘦路径的读取器按 `units` 里 `allgather` Unit 的规划顺序产出（02 第 7.2 节）。 |
@@ -691,7 +691,7 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 | 子 RFC | 约定 |
 |---|---|
 | [01](./01-startup-transaction.md) | 第 2 节的 Protocol 和数据类型；`ResourceLedger` 的 `register`、`hand_over`、`transfer`、`close`；驱动在第 1 点调用 `collective_signature()`、`unmatched_policy_keys()` 和 `bind_groups()`，在第 12 步调用 `setup_compile()`；`MemoryPools.slots()` 对应 `weight_slots` 池；worker 在睡眠前后调用 `before_sleep()`、`after_wake()`；`StartupContext.policy` 为 `None` 表示不做 offload；`StartupContext.faults`；05-3 合入之前 `unified` 下的 offload 配置在参数解析阶段被拒绝。 |
-| [02](./02-unified-loader.md) | `ComponentCatalog` 的字段和三个写方法；`require_complete()` 报 `PlanningError`（归属违例和保持 fp32 的层配了量化）；`TensorDecl.module` 是包装前的规范路径、解析得到包装层；`ComponentCatalog.declaration_order` 给出组件的声明顺序（02 第 2.7 节），`resolve_selection()` 的 `refs` 和常驻层计数用它，`entries` 只用于查找；`weight_stack.components.pipeline_of(catalog) -> nn.Module` 返回以这个目录登记的 pipeline 对象，`plan()` 用它读模块树（读 02 第 2.8 节的进程级弱引用表），这个函数由 02-1 提供；`FinalManifest.live()` 给出规范张量和别名对象；`repeated_block_paths` 返回 `set_discovered_blocks()` 的记录；`fully_resident`、`component_paths`、`catalog`、`weight_generation` 的语义按 02 第 2.8 节；动态 LoRA 管理器从包装层取槽位，只用 `copy_` 写入，每次写入后调用 `bump_weight_generation`。 |
+| [02](./02-unified-loader.md) | `ComponentCatalog` 的字段和三个写方法；`require_complete()` 报 `PlanningError`（归属违例和保持 fp32 的层配了量化）；`TensorDecl.module` 是包装前的规范路径、解析得到包装层；`ComponentCatalog.declaration_order` 给出组件的声明顺序（02 第 2.7 节），`resolve_selection()` 的 `refs` 和常驻层计数用它，`entries` 只用于查找；`weight_management.components.pipeline_of(catalog) -> nn.Module` 返回以这个目录登记的 pipeline 对象，`plan()` 用它读模块树（读 02 第 2.8 节的进程级弱引用表），这个函数由 02-1 提供；`FinalManifest.live()` 给出规范张量和别名对象；`repeated_block_paths` 返回 `set_discovered_blocks()` 的记录；`fully_resident`、`component_paths`、`catalog`、`weight_generation` 的语义按 02 第 2.8 节；动态 LoRA 管理器从包装层取槽位，只用 `copy_` 写入，每次写入后调用 `bump_weight_generation`。 |
 | [03](./03-host-storage.md) | `HostRequest` 的结构（03 第 4.1 节），`cold_start` 为 `thin` 的组件没有 `replaced_at_finalize` 的条目；`HostStorage.note_written()` 由 Loader 调用，04 不调用；先全量后裁剪的组件在 `seal()` 里按 `flatten_shard_unit` 重新布局，`commit()` 按最终清单重建块环和分片槽位的视图（4.3）；`view()` 对等待者的共享张量和瘦路径的范围外张量返回 meta 张量；`ranges(unit)` 在 `seal()` 之后有效，本机部分按地址合并相邻的张量、一个文件里可以有几段，分片部分每个类型组一段（03 第 7.6 节）；`MemoryRange.read_only` 与 `Mapping.kind` 一致；`flatten_shard_unit(tensors, group_size)` 接受带 `name`、`dtype`、`nbytes` 属性的对象，给出每个类型组的元素数、段长和组内偏移；`storage.close()` 可以多次调用。 |
 | [05](./05-configuration.md) | `resolve_selection(policy, refs, *, pipeline)` 按 `declaration_order` 的 `refs` 调用，报 L02 到 L05，`Selection.unmatched` 按本 rank 判断；`HostPolicy.pin_cpu_memory` 和 `registration_limit_bytes`；P15 到 P18 和 P29 在参数解析阶段拒绝 `module` 配 `allgather`、`resident_layers` 大于 0 配 `allgather`、`units` 配 `module`、`units` 配 `resident_layers` 大于 0、全量编译配 offload；第 15.2 节的启动日志事件；05-6 在 `commit()` 末尾和 `OffloadRuntime.close()` 之后加入 `record_device_resources` 的调用（05 第 16.2 节）。 |
 
@@ -700,7 +700,7 @@ C12 的各个位置。只持有组件模块、没有 pipeline 引用的对象，
 新增文件：
 
 ```text
-vllm_omni/diffusion/weight_stack/offload/
+vllm_omni/diffusion/weight_management/offload/
   __init__.py          create_offloader、PlacementPlan、Unit、HOOK_NAMES
   plan.py              第 2 节的数据类型和 PlacementPlan 的方法
   discovery.py         重复块发现（3.4）
@@ -716,7 +716,7 @@ vllm_omni/diffusion/weight_stack/offload/
   runtime.py           UnifiedOffloadRuntime（5.6～5.8）
   compile_setup.py     setup_compile（6.2）
 vllm_omni/platforms/cuda/host_registration.py
-tests/diffusion/weight_stack/offload/
+tests/diffusion/weight_management/offload/
   conftest.py          合成模块树、HostStorage 替身、注入的选择函数
   test_plan_none.py  test_discovery.py  test_discovery_expectations.py  test_planner.py
   test_layout_device.py  test_collective_signature.py  test_transaction.py  test_registration.py
@@ -726,7 +726,7 @@ tests/diffusion/weight_stack/offload/
   expectations/discovery.yaml
 ```
 
-`UnifiedOffloader(ctx, *, select=None)` 的 `select` 默认在 `plan()` 里、`policy` 不为 `None` 时从 `weight_stack.policy` 取 `resolve_selection`。05-3 合入之前，`unified` 下的 offload 配置在参数解析阶段被拒绝（01 第 1.3 节），生产路径上 `policy` 总是 `None`；本 RFC 的测试传入 `conftest.py` 里按 05 第 11 节字段写的选择函数替身，所以本 RFC 的 PR 不依赖 05 的 PR。
+`UnifiedOffloader(ctx, *, select=None)` 的 `select` 默认在 `plan()` 里、`policy` 不为 `None` 时从 `weight_management.policy` 取 `resolve_selection`。05-3 合入之前，`unified` 下的 offload 配置在参数解析阶段被拒绝（01 第 1.3 节），生产路径上 `policy` 总是 `None`；本 RFC 的测试传入 `conftest.py` 里按 05 第 11 节字段写的选择函数替身，所以本 RFC 的 PR 不依赖 05 的 PR。
 
 修改的文件：
 

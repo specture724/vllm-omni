@@ -2,7 +2,7 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 8.2 到 8.7 节、第 10 节、第 13 节，以及 umbrella RFC 的“配置”“可观测性”两节。本 RFC 取代 #7204。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/policy.py`、`vllm_omni/diffusion/weight_stack/observability.py`；配置传递链上的 `vllm_omni/entrypoints/cli/serve.py`、`vllm_omni/engine/arg_utils.py`、`vllm_omni/config/stage_config.py`、`vllm_omni/config/omni_config.py`、`vllm_omni/diffusion/data.py`；指标链上的 `vllm_omni/diffusion/worker/diffusion_worker.py`、`vllm_omni/diffusion/stage_diffusion_proc.py`、`vllm_omni/diffusion/inline_stage_diffusion_client.py`、`vllm_omni/engine/orchestrator.py`、`vllm_omni/metrics/`；`recipes/`、`docs/`。
+> 范围：`vllm_omni/diffusion/weight_management/policy.py`、`vllm_omni/diffusion/weight_management/observability.py`；配置传递链上的 `vllm_omni/entrypoints/cli/serve.py`、`vllm_omni/engine/arg_utils.py`、`vllm_omni/config/stage_config.py`、`vllm_omni/config/omni_config.py`、`vllm_omni/diffusion/data.py`；指标链上的 `vllm_omni/diffusion/worker/diffusion_worker.py`、`vllm_omni/diffusion/stage_diffusion_proc.py`、`vllm_omni/diffusion/inline_stage_diffusion_client.py`、`vllm_omni/engine/orchestrator.py`、`vllm_omni/metrics/`；`recipes/`、`docs/`。
 >
 > 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关 `is_unified()`、`ConfigError` 等错误类型和报错格式、`ExecutionOffloadFacts` 和 `execution_offload_facts`、`StartupContext.policy`、全组确认第 1 点的 `Point1Payload.unmatched_policy_keys`、登记表和静态测试 T1、T5、T6）；[子 RFC 02](./02-unified-loader.md)（组件目录的组件名、角色、`hsdp_managed` 和 `declaration_order`，`DynamicLoraSpec`，支持矩阵测试 `test_structure_matrix.py` 的结果，`meta_materialized`、`write_transient_peak` 事件的调用点）；[子 RFC 03](./03-host-storage.md)（`Mapping.kind`、`host_share` 和 `host_admission` 事件的调用点）；[子 RFC 04](./04-unified-offloader.md)（`plan()` 经本 RFC 的 `resolve_selection()` 读取策略，`PlacementPlan.unmatched_policy_keys()`，内存登记、暂存区和加速卡槽位的字节数）。
 
@@ -75,7 +75,7 @@ vllm_omni/diffusion/data.py          OmniDiffusionConfig                   同�
 #### 2.1 数据类型
 
 ```python
-# vllm_omni/diffusion/weight_stack/policy.py
+# vllm_omni/diffusion/weight_management/policy.py
 SELECTABLE_ROLES: tuple[str, ...] = ("dit", "text_encoder", "image_encoder", "audio_encoder", "vae")
 ALL_ROLES: tuple[str, ...] = SELECTABLE_ROLES + ("other",)
 
@@ -293,7 +293,7 @@ def startup_policy(config: OmniDiffusionConfig, *, log: bool) -> OffloadPolicy |
 
 - `mode` 和 `components` 必填；`components` 只能取 `dit`、`text_encoder`；`layer_options` 的键必须是选中的组件，只在 `mode` 为 `layer` 时允许；`resident_layers` 只允许 `dit`，并要求 `dit` 的 `weight_transfer` 是 `rank-local`；`pin_memory` 是可选的布尔值。
 - 翻译规则：`mode` 照搬成每个选择器的 `mode`；`components` 列表里的每一项成为一个角色键；`layer_options` 里每个组件的 `weight_transfer`、`resident_layers` 照搬，没写 `weight_transfer` 时取 `rank-local`（与 `resolve_offload` 的 `options.weight_transfer or DLOTransfer.RANK_LOCAL` 相同）；`pin_memory` 翻成 `HostPolicy.pin_cpu_memory`（第 6.5 节）。选择器的 `if_absent`、`if_no_blocks` 都是 `error`。
-- `weight_stack` 不能 import `offloader/`（01 的 T1），所以 `policy.py` 有自己的 `parse_legacy_offload_config()`，规则和报错文本与 `parse_diffusion_offload_config` 逐条相同，旧配置与旧开关组合时的规则与 `_validate_legacy_layer_options`、`resolve_offload` 相同（第 8 节的 `P32`、`P33`）。第 6.6 节的等价测试保证两边对同一份输入的接受、拒绝和报错文本一致。
+- `weight_management` 不能 import `offloader/`（01 的 T1），所以 `policy.py` 有自己的 `parse_legacy_offload_config()`，规则和报错文本与 `parse_diffusion_offload_config` 逐条相同，旧配置与旧开关组合时的规则与 `_validate_legacy_layer_options`、`resolve_offload` 相同（第 8 节的 `P32`、`P33`）。第 6.6 节的等价测试保证两边对同一份输入的接受、拒绝和报错文本一致。
 - `_DiffusionConfigProjection.from_kwargs` 对旧配置调用 `parse_diffusion_offload_config` 的语句不变，两个栈都执行。
 
 #### 6.3 `--dlo-resident-layers`
@@ -345,7 +345,7 @@ LEGACY_VAE_LIFECYCLE_MODELS: Mapping[str, str] = {    # 注册名到 recipe 路�
 
 #### 6.6 翻译测试与豁免
 
-`tests/diffusion/weight_stack/policy/test_legacy_translation.py` 对 `DiffusionModelRegistry` 里每个能在只建结构的上下文里构造的 pipeline（02 的支持矩阵里结果为成功的），对每种旧开关组合（三个布尔开关各自单独出现，分布式逐层配 `--dlo-no-use-allgather`，旧配置的 `module` 和 `layer` 两种 `mode`）做：
+`tests/diffusion/weight_management/policy/test_legacy_translation.py` 对 `DiffusionModelRegistry` 里每个能在只建结构的上下文里构造的 pipeline（02 的支持矩阵里结果为成功的），对每种旧开关组合（三个布尔开关各自单独出现，分布式逐层配 `--dlo-no-use-allgather`，旧配置的 `module` 和 `layer` 两种 `mode`）做：
 
 ```text
 构造：在只建结构的上下文里构造一次 pipeline，只用配置文件，不加载权重
@@ -646,8 +646,8 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
 ```
 
 - 每个事件一行。值里有空格、等号或引号时写成 JSON 字符串；列表写成逗号分隔、不带空格的形式。
-- `observability.py` 提供 `bind_context(stage_id, rank, world_size)`（runner 在 `_load_model_unified` 开头调用一次）、`format_event(event, **fields) -> str` 和 `log_event(logger, event, *, level=logging.INFO, **fields)`。各模块用自己的 logger：`vllm_omni.diffusion.weight_stack.policy`、`.loader`、`.host`、`.offload`、`.startup`。
-- `observability.py` 只 import 标准库和 `weight_stack.errors`，`loader/`、`host/`、`offload/`、`policy.py` 都可以 import 它。
+- `observability.py` 提供 `bind_context(stage_id, rank, world_size)`（runner 在 `_load_model_unified` 开头调用一次）、`format_event(event, **fields) -> str` 和 `log_event(logger, event, *, level=logging.INFO, **fields)`。各模块用自己的 logger：`vllm_omni.diffusion.weight_management.policy`、`.loader`、`.host`、`.offload`、`.startup`。
+- `observability.py` 只 import 标准库和 `weight_management.errors`，`loader/`、`host/`、`offload/`、`policy.py` 都可以 import 它。
 
 #### 15.2 事件
 
@@ -667,7 +667,7 @@ DiffusionModelRunner._load_model_unified（01 第 8.1 节）
 | `fully_resident` | 04 | `commit()` 时每个组件一条，字段 `component`、`value`；编译模式被降成 `default` 时再输出一条，另带 `compile_mode`（降级后的模式）和 `downgraded_from`（原模式）（04 第 6.3 节）。 |
 | `startup_summary` | 05，`IN_SERVICE` 之前 | `host_private_bytes`、`host_shared_bytes`、`host_shard_bytes`、`registered_bytes`、`staging_bytes`、`device_slot_bytes`、`startup_s`。 |
 
-- 02 第 7.3 节、03 第 14 节和 04 第 9 节的启动日志按这张表的事件名和字段输出。02、03、04 的 PR 先于 05-6 合入，期间用各自的 logger（`vllm_omni.diffusion.weight_stack.loader`、`.host`、`.offload`）按同样的事件名和字段输出；05-6 把这些调用点改成 `log_event`，事件名和字段不变。
+- 02 第 7.3 节、03 第 14 节和 04 第 9 节的启动日志按这张表的事件名和字段输出。02、03、04 的 PR 先于 05-6 合入，期间用各自的 logger（`vllm_omni.diffusion.weight_management.loader`、`.host`、`.offload`）按同样的事件名和字段输出；05-6 把这些调用点改成 `log_event`，事件名和字段不变。
 - `startup_summary` 由 runner 在 `run_unified_startup` 返回之后、`mark_in_service()` 之前调用 `observability.log_startup_summary(handle)` 输出。
 
 ### 16. 指标
@@ -715,7 +715,7 @@ Orchestrator._absorb_diffusion_metrics
 - `weight_stack_memory_report` 只读登记的数值和 `/proc/self/smaps_rollup`，不进入 `OffloadRuntime.execution()`，不发起集合通信，不改变任何状态；采集失败时只记一次警告，不影响服务。
 
 ```python
-# vllm_omni/diffusion/weight_stack/observability.py
+# vllm_omni/diffusion/weight_management/observability.py
 @dataclass(frozen=True)
 class WeightStackMemoryReport:
     rank: int
@@ -756,14 +756,14 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 | `docs/user_guide/diffusion_features.md` | 链接支持矩阵，写明非 CUDA 平台的 Unit 走暂存区（总体设计第 13 节）。 |
 | `docs/design/metrics.md` | 第 16 节的指标。 |
 | `docs/design/feature/offloader/README.md`、`docs/design/module/diffusion/offloader.md` | 指向总体设计和本 RFC，写明现有三个后端只用于 `legacy`。 |
-| 新增 `docs/user_guide/diffusion/weight_stack_migration.md` | 迁移说明：第 6 节的翻译和迁移报错、总体设计第 9 节第 3 步列出的门槛例外、写入进程退出后新副本重建一份的影响（总体设计第 13 节）、默认值翻转之后的一个版本里主干外没有迁移的 pipeline（`register_diffusion_model` 注册的、`load_format="custom_pipeline"` 的）必须显式传 `--diffusion-weight-stack legacy`（总体设计第 9 节第 5 步）。 |
-| 新增 `docs/user_guide/diffusion/weight_stack_support_matrix.md` | 支持矩阵，见第 17.3 节。 |
+| 新增 `docs/user_guide/diffusion/weight_management_migration.md` | 迁移说明：第 6 节的翻译和迁移报错、总体设计第 9 节第 3 步列出的门槛例外、写入进程退出后新副本重建一份的影响（总体设计第 13 节）、默认值翻转之后的一个版本里主干外没有迁移的 pipeline（`register_diffusion_model` 注册的、`load_format="custom_pipeline"` 的）必须显式传 `--diffusion-weight-stack legacy`（总体设计第 9 节第 5 步）。 |
+| 新增 `docs/user_guide/diffusion/weight_management_support_matrix.md` | 支持矩阵，见第 17.3 节。 |
 
 #### 17.3 支持矩阵
 
 - 02 的 `test_structure_matrix.py` 为每个注册的 pipeline 用测试资源里的配置文件在只建结构的上下文里构造一次（02 第 5.7 节）。它把每个注册名的结果写进 `structure_matrix.json`：构造结果、读取陷阱或残留 meta 张量的位置、完整性违例、缺少的规则表，以及成功时目录里的组件名和角色。这个文件格式由本节规定，02 的测试按它输出。
-- `tools/weight_stack/render_support_matrix.py` 把它渲染成 `docs/user_guide/diffusion/weight_stack_support_matrix.md`：每个注册名一行，列出构造结果（成功、读取陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表）、组件名和角色，以及还没有验证、但没有正确性问题的组合（总体设计 7.7）。
-- `tests/diffusion/weight_stack/policy/test_support_matrix_doc.py` 断言仓库里的文档等于用当前结果渲染的内容，改变支持情况的 PR 必须同时更新文档。翻转默认值之前，矩阵里不能有 `unified` 不支持的 pipeline（总体设计第 9 节第 4 步）。
+- `tools/weight_management/render_support_matrix.py` 把它渲染成 `docs/user_guide/diffusion/weight_management_support_matrix.md`：每个注册名一行，列出构造结果（成功、读取陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表）、组件名和角色，以及还没有验证、但没有正确性问题的组合（总体设计 7.7）。
+- `tests/diffusion/weight_management/policy/test_support_matrix_doc.py` 断言仓库里的文档等于用当前结果渲染的内容，改变支持情况的 PR 必须同时更新文档。翻转默认值之前，矩阵里不能有 `unified` 不支持的 pipeline（总体设计第 9 节第 4 步）。
 
 ## 与其他子 RFC 的接口
 
@@ -771,7 +771,7 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
-| `weight_stack.policy` 的 `OffloadPolicy`、`Selector`、`ComponentSetting`、`HostPolicy`、`Mode`、`WeightTransfer` | 01、04 | 第 2 节。冻结、可 pickle；`StartupContext.policy` 是 `startup_policy()` 的结果或 `None`。 |
+| `weight_management.policy` 的 `OffloadPolicy`、`Selector`、`ComponentSetting`、`HostPolicy`、`Mode`、`WeightTransfer` | 01、04 | 第 2 节。冻结、可 pickle；`StartupContext.policy` 是 `startup_policy()` 的结果或 `None`。 |
 | `resolve_selection(policy, refs, *, pipeline) -> Selection` | 04 | 第 11 节。04 的 `plan()` 按 `declaration_order` 用目录的组件名、角色和 `hsdp_managed` 调用，报 L02 到 L05；`Selection.unmatched` 只按本 rank 判断，经 `PlacementPlan.unmatched_policy_keys()` 交给 01 做 L01 的跨 rank 判断。 |
 | L01 的判断规则和报错文本 | 01 | 第 11 节和第 8.2 节。01 在全组确认第 1 点第一轮收集 `Point1Payload.unmatched_policy_keys`，取交集，不为空时每个 rank 报 `PlanningError`。 |
 | `OffloadPolicy.execution_facts()`、`cached_policy(config)` | 01 的 `execution_offload_facts` | 第 12 节；只读策略，不读环境变量。 |
@@ -796,15 +796,15 @@ recipe 里的自定义配置只列出这个模型组件声明里存在的角色�
 新增文件：
 
 ```text
-vllm_omni/diffusion/weight_stack/policy.py            数据类型、schema、解析器、预设、兼容层、校验、resolve_selection、执行事实
-vllm_omni/diffusion/weight_stack/observability.py     启动日志、资源字节登记、WeightStackMemoryReport
-tools/weight_stack/render_support_matrix.py           支持矩阵渲染
-docs/user_guide/diffusion/weight_stack_migration.md
-docs/user_guide/diffusion/weight_stack_support_matrix.md
-tests/diffusion/weight_stack/policy/                  第“测试计划”节的测试
-tests/diffusion/weight_stack/observability/
-tests/diffusion/weight_stack/gate/                    门槛矩阵（05-9）
-tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_05_6.py
+vllm_omni/diffusion/weight_management/policy.py            数据类型、schema、解析器、预设、兼容层、校验、resolve_selection、执行事实
+vllm_omni/diffusion/weight_management/observability.py     启动日志、资源字节登记、WeightStackMemoryReport
+tools/weight_management/render_support_matrix.py           支持矩阵渲染
+docs/user_guide/diffusion/weight_management_migration.md
+docs/user_guide/diffusion/weight_management_support_matrix.md
+tests/diffusion/weight_management/policy/                  第“测试计划”节的测试
+tests/diffusion/weight_management/observability/
+tests/diffusion/weight_management/gate/                    门槛矩阵（05-9）
+tests/diffusion/weight_management/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_05_6.py
 ```
 
 修改的文件：
@@ -817,8 +817,8 @@ tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_0
 | `vllm_omni/diffusion/worker/diffusion_worker.py` | `weight_stack_memory_report()`。 |
 | `vllm_omni/diffusion/stage_diffusion_proc.py`、`vllm_omni/diffusion/inline_stage_diffusion_client.py` | D21 的报告采集。 |
 | `vllm_omni/engine/orchestrator.py`、`vllm_omni/metrics/definitions.py`、`vllm_omni/metrics/prometheus.py` | 第 16 节。 |
-| `vllm_omni/diffusion/weight_stack/loader/`、`host/`、`offload/` 的日志和字节登记调用点 | 05-6 把日志改用 `log_event`，事件名和字段不变；加入 `record_host_mapping`、`forget_host_mapping`、`record_device_resources` 的调用（第 16.2 节）。 |
-| `tests/diffusion/weight_stack/test_static_dependencies.py` | T5 字段表加入四个新字段（01 允许的改动）。 |
+| `vllm_omni/diffusion/weight_management/loader/`、`host/`、`offload/` 的日志和字节登记调用点 | 05-6 把日志改用 `log_event`，事件名和字段不变；加入 `record_host_mapping`、`forget_host_mapping`、`record_device_resources` 的调用（第 16.2 节）。 |
+| `tests/diffusion/weight_management/test_static_dependencies.py` | T5 字段表加入四个新字段（01 允许的改动）。 |
 | `recipes/`、`docs/` | 第 17 节。 |
 
 ## 实现拆分
@@ -834,8 +834,8 @@ tests/diffusion/weight_stack/coexistence/sites/D20_05_3.py、D22_05_3.py、D21_0
 | 05-5 | 翻译测试和豁免、`LEGACY_RESIDENT_DIT_MODELS` 的派生测试。 | 只有测试 | `test_legacy_translation.py`、`test_resident_gate_table.py` | 05-3、02-2、04-2 | M | 无 |
 | 05-6 | `observability.py`、启动日志事件、02、03 和 04 日志调用点的改写、03 和 04 的字节登记调用、`weight_stack_memory_report`、D21、指标族和编排器的处理、`docs/design/metrics.md`。 | `observability.py`、`loader/`、`host/`、`offload/`、`diffusion_worker.py`、`stage_diffusion_proc.py`、`inline_stage_diffusion_client.py`、`orchestrator.py`、`metrics/` | `test_events.py`、`test_memory_report.py`、`test_metrics_absorb.py`、`test_memory_report_multiproc.py`、`test_metrics_e2e.py` | 05-3、02-5、03-8、04-5 | L | D21 |
 | 05-7 | 第 17.1 节的 recipe、第 17.2 节的文档和迁移说明。 | `recipes/`、`docs/` | `test_recipe_policies.py` | 05-4、05-5、05-6、02-11、02-12、02-14、02-18 | M | 无 |
-| 05-8 | 支持矩阵的渲染工具、文档和一致性测试。 | `tools/weight_stack/`、`docs/` | `test_support_matrix_doc.py` | 02-2、05-7 | S | 无 |
-| 05-9 | 门槛矩阵：组合清单、对比基准、Host 和加速卡内存峰值的采集、原始数据的保存。 | `tests/diffusion/weight_stack/gate/` | `test_gate_matrix.py` | 05-7、03-9、04-13 | M | 无 |
+| 05-8 | 支持矩阵的渲染工具、文档和一致性测试。 | `tools/weight_management/`、`docs/` | `test_support_matrix_doc.py` | 02-2、05-7 | S | 无 |
+| 05-9 | 门槛矩阵：组合清单、对比基准、Host 和加速卡内存峰值的采集、原始数据的保存。 | `tests/diffusion/weight_management/gate/` | `test_gate_matrix.py` | 05-7、03-9、04-13 | M | 无 |
 
 ```text
 01-1..01-7

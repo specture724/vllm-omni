@@ -2,9 +2,9 @@
 
 > 上级 RFC：[umbrella RFC](./00-umbrella.md)。设计依据：[总体设计](../LOADER_OFFLOADER_DESIGN.md) 第 5 节（5.1～5.7）、8.7、9.1、9.2、9.3。
 >
-> 范围：`vllm_omni/diffusion/weight_stack/loader/`、`vllm_omni/diffusion/weight_stack/components.py`、`vllm_omni/diffusion/model_loader/construct.py`、`vllm_omni/diffusion/model_loader/hub_prefetch.py`，19 个构造期读张量的家族目录，以及共存期必改清单里由本 RFC 承担的各行。
+> 范围：`vllm_omni/diffusion/weight_management/loader/`、`vllm_omni/diffusion/weight_management/components.py`、`vllm_omni/diffusion/model_loader/construct.py`、`vllm_omni/diffusion/model_loader/hub_prefetch.py`，19 个构造期读张量的家族目录，以及共存期必改清单里由本 RFC 承担的各行。
 >
-> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_stack/interfaces.py`、`weight_stack/errors.py`、启动驱动、`StartupContext.memory_pools`、共存期登记表（`tests/diffusion/weight_stack/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan` 给出的冷启动路径、每个张量的 Transport、分片 Unit 的规划顺序、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
+> 依赖：[子 RFC 01](./01-startup-transaction.md)（总开关的进程级状态、`weight_management/interfaces.py`、`weight_management/errors.py`、启动驱动、`StartupContext.memory_pools`、共存期登记表（`tests/diffusion/weight_management/coexistence/`）、测试替身）；[子 RFC 03](./03-host-storage.md)（`HostStorage.view` 与 `seal` 的语义、瘦路径的地址预留）；[子 RFC 04](./04-unified-offloader.md)（`PlacementPlan` 给出的冷启动路径、每个张量的 Transport、分片 Unit 的规划顺序、`LoadTransaction.target`、叠加层槽位的分配、`fully_resident` 的填写、编译设置）；[子 RFC 05](./05-configuration.md)（`--diffusion-max-lora-rank` 和 LoRA 相关组合的解析）。
 
 ## 摘要
 
@@ -41,7 +41,7 @@ umbrella 的“背景与问题”已经给出总体原因，这里只列本 RFC 
 
 ### 1. Loader 在启动流程中的位置
 
-`UnifiedLoader`（`weight_stack/loader/loader.py`）实现 [子 RFC 01](./01-startup-transaction.md) 在 `weight_stack/interfaces.py` 里定义的 `Loader` 协议。`weight_stack/loader/__init__.py` 导出工厂函数 `create_loader(ctx: StartupContext) -> Loader`，由 01 的 `EntryPointFactory` 按名字取用。启动驱动按下表调用：
+`UnifiedLoader`（`weight_management/loader/loader.py`）实现 [子 RFC 01](./01-startup-transaction.md) 在 `weight_management/interfaces.py` 里定义的 `Loader` 协议。`weight_management/loader/__init__.py` 导出工厂函数 `create_loader(ctx: StartupContext) -> Loader`，由 01 的 `EntryPointFactory` 按名字取用。启动驱动按下表调用：
 
 ```text
 启动步骤（总体设计 4.2）   调用                                              结束时的状态
@@ -54,7 +54,7 @@ umbrella 的“背景与问题”已经给出总体原因，这里只列本 RFC 
 ```
 
 ```python
-# weight_stack/loader/__init__.py 导出、01 的 interfaces.py 在 TYPE_CHECKING 里引用的类型
+# weight_management/loader/__init__.py 导出、01 的 interfaces.py 在 TYPE_CHECKING 里引用的类型
 @dataclass(frozen=True)
 class Preflight:
     content_identities: Mapping[str, str]                 # 组件名到内容身份摘要，即 RankFingerprints.content_identities
@@ -67,14 +67,14 @@ class Preflight:
 - `write()` 里每个张量的写入目标取 `transaction.target(tensor_key)`，`tensor_key` 是预期清单里的规范名。返回张量时绑定到它；返回 `None` 时这个张量常驻加速卡，Loader 在执行设备上、在 `ctx.memory_pools.weights()` 里分配，因此进入睡眠时备份的池。收尾里新建或替换的常驻加速卡张量（第 2 步的替换、第 1 步 HSDP 分片后的本地分片，第 9、13 节）同样由 Loader 在这个池里分配。只建结构期间的分配和写入期间的临时张量（量化前的参数、适配器的 Δ、`on_execution_device` 变换的中间结果）不进任何睡眠池。驱动自己不进入睡眠池（01 的 6.2）。
 - `finalize()` 执行总体设计 5.4 的第 1 到第 7 步（第 9 节），第 6 步调用 `storage.seal(final_manifest)`。
 - `close()` 关闭构造上下文、读取陷阱、checkpoint 读取器的文件句柄和临时张量。组件目录在 `close()` 之后仍然可以查询。
-- Loader 从 HWM 和 Offloader 一侧只 import `weight_stack.interfaces`，不 import 它们的实现；在 `weight_stack` 里另外只 import `errors`、`components` 和 `startup`（只用 `WeightStack` 和 `process_weight_stack`）。复用 legacy 的来源解析时在函数内 import `model_loader.diffusers_loader`（7.1）。
-- 每一步失败时抛出 01 在 `weight_stack/errors.py` 里定义的对应类型：`ConstructionError`、`PreflightError`、`WriteError`、`FinalizeError`。上下文关闭后调用组件构造函数报 `LifecycleError`。
+- Loader 从 HWM 和 Offloader 一侧只 import `weight_management.interfaces`，不 import 它们的实现；在 `weight_management` 里另外只 import `errors`、`components` 和 `startup`（只用 `WeightStack` 和 `process_weight_stack`）。复用 legacy 的来源解析时在函数内 import `model_loader.diffusers_loader`（7.1）。
+- 每一步失败时抛出 01 在 `weight_management/errors.py` 里定义的对应类型：`ConstructionError`、`PreflightError`、`WriteError`、`FinalizeError`。上下文关闭后调用组件构造函数报 `LifecycleError`。
 
 ### 2. 组件声明与组件目录
 
 #### 2.1 模型侧的声明
 
-模型侧的类型和函数放在 `weight_stack/components.py`。`models/`、`lora/`、`cache/` 可以 import 它；它不 import Loader、HWM、Offloader 的实现。
+模型侧的类型和函数放在 `weight_management/components.py`。`models/`、`lora/`、`cache/` 可以 import 它；它不 import Loader、HWM、Offloader 的实现。
 
 ```python
 Role = Literal["dit", "text_encoder", "image_encoder", "audio_encoder", "vae", "other"]
@@ -162,7 +162,7 @@ pipeline 没有调用 `declare_components` 时，Loader 在构造结束后从现
 
 #### 2.7 组件目录
 
-目录的数据类型同样放在 `weight_stack/components.py`，构建逻辑放在 `weight_stack/loader/catalog.py`。Offloader 的 `plan()` 只读这个对象，不 import Loader。
+目录的数据类型同样放在 `weight_management/components.py`，构建逻辑放在 `weight_management/loader/catalog.py`。Offloader 的 `plan()` 只读这个对象，不 import Loader。
 
 ```python
 @dataclass(frozen=True)
@@ -227,7 +227,7 @@ class ComponentCatalog:
 
 #### 2.8 查询接口
 
-`weight_stack/components.py` 提供以下只读函数，供 `torch.compile` 的目标选择、缓存加速、动态 LoRA、模型注册表、序列并行钩子和 VAE 快路径使用（第 15 节）。目录不挂在 pipeline 对象上（总体设计 3.2 第 5 条）：`build_structure()` 把它登记在 `components.py` 的进程级弱引用表里，以 pipeline 对象为键，pipeline 被回收时条目随之消失；`custom_pipeline` 重新初始化时，新 pipeline 登记新的目录。前三个函数和 `fully_resident` 带一个 `legacy` 参数：`legacy` 下函数只调用它并返回结果，使用方现有的判断原样移进这个局部函数，`legacy` 下行为不变。
+`weight_management/components.py` 提供以下只读函数，供 `torch.compile` 的目标选择、缓存加速、动态 LoRA、模型注册表、序列并行钩子和 VAE 快路径使用（第 15 节）。目录不挂在 pipeline 对象上（总体设计 3.2 第 5 条）：`build_structure()` 把它登记在 `components.py` 的进程级弱引用表里，以 pipeline 对象为键，pipeline 被回收时条目随之消失；`custom_pipeline` 重新初始化时，新 pipeline 登记新的目录。前三个函数和 `fully_resident` 带一个 `legacy` 参数：`legacy` 下函数只调用它并返回结果，使用方现有的判断原样移进这个局部函数，`legacy` 下行为不变。
 
 ```python
 def component_paths(pipeline, role: Role, *, legacy: Callable[[], Sequence[str]]) -> tuple[str, ...]: ...
@@ -253,7 +253,7 @@ def bump_weight_generation(pipeline) -> None: ...
 
 #### 3.1 进入、阶段与退出
 
-`StructureContext`（`weight_stack/loader/context.py`）是进程级的单例状态，与 01 的进程级总开关一起使用。同一时刻一个进程里最多有一个打开的上下文，第二个上下文在第一个关闭之前打开时报 `LifecycleError`，不排队等待：持有上下文的 worker 可能正在 `seal()` 里等待排队的那个 worker 作为写入进程完成封存，排队会死锁。单进程执行器把几个 worker 放在同一个进程里时，它们的 `unified` 启动必须依次进行。陷阱的补丁对进程里的所有线程生效，所以上下文打开期间，同一进程里的其他代码也不能读取 checkpoint。
+`StructureContext`（`weight_management/loader/context.py`）是进程级的单例状态，与 01 的进程级总开关一起使用。同一时刻一个进程里最多有一个打开的上下文，第二个上下文在第一个关闭之前打开时报 `LifecycleError`，不排队等待：持有上下文的 worker 可能正在 `seal()` 里等待排队的那个 worker 作为写入进程完成封存，排队会死锁。单进程执行器把几个 worker 放在同一个进程里时，它们的 `unified` 启动必须依次进行。陷阱的补丁对进程里的所有线程生效，所以上下文打开期间，同一进程里的其他代码也不能读取 checkpoint。
 
 ```text
 build_structure() 开始     phase = CONSTRUCT   参数落到 meta、设备移动受限、读取陷阱拦截张量读取
@@ -306,7 +306,7 @@ loader.close()             上下文关闭          失败路径上同样撤除�
 
 ### 4. 读取陷阱
 
-`ReadTrap`（`weight_stack/loader/trap.py`）从 `build_structure()` 开始一直开到 `finalize()` 结束。
+`ReadTrap`（`weight_management/loader/trap.py`）从 `build_structure()` 开始一直开到 `finalize()` 结束。
 
 | 被拦截的调用 | `CONSTRUCT` 阶段 | `SEALED` 阶段 |
 |---|---|---|
@@ -321,7 +321,7 @@ loader.close()             上下文关闭          失败路径上同样撤除�
 - 放行的头部读取：`safe_open` 句柄的 `keys()`、`metadata()`、`get_slice(name).get_shape()`、`get_slice(name).get_dtype()`，以及 JSON 配置文件的读取。
 - 实现：陷阱用代理对象替换 `safetensors.safe_open`、`safetensors.torch.safe_open`、`safetensors.torch.load_file`、`safetensors.torch.load`、`torch.load`、`torch.serialization.load`，以及上面列出的类方法。模型模块常用 `from safetensors import safe_open` 把名字绑进自己的命名空间，`vllm`、`diffusers` 的辅助函数也这样绑定，所以陷阱在打开时扫描 `sys.modules` 里除 `torch`、`safetensors` 两个包以外的全部模块，把与原对象身份相同的全局名字换成代理，关闭时换回；上下文打开期间新 import 的模块由一个 `sys.meta_path` 查找器在执行完模块代码后同样处理。
 - Loader 自己的 checkpoint 读取器不受影响：读取器只在 `trap.trusted()` 里调用读取函数，代理看到线程局部的信任标记时直接调用原函数。读取器的线程池在每个工作线程里进入 `trusted()`。
-- 违例记录：代理抛出 `ConstructionError` 或 `WriteError` 之前，把一条 `Violation(kind, call, where)` 记进陷阱。`where` 取调用栈上第一个不属于 `torch`、`safetensors`、`transformers`、`diffusers` 和 `weight_stack` 的帧，写成文件路径和函数名。即使模型代码用 `try/except` 吞掉了异常，`build_structure()` 第 7 步和 `finalize()` 结束时照样报错，列出全部违例。
+- 违例记录：代理抛出 `ConstructionError` 或 `WriteError` 之前，把一条 `Violation(kind, call, where)` 记进陷阱。`where` 取调用栈上第一个不属于 `torch`、`safetensors`、`transformers`、`diffusers` 和 `weight_management` 的帧，写成文件路径和函数名。即使模型代码用 `try/except` 吞掉了异常，`build_structure()` 第 7 步和 `finalize()` 结束时照样报错，列出全部违例。
 - `CONSTRUCT` 阶段违例的报错类型是 `ConstructionError`；`SEALED` 阶段是 `WriteError`（写入期间）或 `FinalizeError`（收尾期间）。
 
 ### 5. 构造期的分发
@@ -427,14 +427,14 @@ class BufferSource:
 #### 5.7 未迁移的 pipeline 与支持矩阵
 
 - 未迁移的 pipeline 在 `unified` 下构造时触发读取陷阱或构造后检查，启动报 `ConstructionError`，写明读取发生的位置，`fix` 是 `use --diffusion-weight-stack legacy`。是否已迁移不另设标记。
-- `tests/diffusion/weight_stack/loader/test_structure_matrix.py` 为 `DiffusionModelRegistry` 里注册的每个 pipeline，用测试资源里的配置文件在上下文里调用一次 `build_structure()`（不需要权重），记录结果：成功、触发陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表，以及成功时目录里的组件名和角色。结果按 [05](./05-configuration.md) 第 17.3 节规定的格式写进 `structure_matrix.json`，由 05 渲染成 `docs/` 下的支持矩阵。
+- `tests/diffusion/weight_management/loader/test_structure_matrix.py` 为 `DiffusionModelRegistry` 里注册的每个 pipeline，用测试资源里的配置文件在上下文里调用一次 `build_structure()`（不需要权重），记录结果：成功、触发陷阱的位置、残留 meta 张量的位置、完整性违例、缺少的规则表，以及成功时目录里的组件名和角色。结果按 [05](./05-configuration.md) 第 17.3 节规定的格式写进 `structure_matrix.json`，由 05 渲染成 `docs/` 下的支持矩阵。
 - 共存期间不合入构造期读张量的新 pipeline：这个测试对新注册的 pipeline 要求结果为成功。
 
 ### 6. 规则表
 
 #### 6.1 格式
 
-规则表是数据，放在 `weight_stack/loader/rules/`，每个类一个模块，模块里只有一个 `TABLE: RuleTable` 常量，由 `rules/__init__.py` 的注册表按类的限定名索引。
+规则表是数据，放在 `weight_management/loader/rules/`，每个类一个模块，模块里只有一个 `TABLE: RuleTable` 常量，由 `rules/__init__.py` 的注册表按类的限定名索引。
 
 ```python
 @dataclass(frozen=True)
@@ -487,10 +487,10 @@ class RuntimeDtype:
 
 #### 6.3 逐表测试
 
-`tests/diffusion/weight_stack/loader/rules/test_rule_tables.py` 对注册表里的每张表各跑一个用例：
+`tests/diffusion/weight_management/loader/rules/test_rule_tables.py` 对注册表里的每张表各跑一个用例：
 
 ```text
-1. 用表旁边的测试配置（tests/diffusion/weight_stack/loader/rules/configs/<cls>.json，缩小到几层）
+1. 用表旁边的测试配置（tests/diffusion/weight_management/loader/rules/configs/<cls>.json，缩小到几层）
    构造一个随机初始化的模型，save_pretrained 到临时目录
 2. 参考：cls.from_pretrained(tmp, torch_dtype=stage 类型)
 3. 被测：HF 组件入口在上下文里建结构，Loader 按规则表从同一目录写入（全部常驻）
@@ -500,7 +500,7 @@ class RuntimeDtype:
 
 - 库版本不等时测试失败，升级 transformers 或 diffusers 时每张表都要重新验证并更新 `validated_with`。
 - 用 `from_single_file` 的类（Wan2.2-S2V 的 VAE），参考换成 `from_single_file`，被测用规则表的 `conversions` 表达单文件格式的键转换。
-- `python -m vllm_omni.diffusion.weight_stack.loader.rules.generate <cls>` 从类的 `_tied_weights_keys`、`_keys_to_ignore_on_load_unexpected`、`_keep_in_fp32_modules` 和 transformers 的转换表生成表的初稿，初稿只有在上面的测试通过后才能入库。
+- `python -m vllm_omni.diffusion.weight_management.loader.rules.generate <cls>` 从类的 `_tied_weights_keys`、`_keys_to_ignore_on_load_unexpected`、`_keep_in_fp32_modules` 和 transformers 的转换表生成表的初稿，初稿只有在上面的测试通过后才能入库。
 
 ### 7. checkpoint 读取器与写入
 
@@ -579,7 +579,7 @@ buffer：module._buffers[name] = t；别名指向同一个对象
 
 #### 7.6 逐层在线量化
 
-- 构造结束时，Loader 对每个带 `quant_method` 的层调用 `quant_output_specs(layer)`（`weight_stack/loader/quant.py`），得到这一层量化后每个输出张量的名字、形状和类型，作为 `kind="quant_output"` 进入目录。没有登记输出声明的量化方法，在构造阶段报 `ConstructionError`。
+- 构造结束时，Loader 对每个带 `quant_method` 的层调用 `quant_output_specs(layer)`（`weight_management/loader/quant.py`），得到这一层量化后每个输出张量的名字、形状和类型，作为 `kind="quant_output"` 进入目录。没有登记输出声明的量化方法，在构造阶段报 `ConstructionError`。
 - 写入阶段，包装后的 `weight_loader` 第一次被这一层的参数调用时，Loader 在执行设备上为这一层量化前的参数分配临时张量并绑定，然后才调用原函数；量化层量化前的参数被不经过 `weight_loader` 的写入命中、而临时张量还没有分配时报 `WriteError`。包装函数返回时，写入跟踪发现这一层量化前的参数全部写完，Loader 立即调用 `quant_method.process_weights_after_loading(layer)`，把每个输出张量拷进它的最终存储，把层的属性换成最终存储上的张量，然后释放临时张量。量化在加速卡上进行，结果直接写进最终存储。
 - 输出目标全部是 meta 的量化层（等待者写进共享存储的层、瘦路径下完全落在本 rank 范围之外的层）：写入期间量化前的参数留在 meta 上，写入是空操作，不读 checkpoint；这一层写完时，Loader 分配不初始化的临时张量，照样调用 `process_weights_after_loading`，使层上不属于权重的运行期属性与写入进程相同，然后丢弃输出、释放临时张量。
 - 输出的形状或类型与声明不同时报 `WriteError`。
@@ -591,7 +591,7 @@ buffer：module._buffers[name] = t；别名指向同一个对象
 
 #### 8.1 格式转换器
 
-每种适配器格式有一个转换器，登记在 `weight_stack/loader/adapters/` 的注册表里：
+每种适配器格式有一个转换器，登记在 `weight_management/loader/adapters/` 的注册表里：
 
 ```python
 class AdapterFormat(Protocol):
@@ -629,7 +629,7 @@ class AdapterFormat(Protocol):
 #### 8.5 固定适配器
 
 - `apply: fuse`：与用户给出的适配器一样在读取器里融合，进入内容身份。
-- `apply: overlay`：只建结构时，Loader 把 `targets` 匹配的层包成 `FixedOverlayLinear`（`weight_stack/loader/overlay.py`）。A/B 以 `kind="fixed_overlay"` 进入目录，属于目标层所在的 Unit，进入内容身份；它们是基础内容，由 Loader 在写入阶段从适配器来源写入，TP 切分沿用目标层现有的布局函数。运行期模型只负责开关（`set_enabled(name, bool)`），不占动态 LoRA 的槽位。
+- `apply: overlay`：只建结构时，Loader 把 `targets` 匹配的层包成 `FixedOverlayLinear`（`weight_management/loader/overlay.py`）。A/B 以 `kind="fixed_overlay"` 进入目录，属于目标层所在的 Unit，进入内容身份；它们是基础内容，由 Loader 在写入阶段从适配器来源写入，TP 切分沿用目标层现有的布局函数。运行期模型只负责开关（`set_enabled(name, bool)`），不占动态 LoRA 的槽位。
 - 支持的目标层是 vLLM 的线性层（`LinearBase` 的子类）和 `nn.Linear`；`targets` 匹配到其他类型时在构造阶段报错。
 - LTX2 两阶段蒸馏的相位适配器、LongCat-Video-Avatar 的 DMD LoRA 用 `overlay`（第 16 节）。
 
@@ -844,7 +844,7 @@ class DynamicLoraSpec:
 
 #### 14.1 逐张量对比框架
 
-`tests/diffusion/weight_stack/baseline/` 提供 `compare_against_legacy(family, checkpoint, od_overrides)`：
+`tests/diffusion/weight_management/baseline/` 提供 `compare_against_legacy(family, checkpoint, od_overrides)`：
 
 ```text
 1. 子进程 A：总开关 legacy，DiffusersPipelineLoader.load_model 正常构造加加载，不做 offload
@@ -854,14 +854,14 @@ class DynamicLoraSpec:
 4. 逐项比较，例外表里的条目按表处理
 ```
 
-- 结构可以配置的家族用合成的小 checkpoint（`tests/diffusion/weight_stack/baseline/fixtures/` 里的生成脚本），在改动对应家族目录或 `weight_stack/loader/` 的 PR 上运行，L2；结构固定的家族用真实 checkpoint，L4 每晚运行。
+- 结构可以配置的家族用合成的小 checkpoint（`tests/diffusion/weight_management/baseline/fixtures/` 里的生成脚本），在改动对应家族目录或 `weight_management/loader/` 的 PR 上运行，L2；结构固定的家族用真实 checkpoint，L4 每晚运行。
 - 按空闲显存选择分块大小的 VAE，对比时固定分块。
 - 融合适配器的组合逐张量对比融合结果；蒸馏 LoRA 配在线量化、蒸馏 LoRA 配 TP 大于 1 的组合，以“完整加载、融合、再量化”的参考结果为基准。
 - 框架同时提供 `export_legacy_hashes(family, checkpoint, od_overrides)`，把子进程 A 的快照存成逐张量的哈希文件，比较一侧可以换成这份文件。删除 `legacy` 之前用它存下每个家族的结果（总体设计 9 第 6 步、9.3），之后对比测试改为与哈希对比。
 
 #### 14.2 对比例外表
 
-`tests/diffusion/weight_stack/baseline/exceptions.py` 里的 `EXCEPTIONS` 是数据：
+`tests/diffusion/weight_management/baseline/exceptions.py` 里的 `EXCEPTIONS` 是数据：
 
 ```python
 @dataclass(frozen=True)
@@ -877,7 +877,7 @@ class ComparisonException:
 
 #### 14.3 指纹清单
 
-`vllm_omni/diffusion/weight_stack/loader/fingerprints.py` 里的 `LEGACY_READERS` 是数据：
+`vllm_omni/diffusion/weight_management/loader/fingerprints.py` 里的 `LEGACY_READERS` 是数据：
 
 ```python
 @dataclass(frozen=True)
@@ -890,7 +890,7 @@ class LegacyReader:
 ```
 
 - 源码指纹是 `inspect.getsource` 的结果去掉注释、空行和行尾空白后再做 `ast.dump` 的 sha256，只对代码改动敏感。
-- `tests/diffusion/weight_stack/loader/test_legacy_fingerprints.py` 对每一条重新计算指纹，与记录的不同时失败，报错按总体设计 9.2 的表给出处理方式：同一个 PR 里改 unified 一支，或在 `note` 里写明 unified 不需要的原因，再更新指纹。
+- `tests/diffusion/weight_management/loader/test_legacy_fingerprints.py` 对每一条重新计算指纹，与记录的不同时失败，报错按总体设计 9.2 的表给出处理方式：同一个 PR 里改 unified 一支，或在 `note` 里写明 unified 不需要的原因，再更新指纹。
 - 清单同时是删除 legacy 时的删除清单（第 9.3 节的删除前保证在“删除 legacy 时”一节）。
 
 ### 15. 组件查询接口的使用方迁移
@@ -940,7 +940,7 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 
 ### 17. 本 RFC 承担的共存期必改行
 
-每一行只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变（01 的 9.3）。承担一行的 PR 按 01 的 9.4 新增位置文件 `tests/diffusion/weight_stack/coexistence/sites/<行编号>_<PR 编号>.py`（例如 `C16_02_7.py`），在 `SITES` 里写出它新增的读总开关或构造上下文的位置，不修改 `registry.py`；一行拆给两个 PR 时各自新增一个位置文件。本 RFC 自己的分发点 D06 在 02-2 的位置文件 `D06_02_2.py` 里用 `NEW_ROW` 声明。模型代码只经 `is_unified_stack()` 或 `is_building_structure()` 判断。
+每一行只改变 `unified` 下的行为，`legacy` 下的行为和已有测试不变（01 的 9.3）。承担一行的 PR 按 01 的 9.4 新增位置文件 `tests/diffusion/weight_management/coexistence/sites/<行编号>_<PR 编号>.py`（例如 `C16_02_7.py`），在 `SITES` 里写出它新增的读总开关或构造上下文的位置，不修改 `registry.py`；一行拆给两个 PR 时各自新增一个位置文件。本 RFC 自己的分发点 D06 在 02-2 的位置文件 `D06_02_2.py` 里用 `NEW_ROW` 声明。模型代码只经 `is_unified_stack()` 或 `is_building_structure()` 判断。
 
 | 编号 | 位置 | `unified` 一支 |
 |---|---|---|
@@ -962,12 +962,12 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 
 | 提供的内容 | 使用方 | 约定 |
 |---|---|---|
-| `weight_stack.loader.create_loader(ctx)`、`Preflight`、`ExpectedManifest`、`FinalManifest` | 01 | 签名见设计第 1 节和第 10 节；`Preflight.content_identities` 是组件名到摘要的映射，直接填进 `RankFingerprints.content_identities`。 |
+| `weight_management.loader.create_loader(ctx)`、`Preflight`、`ExpectedManifest`、`FinalManifest` | 01 | 签名见设计第 1 节和第 10 节；`Preflight.content_identities` 是组件名到摘要的映射，直接填进 `RankFingerprints.content_identities`。 |
 | `Loader.write()` 的绑定规则 | 03、04 | 每个张量调用一次 `transaction.target(name)`，名字是预期清单的规范名；返回张量的形状、类型、步长必须与清单一致；返回 meta 张量表示写入是空操作。每个 Host 驻留张量全部写完时调用一次 `storage.note_written(name)`（7.5）。 |
 | `Loader.finalize()` | 01、03 | 第 6 步之前完成收尾里的全部集合通信，第 6 步调用一次 `storage.seal(final_manifest)`；`final_manifest.live()` 给出要重新绑定的模型张量。 |
 | `ComponentCatalog` 及其方法 | 04 | `plan()` 第一步调用 `require_complete()`，组件不完整或保持 fp32 的层配了量化时报 `PlanningError`；`plan()` 经 `set_discovered_blocks()` 记录自动发现的重复块；`commit()` 调用 `set_fully_resident()` 和 `bind_overlay_slot()`；`write_transient` 计入加速卡准入；`shapes_final`、`finalize_replaced` 用于冷启动路径和共享条件。 |
 | `ExpectedManifest` | 03 | `layout(plan, expected_manifest)` 的输入；`digest(names)` 是交接时核对的预期清单摘要。 |
-| `weight_stack.components` 的查询函数、`execution_device()`、`is_unified_stack()`、`weight_generation()`、`bump_weight_generation()` | 04、模型代码、`cache/`、`lora/`、`registry.py` | 第 2.8 节。`is_unified_stack()` 是模型代码读总开关的唯一入口（01 的 T6）。 |
+| `weight_management.components` 的查询函数、`execution_device()`、`is_unified_stack()`、`weight_generation()`、`bump_weight_generation()` | 04、模型代码、`cache/`、`lora/`、`registry.py` | 第 2.8 节。`is_unified_stack()` 是模型代码读总开关的唯一入口（01 的 T6）。 |
 | `model_loader.construct`：`build_component`、`declare_weights`、`hf_component`、`is_building_structure`、`WeightSource`、`BufferSource` | 模型代码 | 第 5 节；`declare_weights` 在构造阶段之外调用、`unified` 下 `build_component` 和 HF 组件入口（带权重的类）在构造阶段之外调用，都报 `LifecycleError`。 |
 | `DynamicLoraSpec` 和包装层记录 | 04、`lora/manager.py` | 槽位形状来自 `overlay_slots`；管理器从目录取包装层。 |
 
@@ -975,7 +975,7 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 
 | 子 RFC | 约定 |
 |---|---|
-| [01](./01-startup-transaction.md) | `StartupContext`（含 `memory_pools`）、`Loader` 协议、错误类型；总开关取自 `weight_stack.startup` 的 `WeightStack` 和 `process_weight_stack()`；驱动不进入任何睡眠池，常驻加速卡的张量（包括收尾里新建、替换的张量和 HSDP 的本地分片）由 Loader 自己在 `ctx.memory_pools.weights()` 里分配；驱动在第 10 步成功之后立即调用 `loader.close()`；必改行和 D06 的位置文件放在 `tests/diffusion/weight_stack/coexistence/sites/` 下，D06 用 `NEW_ROW` 声明，不修改 `registry.py`；T6 不检查 `weight_stack/`、`model_loader/construct.py` 和 `model_loader/hub_prefetch.py` 内部；测试替身（全部常驻的规划、空的 host 存储）用于对比框架。单进程执行器在同一进程里依次进行各 worker 的 `unified` 启动（3.1）。 |
+| [01](./01-startup-transaction.md) | `StartupContext`（含 `memory_pools`）、`Loader` 协议、错误类型；总开关取自 `weight_management.startup` 的 `WeightStack` 和 `process_weight_stack()`；驱动不进入任何睡眠池，常驻加速卡的张量（包括收尾里新建、替换的张量和 HSDP 的本地分片）由 Loader 自己在 `ctx.memory_pools.weights()` 里分配；驱动在第 10 步成功之后立即调用 `loader.close()`；必改行和 D06 的位置文件放在 `tests/diffusion/weight_management/coexistence/sites/` 下，D06 用 `NEW_ROW` 声明，不修改 `registry.py`；T6 不检查 `weight_management/`、`model_loader/construct.py` 和 `model_loader/hub_prefetch.py` 内部；测试替身（全部常驻的规划、空的 host 存储）用于对比框架。单进程执行器在同一进程里依次进行各 worker 的 `unified` 启动（3.1）。 |
 | [03](./03-host-storage.md) | `HostStorage.view(name)` 对瘦路径下本 rank 范围之外的张量、以及等待者的共享张量返回形状和类型正确的 meta 张量；`seal()` 在每个 worker、每种后端上都被调用一次：私有存储和分片在其中定稿，共享存储在其中封存、交接并用 `final_manifest.live()` 重新绑定；`layout()` 只读 `ExpectedManifest` 的条目。 |
 | [04](./04-unified-offloader.md) | `plan()` 第一步调用 `catalog.require_complete()`，并经 `set_discovered_blocks()` 记录自动发现的重复块；`PlacementPlan` 给出每个组件的冷启动路径 `cold_start(component)`（供预检核对）、分片后端 Unit 的张量规范名 `sharded_tensor_names()`（供收尾第 7 步换成占位），以及按规划顺序排列的 `units` 和每个 Unit 的 `roots`、`transport`（供瘦路径的读取器按 Unit 产出，7.2）；`transaction.target()` 的语义同 01；`prepare_materialization()` 分配叠加层槽位，`commit()` 调用 `bind_overlay_slot()` 并把槽位交给动态 LoRA 管理器；`repeated_block_paths` 返回 `set_discovered_blocks()` 记录的结果；`setup_compile` 经查询接口选目标。 |
 | [05](./05-configuration.md) | 解析 `--diffusion-max-lora-rank` 并检查合法值；HSDP 预分片配 LoRA 或量化在参数解析阶段报错；支持矩阵文档收录 5.7 的结果。 |
@@ -983,7 +983,7 @@ LingBot-Video 的 `LingBotVideoTransformer3DModel.to` 覆写在改类型时让 `
 ## 代码组织
 
 ```text
-vllm_omni/diffusion/weight_stack/
+vllm_omni/diffusion/weight_management/
   components.py            ComponentDecl、ComponentCatalog、TensorDecl、OverlaySlotDecl、查询函数、目录的弱引用表
   loader/
     __init__.py            create_loader、Preflight、ExpectedManifest、FinalManifest、ContentIdentity
@@ -1005,14 +1005,14 @@ vllm_omni/diffusion/weight_stack/
 vllm_omni/diffusion/model_loader/construct.py   build_component、declare_weights、hf_component、is_building_structure、来源类型
 vllm_omni/diffusion/models/<family>/unified_build.py   每个迁移家族的 unified 一支
 
-tests/diffusion/weight_stack/loader/
+tests/diffusion/weight_management/loader/
   test_catalog.py  test_context.py  test_trap.py  test_construct_api.py  test_hf_entry.py
   test_reader.py  test_lazy_tensor.py  test_write_tracking.py  test_online_quant.py
   test_adapters.py  test_finalize.py  test_content_identity.py  test_manifests.py
   test_overlay.py  test_diffusers_format.py  test_hsdp.py  test_query_api.py
   test_structure_matrix.py  test_legacy_fingerprints.py
   rules/test_rule_tables.py  rules/configs/
-tests/diffusion/weight_stack/baseline/
+tests/diffusion/weight_management/baseline/
   compare.py  exceptions.py  fixtures/  test_<family>_baseline.py
 ```
 
@@ -1040,7 +1040,7 @@ tests/diffusion/weight_stack/baseline/
 | 02-3 | 2b | 规则表的格式和执行、`generate` 工具、逐表测试框架，以及主干 pipeline 用到的 Hugging Face 类的第一批表 | `loader/rules/` | `rules/test_rule_tables.py` | 02-2 | L | 无 |
 | 02-4 | 2c | 来源解析、读取流水线、延迟张量、预检的来源核对、内容身份、预期清单 | `loader/reader.py`、`loader/identity.py` | `test_reader.py`、`test_lazy_tensor.py`、`test_content_identity.py` | 02-2 | L | 无 |
 | 02-5 | 2c | 存储绑定、写入入口选择、写入跟踪、逐层在线量化、收尾顺序、最终清单、HSDP 组件的物化和分片 | `loader/writer.py`、`loader/quant.py`、`loader/finalize.py`、`loader/hsdp.py` | `test_write_tracking.py`、`test_online_quant.py`、`test_finalize.py`、`test_manifests.py`、`test_hsdp.py` | 02-3、02-4 | L | 无 |
-| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架和 `export_legacy_hashes`、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_stack/baseline/`、`loader/fingerprints.py` | `baseline/test_compare_framework.py`（用一个已按新写法构造的 pipeline，例如 Z-Image，自测对比框架）、`test_legacy_fingerprints.py` | 02-5 | M | 无 |
+| 02-6 | 2b | 以 legacy 为基准的逐张量对比框架和 `export_legacy_hashes`、对比例外表、指纹清单和指纹测试 | `tests/diffusion/weight_management/baseline/`、`loader/fingerprints.py` | `baseline/test_compare_framework.py`（用一个已按新写法构造的 pipeline，例如 Z-Image，自测对比框架）、`test_legacy_fingerprints.py` | 02-5 | M | 无 |
 | 02-7 | 2c | 适配器格式转换器（diffusers、kohya、fasth3、vdn）、读取器里的融合、预检的键核对、`fuse` 固定适配器、worker 的 distill 分支 | `loader/adapters/`、`diffusion_worker.py` | `test_adapters.py`；融合后在线量化在 TP 为 1 和 2 时与参考一致 | 02-5 | L | C16（融合） |
 | 02-8 | 2f | 动态 LoRA 包装、`base_layer` 名字规则、槽位声明、`overlay` 固定适配器（ltx_phase、longcat_dmd 转换器）、管理器的 `unified` 一支 | `loader/overlay.py`、`lora/manager.py`、`diffusion_worker.py` | `test_overlay.py`；加载、切换、卸载动态 LoRA 前后结构和基础权重地址不变 | 02-5 | M | C16（包装） |
 | 02-9 | 2f | `load_format="diffusers"` 的 `unified` 一支、`attach_structure_only_pipeline`、C18 | `loader/diffusers_format.py`、`pipeline_diffusers_adapter.py` | `test_diffusers_format.py`；SDXL fp16 的 `upcast_vae` 由规则表固定类型 | 02-3、02-5 | M | C18 |
@@ -1076,7 +1076,7 @@ tests/diffusion/weight_stack/baseline/
 
 ## 测试计划
 
-除特别写明的以外，测试放在 `tests/diffusion/weight_stack/loader/`，是 L1，标记 `core_model`、`diffusion`、`cpu`，不需要加速卡。
+除特别写明的以外，测试放在 `tests/diffusion/weight_management/loader/`，是 L1，标记 `core_model`、`diffusion`、`cpu`，不需要加速卡。
 
 **组件目录**（`test_catalog.py`）
 
@@ -1137,9 +1137,9 @@ tests/diffusion/weight_stack/baseline/
 - 支持矩阵测试每个 PR 运行，新注册的 pipeline 必须构造成功。
 - 指纹测试每个 PR 运行。
 
-**逐张量对比**（`tests/diffusion/weight_stack/baseline/`）
+**逐张量对比**（`tests/diffusion/weight_management/baseline/`）
 
-- 结构可以配置的家族：合成 checkpoint，L2，标记 `core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`，在改动对应家族目录或 `weight_stack/loader/` 的 PR 上运行。
+- 结构可以配置的家族：合成 checkpoint，L2，标记 `core_model`、`diffusion`，`hardware_test(res={"cuda": "L4"})`，在改动对应家族目录或 `weight_management/loader/` 的 PR 上运行。
 - 结构固定的家族（MiniMax H3、MAGI-2、LTX2 等真实 checkpoint）：L4，标记 `full_model`、`diffusion` 和 `hardware_test(res=...)`（SKU 按 checkpoint 所需的显存选择），每晚运行，接入 `.buildkite/cuda/test-nightly.yml`。
 - 规则表的逐表测试：L1，固定库版本。
 
