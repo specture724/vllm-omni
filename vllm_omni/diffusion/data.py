@@ -100,7 +100,7 @@ def validate_diffusion_weight_stack(config: object) -> str:
         ]
         if values.get("diffusion_offload_config", None) is not None:
             unsupported.append("diffusion_offload_config")
-        if values.get("dlo_host_registration_limit_gib", 0) > 0:
+        if float(values.get("dlo_host_registration_limit_gib", 0)) > 0:
             unsupported.append("dlo_host_registration_limit_gib")
         if values.get("host_weight_runtime_mode", "disabled") != "disabled":
             unsupported.append("host_weight_runtime_mode")

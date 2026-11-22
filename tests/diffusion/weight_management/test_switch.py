@@ -36,6 +36,21 @@ def test_unified_rejects_legacy_offload_settings(setting, value):
     assert "--diffusion-weight-stack legacy" in str(error.value)
 
 
+@pytest.mark.parametrize("projected", [False, True], ids=["direct", "projection"])
+@pytest.mark.parametrize(("limit", "accepted"), [(0, True), ("0", True), (1, False), ("1", False)])
+def test_unified_normalizes_registration_limit_before_admission(projected, limit, accepted):
+    from vllm_omni.config.omni_config import _DiffusionConfigProjection
+
+    factory = _DiffusionConfigProjection.from_kwargs if projected else OmniDiffusionConfig
+    options = {"diffusion_weight_stack": "unified", "dlo_host_registration_limit_gib": limit}
+    if accepted:
+        config = factory(**options)
+        assert config.dlo_host_registration_limit_gib == 0.0
+    else:
+        with pytest.raises(ConfigError, match="dlo_host_registration_limit_gib"):
+            factory(**options)
+
+
 @pytest.mark.parametrize("setting", ["OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE"])
 @pytest.mark.parametrize("value", ["", "0", "1"])
 def test_unified_rejects_prompt_cache_environment(monkeypatch, setting, value):
@@ -218,6 +233,7 @@ def test_failed_worker_initialization_releases_selector(worker_environment, monk
     original = error_type("initialization failed")
 
     def fail(*args, **kwargs):
+        assert process_weight_stack() is WeightStack.UNIFIED
         raise original
 
     if phase == "runner":
@@ -270,6 +286,11 @@ def test_failed_worker_does_not_clear_another_owner(worker_environment, monkeypa
     first = module.DiffusionWorker(0, 0, _worker_config(), skip_load_model=True)
     destroyed = []
     monkeypatch.setattr(module, "destroy_distributed_env", lambda: destroyed.append(True))
+
+    def unexpected_init_device(self):
+        pytest.fail("a conflicting worker must be rejected before device initialization")
+
+    monkeypatch.setattr(module.DiffusionWorker, "init_device", unexpected_init_device)
     try:
         with pytest.raises(ConfigError):
             module.DiffusionWorker(0, 0, _worker_config("legacy"), skip_load_model=True)

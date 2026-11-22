@@ -496,10 +496,10 @@ class DiffusionWorker:
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
-        self.init_device()
-        # A rejected owner must not tear down another worker's distributed environment.
+        # Claim before device setup mutates process-wide rank and device state.
         set_process_weight_stack(parse_weight_stack(od_config.diffusion_weight_stack), owner=self)
         try:
+            self.init_device()
             # Create model runner — one decision chain, in precedence order:
             #   1. explicit od_config.diffusion_model_runner_cls (user override),
             #   2. the runner declared by the engine class that engine_backend
