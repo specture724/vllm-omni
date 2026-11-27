@@ -323,3 +323,61 @@ def test_yaml_rejects_legacy_policy_before_parsing(tmp_path):
     )
     with pytest.raises(ConfigError, match="diffusion_offload_config"):
         VllmOmniConfig.from_pipeline_config(resolve_pipeline_config("dreamzero"), deploy_config_path=str(deploy))
+
+
+def test_package_root_exports_weight_stack():
+    from vllm_omni.diffusion.weight_management import WeightStack
+
+    assert WeightStack.LEGACY.value == "legacy"
+    assert WeightStack.UNIFIED.value == "unified"
+
+
+def test_projection_normalizes_boolean_strings_before_unified_admission():
+    from vllm_omni.config.omni_config import _DiffusionConfigProjection
+
+    accepted = _DiffusionConfigProjection.from_kwargs(diffusion_weight_stack="unified", enable_cpu_offload="false")
+    assert accepted.enable_cpu_offload is False
+    with pytest.raises(ConfigError, match="enable_cpu_offload"):
+        _DiffusionConfigProjection.from_kwargs(diffusion_weight_stack="unified", enable_cpu_offload="true")
+
+
+def test_failed_second_worker_in_init_device_preserves_first_worker_groups(worker_environment, monkeypatch):
+    from vllm_omni.diffusion.weight_management.startup import WeightStack, process_weight_stack
+
+    module, _ = worker_environment
+    first = module.DiffusionWorker(0, 0, _worker_config("unified"), skip_load_model=True)
+    destroyed = []
+    monkeypatch.setattr(module, "destroy_distributed_env", lambda: destroyed.append(True))
+
+    def fail_init_device(self):
+        raise RuntimeError("model parallel state must be empty")
+
+    monkeypatch.setattr(module.DiffusionWorker, "init_device", fail_init_device)
+    try:
+        with pytest.raises(RuntimeError, match="model parallel state must be empty"):
+            module.DiffusionWorker(0, 0, _worker_config("unified"), skip_load_model=True)
+        assert destroyed == []
+        assert process_weight_stack() is WeightStack.UNIFIED
+    finally:
+        first.shutdown()
+    assert process_weight_stack() is WeightStack.LEGACY
+
+
+def test_unclosed_owner_released_on_gc():
+    import gc
+
+    from vllm_omni.diffusion.weight_management.startup import (
+        WeightStack,
+        process_weight_stack,
+        set_process_weight_stack,
+    )
+
+    class _Owner:
+        stage_id = 7
+
+    owner = _Owner()
+    set_process_weight_stack(WeightStack.UNIFIED, owner=owner)
+    assert process_weight_stack() is WeightStack.UNIFIED
+    del owner
+    gc.collect()
+    assert process_weight_stack() is WeightStack.LEGACY

@@ -81,6 +81,16 @@ def _move_diffusion_alias(
     normalized[canonical_name] = legacy_value
 
 
+def _as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("0", "false", "no", "off", "n", "f", ""):
+            return False
+        if lowered in ("1", "true", "yes", "on", "y", "t"):
+            return True
+    return bool(value)
+
+
 def validate_diffusion_weight_stack(config: object) -> str:
     """Validate the selector and temporary unified admission limits (RFC 01-2)."""
     from vllm_omni.diffusion.weight_management.errors import ConfigError
@@ -96,12 +106,20 @@ def validate_diffusion_weight_stack(config: object) -> str:
                 "enable_layerwise_offload",
                 "enable_distributed_layerwise_offload",
             )
-            if values.get(name, False)
+            if _as_bool(values.get(name, False))
         ]
         if values.get("diffusion_offload_config", None) is not None:
             unsupported.append("diffusion_offload_config")
-        if float(values.get("dlo_host_registration_limit_gib", 0)) > 0:
-            unsupported.append("dlo_host_registration_limit_gib")
+        limit = values.get("dlo_host_registration_limit_gib", 0)
+        if limit is not None:
+            try:
+                if float(limit) > 0:
+                    unsupported.append("dlo_host_registration_limit_gib")
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(
+                    f"dlo_host_registration_limit_gib must be a number, got {limit!r}",
+                    fix="use --diffusion-weight-stack legacy",
+                ) from exc
         if values.get("host_weight_runtime_mode", "disabled") != "disabled":
             unsupported.append("host_weight_runtime_mode")
         if values.get("host_weight_runtime_root", None) is not None:

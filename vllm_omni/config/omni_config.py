@@ -1056,15 +1056,12 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             build_attention_config,
             parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
-            validate_diffusion_weight_stack,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
             validate_kv_cache_dtype_vs_attention_specs,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
-
-        validate_diffusion_weight_stack(self)
 
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
         self.moe_backend = kernels.moe_backend

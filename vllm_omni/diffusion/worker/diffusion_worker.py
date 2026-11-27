@@ -86,6 +86,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
 from vllm_omni.diffusion.weight_management.startup import (
+    WeightStack,
     clear_process_weight_stack,
     parse_weight_stack,
     set_process_weight_stack,
@@ -497,9 +498,13 @@ class DiffusionWorker:
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         # Claim before device setup mutates process-wide rank and device state.
-        set_process_weight_stack(parse_weight_stack(od_config.diffusion_weight_stack), owner=self)
+        raw_stack = getattr(od_config, "diffusion_weight_stack", None)
+        stack = parse_weight_stack(raw_stack) if isinstance(raw_stack, (str, type(None))) else WeightStack.LEGACY
+        set_process_weight_stack(stack, owner=self)
+        device_initialized = False
         try:
             self.init_device()
+            device_initialized = True
             # Create model runner — one decision chain, in precedence order:
             #   1. explicit od_config.diffusion_model_runner_cls (user override),
             #   2. the runner declared by the engine class that engine_backend
@@ -544,10 +549,15 @@ class DiffusionWorker:
                 with set_current_vllm_config(self.vllm_config):
                     self.init_lora_manager()
         except BaseException:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("Worker %s: cleanup after initialization failure failed", self.rank)
+            # Only tear down process-global distributed state if this worker
+            # completed init_device(); otherwise release only our stack claim.
+            if device_initialized:
+                try:
+                    self.shutdown()
+                except Exception:
+                    logger.exception("Worker %s: cleanup after initialization failure failed", self.rank)
+            else:
+                clear_process_weight_stack(owner=self)
             raise
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
@@ -1614,118 +1624,116 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and release process-global resources."""
+        clear_process_weight_stack(owner=self)
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._shutdown_complete = True
+
+        # Detach every model-owned reference before releasing the CuMem pools.
+        # Inline executors stay in the parent process, so relying on their
+        # wrapper becoming unreachable is not sufficient for deterministic
+        # teardown between sequential engine instances.
+        model_runner = getattr(self, "model_runner", None)
+        lora_manager = getattr(self, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.close()
+        # The manager still references its pipeline after close. Drop this
+        # local before cleanup tracebacks or CuMem pool release can retain it.
+        del lora_manager
+        self.model_runner = None
+        self.lora_manager = None
+        self.profiler = None
+        self._sleep_saved_buffers = {}
+        self._step_lora_state = {}
+
+        # WTE retains the pipeline independently of model_runner. Close its
+        # transport before distributed teardown and drop both references before
+        # releasing the model's memory pools.
+        weight_transfer_engine = getattr(self, "weight_transfer_engine", None)
+        self.weight_transfer_engine = None
         try:
-            if getattr(self, "_shutdown_complete", False):
-                return
-            self._shutdown_complete = True
-
-            # Detach every model-owned reference before releasing the CuMem pools.
-            # Inline executors stay in the parent process, so relying on their
-            # wrapper becoming unreachable is not sufficient for deterministic
-            # teardown between sequential engine instances.
-            model_runner = getattr(self, "model_runner", None)
-            lora_manager = getattr(self, "lora_manager", None)
-            if lora_manager is not None:
-                lora_manager.close()
-            # The manager still references its pipeline after close. Drop this
-            # local before cleanup tracebacks or CuMem pool release can retain it.
-            del lora_manager
-            self.model_runner = None
-            self.lora_manager = None
-            self.profiler = None
-            self._sleep_saved_buffers = {}
-            self._step_lora_state = {}
-
-            # WTE retains the pipeline independently of model_runner. Close its
-            # transport before distributed teardown and drop both references before
-            # releasing the model's memory pools.
-            weight_transfer_engine = getattr(self, "weight_transfer_engine", None)
-            self.weight_transfer_engine = None
-            try:
-                if weight_transfer_engine is not None:
-                    weight_transfer_engine.shutdown()
-            except Exception:
-                logger.exception("Failed to shut down diffusion weight transfer engine")
-            finally:
-                del weight_transfer_engine
-
-            if model_runner is not None:
-                mgr = getattr(model_runner, "kv_transfer_manager", None)
-                if mgr is None:
-                    mgr = getattr(model_runner, "_kv_transfer_manager", None)
-                try:
-                    offload_backend = getattr(model_runner, "offload_backend", None)
-                    if offload_backend is not None:
-                        offload_backend.shutdown()
-                except Exception:
-                    logger.exception("Failed to shut down diffusion offload backend during shutdown")
-                try:
-                    if mgr is not None:
-                        mgr.close()
-                except Exception:
-                    logger.exception("Failed to close diffusion KV transfer manager during shutdown")
-
-            try:
-                shutdown_kv_connector()
-            except Exception:
-                logger.exception("Failed to shutdown diffusion KV connector")
-
-            try:
-                a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-                if a2a_permute is not None:
-                    a2a_permute.clear_a2a_permute_workspaces()
-            except Exception:
-                logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
-
-            try:
-                destroy_distributed_env()
-            except Exception:
-                logger.exception("Failed to destroy diffusion distributed environment")
-
-            # Drop the local runner only after its background services are stopped.
-            # Tensor finalizers must run before release_pools(), otherwise the
-            # singleton keeps allocations visible to the next sleep-enabled worker.
-            del model_runner
-            owns_sleep_pool = getattr(self, "_owns_sleep_pool", False)
-            if owns_sleep_pool:
-                try:
-                    current_omni_platform.synchronize()
-                except Exception:
-                    logger.exception("Failed to synchronize diffusion device during shutdown")
-            try:
-                gc.collect()
-            except Exception:
-                logger.exception("Failed to collect diffusion model resources during shutdown")
-            if owns_sleep_pool:
-                try:
-                    allocator = _get_mem_allocator_instance()
-                    if allocator.get_current_usage():
-                        gc.collect()
-                    if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
-                        from vllm_omni.patch import release_cumem_allocations_for_shutdown
-
-                        retired_bytes = release_cumem_allocations_for_shutdown(allocator)
-                        if retired_bytes:
-                            logger.info(
-                                "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
-                                retired_bytes / GiB_bytes,
-                            )
-                    allocator.release_pools()
-                    self._owns_sleep_pool = False
-                    # Re-collect after dropping the pool references so their
-                    # finalizers remove every tracked allocation before the next
-                    # inline worker checks get_current_usage().
-                    gc.collect()
-                    remaining_usage = allocator.get_current_usage()
-                    if remaining_usage:
-                        logger.warning(
-                            "Diffusion CuMem allocator still tracks %s bytes after shutdown",
-                            remaining_usage,
-                        )
-                except Exception:
-                    logger.exception("Failed to release diffusion CuMem pools during shutdown")
+            if weight_transfer_engine is not None:
+                weight_transfer_engine.shutdown()
+        except Exception:
+            logger.exception("Failed to shut down diffusion weight transfer engine")
         finally:
-            clear_process_weight_stack(owner=self)
+            del weight_transfer_engine
+
+        if model_runner is not None:
+            mgr = getattr(model_runner, "kv_transfer_manager", None)
+            if mgr is None:
+                mgr = getattr(model_runner, "_kv_transfer_manager", None)
+            try:
+                offload_backend = getattr(model_runner, "offload_backend", None)
+                if offload_backend is not None:
+                    offload_backend.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down diffusion offload backend during shutdown")
+            try:
+                if mgr is not None:
+                    mgr.close()
+            except Exception:
+                logger.exception("Failed to close diffusion KV transfer manager during shutdown")
+
+        try:
+            shutdown_kv_connector()
+        except Exception:
+            logger.exception("Failed to shutdown diffusion KV connector")
+
+        try:
+            a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+            if a2a_permute is not None:
+                a2a_permute.clear_a2a_permute_workspaces()
+        except Exception:
+            logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+
+        try:
+            destroy_distributed_env()
+        except Exception:
+            logger.exception("Failed to destroy diffusion distributed environment")
+
+        # Drop the local runner only after its background services are stopped.
+        # Tensor finalizers must run before release_pools(), otherwise the
+        # singleton keeps allocations visible to the next sleep-enabled worker.
+        del model_runner
+        owns_sleep_pool = getattr(self, "_owns_sleep_pool", False)
+        if owns_sleep_pool:
+            try:
+                current_omni_platform.synchronize()
+            except Exception:
+                logger.exception("Failed to synchronize diffusion device during shutdown")
+        try:
+            gc.collect()
+        except Exception:
+            logger.exception("Failed to collect diffusion model resources during shutdown")
+        if owns_sleep_pool:
+            try:
+                allocator = _get_mem_allocator_instance()
+                if allocator.get_current_usage():
+                    gc.collect()
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
+                    from vllm_omni.patch import release_cumem_allocations_for_shutdown
+
+                    retired_bytes = release_cumem_allocations_for_shutdown(allocator)
+                    if retired_bytes:
+                        logger.info(
+                            "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
+                            retired_bytes / GiB_bytes,
+                        )
+                allocator.release_pools()
+                self._owns_sleep_pool = False
+                # Re-collect after dropping the pool references so their
+                # finalizers remove every tracked allocation before the next
+                # inline worker checks get_current_usage().
+                gc.collect()
+                remaining_usage = allocator.get_current_usage()
+                if remaining_usage:
+                    logger.warning(
+                        "Diffusion CuMem allocator still tracks %s bytes after shutdown",
+                        remaining_usage,
+                    )
+            except Exception:
+                logger.exception("Failed to release diffusion CuMem pools during shutdown")
 
 
 class CustomPipelineWorkerExtension:

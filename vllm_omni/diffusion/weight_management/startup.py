@@ -14,18 +14,15 @@ from __future__ import annotations
 
 import enum
 import logging
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
 
 from vllm_omni.diffusion.weight_management.errors import ConfigError, LifecycleError
+from vllm_omni.diffusion.weight_management.interfaces import WeightStack
 
 logger = logging.getLogger(__name__)
-
-
-class WeightStack(str, enum.Enum):
-    LEGACY = "legacy"
-    UNIFIED = "unified"
 
 
 def parse_weight_stack(value: object) -> WeightStack:
@@ -46,23 +43,35 @@ def is_unified(config: object) -> bool:
     return parse_weight_stack(getattr(config, "diffusion_weight_stack", None)) is WeightStack.UNIFIED
 
 
-# Identity keys also support unhashable worker owners.
-_process_owners: dict[int, tuple[object, WeightStack]] = {}
+# Identity keys support unhashable owners; weakrefs avoid leaking unclosed workers.
+_process_owners: dict[int, tuple[weakref.ref[object] | None, int | None, WeightStack]] = {}
 _process_lock = Lock()
+
+
+def _prune_dead_owners() -> None:
+    for owner_id in [k for k, (ref, _, _) in _process_owners.items() if ref is not None and ref() is None]:
+        _process_owners.pop(owner_id, None)
 
 
 def set_process_weight_stack(value: WeightStack, *, owner: object) -> None:
     value = parse_weight_stack(value)
+    owner_id = id(owner)
+    stage_id = getattr(owner, "stage_id", None)
+    try:
+        ref: weakref.ref[object] | None = weakref.ref(owner)
+    except TypeError:
+        ref = None
     with _process_lock:
-        for current_owner, current_value in _process_owners.values():
-            if current_value is not value:
+        _prune_dead_owners()
+        for current_id, (_, current_stage, current_value) in _process_owners.items():
+            if current_id != owner_id and current_value is not value:
                 raise ConfigError(
-                    f"stage {getattr(owner, 'stage_id', None)} selects {value.value!r}, but "
-                    f"stage {getattr(current_owner, 'stage_id', None)} already owns {current_value.value!r} "
+                    f"stage {stage_id} selects {value.value!r}, but "
+                    f"stage {current_stage} already owns {current_value.value!r} "
                     "in this process",
                     fix="use the same diffusion_weight_stack for all workers in one process",
                 )
-        _process_owners[id(owner)] = (owner, value)
+        _process_owners[owner_id] = (ref, stage_id, value)
 
 
 def clear_process_weight_stack(*, owner: object) -> None:
@@ -72,7 +81,8 @@ def clear_process_weight_stack(*, owner: object) -> None:
 
 def process_weight_stack() -> WeightStack:
     with _process_lock:
-        return next((value for _, value in _process_owners.values()), WeightStack.LEGACY)
+        _prune_dead_owners()
+        return next((value for _, _, value in _process_owners.values()), WeightStack.LEGACY)
 
 
 class ResourceKind(enum.IntEnum):

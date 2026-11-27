@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 from pytest_mock import MockerFixture
@@ -13,7 +13,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 def mock_od_config(mocker: MockerFixture):
     """Create a mock OmniDiffusionConfig with a CUDA profiler backend."""
     config = mocker.Mock()
-    config.diffusion_weight_stack = "legacy"
     config.profiler_config = mocker.Mock()
     config.profiler_config.profiler = "cuda"
     config.diffusion_load_format = "default"
@@ -23,13 +22,8 @@ def mock_od_config(mocker: MockerFixture):
 @pytest.fixture
 def mock_diffusion_worker_dependencies(mocker: MockerFixture):
     """Patch heavy worker dependencies for focused profiler tests."""
-    workers = []
-    mocker.patch.object(DiffusionWorker, "init_device", autospec=True, side_effect=workers.append)
+    mocker.patch.object(DiffusionWorker, "init_device")
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionModelRunner")
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
-    yield
-    for worker in workers:
-        worker.shutdown()
 
 
 class TestDiffusionWorkerCudaProfiler:
