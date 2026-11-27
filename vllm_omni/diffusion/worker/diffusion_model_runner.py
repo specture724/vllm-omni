@@ -243,6 +243,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.od_config = od_config
         self.device = device
         self.pipeline: Any | None = None
+        self.weight_stack: Any | None = None
+        self._weight_stack_factory: Any | None = None
         self.cache_backend: Any | None = None
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
@@ -351,12 +353,157 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             compile_kwargs["dynamic"],
         )
 
+    def close_weight_stack(self) -> None:
+        """Close the active unified weight stack locally and clear model references. Idempotent."""
+        handle = getattr(self, "weight_stack", None)
+        self.weight_stack = None
+        try:
+            if handle is not None:
+                handle.close()
+        finally:
+            self.pipeline = None
+
+    def _install_runtime_services(self, enable_pec: bool, pec_size: int) -> None:
+        """Install cache backend, prompt-embedding cache, and interaction coordinator."""
+        # Setup cache backend
+        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+
+        if self.cache_backend is not None:
+            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
+                logger.warning(
+                    "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
+                    self.od_config.cache_backend,
+                    self.od_config.model_class_name,
+                )
+                self.cache_backend = None
+                self.od_config.cache_backend = None
+            else:
+                # Install configured cache capability once at startup. A model
+                # may explicitly adopt the enabled Cache-DiT backend and then
+                # own all later request-boundary enable/disable transitions.
+                self.cache_backend.enable(self.pipeline)
+                if isinstance(self.cache_backend, CacheDiTBackend) and adopt_request_scoped_cache_dit(
+                    self.pipeline,
+                    self.cache_backend,
+                ):
+                    logger.info(
+                        "Pipeline %s owns request-scoped Cache-DiT transitions.",
+                        type(self.pipeline).__name__,
+                    )
+                    self.cache_backend = None
+
+        # Install prompt-embedding cache (transparent wrapper around
+        # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
+        # when the pipeline does not expose ``encode_prompt``.
+        if enable_pec:
+            self.prompt_embed_cache = install_prompt_embed_cache(
+                self.pipeline,
+                max_size=pec_size,
+                enabled=True,
+                model_tag=self.od_config.model_class_name,
+            )
+
+        self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
+        if hasattr(self.pipeline, "_interaction_coordinator"):
+            self.pipeline._interaction_coordinator = self._interaction_coordinator
+
+        self._validate_service_attention_schedule()
+
+    def _load_model_unified(
+        self,
+        memory_pools: Any | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> None:
+        from vllm_omni.diffusion.weight_management.errors import LifecycleError
+        from vllm_omni.diffusion.weight_management.interfaces import StartupContext
+        from vllm_omni.diffusion.weight_management.startup import FaultPlan, run_unified_startup
+
+        if self.weight_stack is not None:
+            raise LifecycleError(
+                "existing unified weight stack must be closed before reloading",
+                where="DiffusionModelRunner._load_model_unified",
+            )
+
+        enable_pec = bool(self.od_config.enable_prompt_embed_cache)
+        pec_size = int(self.od_config.prompt_embed_cache_size)
+
+        current_omni_platform.init_diffusion_model_runner_runtime(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+
+        if torch.distributed.is_initialized():
+            from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+            world = get_world_group()
+            rank, local_rank, world_size = world.rank_in_group, world.local_rank, world.world_size
+        else:
+            rank, local_rank, world_size = 0, 0, 1
+
+        if memory_pools is None:
+
+            class _NullMemoryPools:
+                def weights(self) -> AbstractContextManager[None]:
+                    return nullcontext()
+
+                def slots(self) -> AbstractContextManager[None]:
+                    return nullcontext()
+
+            memory_pools = _NullMemoryPools()
+
+        ctx = StartupContext(
+            od_config=self.od_config,
+            vllm_config=self.vllm_config,
+            device=self.device,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+            memory_pools=memory_pools,
+            policy=None,
+            compile_enabled=not self.od_config.enforce_eager and current_omni_platform.supports_torch_inductor(),
+            faults=FaultPlan.from_environ(),
+        )
+
+        with DeviceMemoryProfiler() as m:
+            handle = run_unified_startup(ctx, factory=self._weight_stack_factory)
+
+        self.weight_stack = handle
+        self.pipeline = handle.model
+        self.offload_backend = None
+        self.model_memory_usage = int(m.consumed_memory)
+
+        try:
+            if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
+                logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
+                self.od_config.step_execution = True
+
+            if self.od_config.step_execution and not self._supports_step_mode():
+                raise ValueError(
+                    "step_execution=True requires a pipeline implementing "
+                    "prepare_encode(), denoise_step(), post_decode(), and either "
+                    "step_scheduler() or denoise_step_updates_state=True; "
+                    f"{self.od_config.model_class_name} does not support that contract."
+                )
+
+            self._install_runtime_services(enable_pec, pec_size)
+            handle.mark_in_service()
+        except BaseException:
+            self.close_weight_stack()
+            raise
+
+        logger.info("Model runner: Unified initialization complete.")
+
     def load_model(
         self,
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
         initialize_lora: Callable[[], None] | None = None,
+        memory_pools: Any | None = None,
     ) -> None:
         """
         Launch the diffusion pipeline, applying compilation, offloading, and caching.
@@ -370,6 +517,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 - "dummy": Skip actual weight loading, useful for testing and custom pipelines that
                     don't require default weights.
             custom_pipeline_name: Optional custom pipeline class name to use.
+            memory_pools: Optional unified sleep-mode memory pools supplied by worker.
         """
 
         if getattr(self, "_weight_share_backend", None) is not None:
@@ -380,6 +528,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if shared_group is not None and load_format not in (None, "default"):
             raise ValueError(f"shared-backbone loading requires load_format='default', got {load_format!r}")
         if load_format == "dummy":
+            return
+
+        from vllm_omni.diffusion.weight_management.startup import is_unified
+
+        if is_unified(self.od_config):
+            self._load_model_unified(
+                memory_pools=memory_pools,
+                load_format=load_format,
+                custom_pipeline_name=custom_pipeline_name,
+            )
             return
 
         self._require_attention_schedule_pipeline(load_format)
@@ -496,49 +654,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     current_omni_platform.get_torch_device(),
                 )
 
-        # Setup cache backend
-        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-
-        if self.cache_backend is not None:
-            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
-                logger.warning(
-                    "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
-                    self.od_config.cache_backend,
-                    self.od_config.model_class_name,
-                )
-                self.cache_backend = None
-                self.od_config.cache_backend = None
-            else:
-                # Install configured cache capability once at startup. A model
-                # may explicitly adopt the enabled Cache-DiT backend and then
-                # own all later request-boundary enable/disable transitions.
-                self.cache_backend.enable(self.pipeline)
-                if isinstance(self.cache_backend, CacheDiTBackend) and adopt_request_scoped_cache_dit(
-                    self.pipeline,
-                    self.cache_backend,
-                ):
-                    logger.info(
-                        "Pipeline %s owns request-scoped Cache-DiT transitions.",
-                        type(self.pipeline).__name__,
-                    )
-                    self.cache_backend = None
-
-        # Install prompt-embedding cache (transparent wrapper around
-        # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
-        # when the pipeline does not expose ``encode_prompt``.
-        if enable_pec:
-            self.prompt_embed_cache = install_prompt_embed_cache(
-                self.pipeline,
-                max_size=pec_size,
-                enabled=True,
-                model_tag=self.od_config.model_class_name,
-            )
-
-        self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
-        if hasattr(self.pipeline, "_interaction_coordinator"):
-            self.pipeline._interaction_coordinator = self._interaction_coordinator
-
-        self._validate_service_attention_schedule()
+        self._install_runtime_services(enable_pec, pec_size)
         logger.info("Model runner: Initialization complete.")
 
     def _require_attention_schedule_pipeline(self, load_format: str) -> None:

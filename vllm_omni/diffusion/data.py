@@ -2916,6 +2916,7 @@ class CuMemTag(str, Enum):
     """Tags representing specific CuMem allocations for sleep/wake state tracking."""
 
     WEIGHTS = "weights"
+    WEIGHT_SLOTS = "weight_slots"
     KV_CACHE = "kv_cache"
 
 

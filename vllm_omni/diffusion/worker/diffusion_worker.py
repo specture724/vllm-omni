@@ -88,6 +88,7 @@ from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolv
 from vllm_omni.diffusion.weight_management.startup import (
     WeightStack,
     clear_process_weight_stack,
+    is_unified,
     parse_weight_stack,
     set_process_weight_stack,
 )
@@ -863,12 +864,20 @@ class DiffusionWorker:
             set_current_vllm_config(self.vllm_config),
             cutlass_fp8_context,
         ):
-            self.model_runner.load_model(
-                memory_pool_context_fn=self._maybe_get_memory_pool_context,
-                load_format=load_format,
-                custom_pipeline_name=custom_pipeline_name,
-                initialize_lora=self.init_lora_manager,
-            )
+            if is_unified(self.od_config):
+                self.model_runner.load_model(
+                    memory_pools=self._build_unified_memory_pools(),
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
+                    initialize_lora=self.init_lora_manager,
+                )
+            else:
+                self.model_runner.load_model(
+                    memory_pool_context_fn=self._maybe_get_memory_pool_context,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
+                    initialize_lora=self.init_lora_manager,
+                )
             current_omni_platform.synchronize()
             gc.collect()
         process_memory = get_process_gpu_memory(self.local_rank)
@@ -1435,6 +1444,12 @@ class DiffusionWorker:
             assert model is not None, "Pipeline not initialized"
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
+        if is_unified(self.od_config) and self.model_runner is not None:
+            weight_stack = getattr(self.model_runner, "weight_stack", None)
+            runtime = getattr(weight_stack, "runtime", None)
+            if runtime is not None:
+                runtime.before_sleep()
+
         free_mem_before = current_omni_platform.get_free_memory()
 
         # Level 1: Offload weights; Level 2: Total Discard
@@ -1476,7 +1491,11 @@ class DiffusionWorker:
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
         allocator = _get_mem_allocator_instance()
-        allocator.wake_up(tags)
+        wake_tags = tags
+        if is_unified(self.od_config):
+            if wake_tags is not None and "weights" in wake_tags and "weight_slots" not in wake_tags:
+                wake_tags = [*wake_tags, "weight_slots"]
+        allocator.wake_up(wake_tags)
         current_omni_platform.synchronize()
         if self.model_runner is not None and (tags is None or "kv_cache" in tags):
             self.model_runner.refresh_diffusion_kv_block_table_layout()
@@ -1488,6 +1507,11 @@ class DiffusionWorker:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
             logger.info(f"[Worker {self.rank}] Buffers restored from CPU.")
+        if is_unified(self.od_config) and self.model_runner is not None:
+            weight_stack = getattr(self.model_runner, "weight_stack", None)
+            runtime = getattr(weight_stack, "runtime", None)
+            if runtime is not None:
+                runtime.after_wake()
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
 
@@ -1608,6 +1632,26 @@ class DiffusionWorker:
                     pass
             return OmniACK(task_id=task_id, status="ERROR", error_msg=str(e))
 
+    def _build_unified_memory_pools(self) -> Any:
+        """Build unified weights/weight_slots sleep pools with a single occupancy check."""
+        is_sleep_enabled = getattr(self.od_config, "enable_sleep_mode", False)
+        allocator: Any = None
+        if is_sleep_enabled:
+            current_omni_platform.synchronize()
+            gc.collect()
+            allocator = _get_mem_allocator_instance()
+            assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+            self._owns_sleep_pool = True
+
+        class _WorkerMemoryPools:
+            def weights(self) -> AbstractContextManager[None]:
+                return allocator.use_memory_pool(tag="weights") if allocator is not None else nullcontext()
+
+            def slots(self) -> AbstractContextManager[None]:
+                return allocator.use_memory_pool(tag="weight_slots") if allocator is not None else nullcontext()
+
+        return _WorkerMemoryPools()
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         """Get memory pool context for sleep mode support."""
         is_sleep_enabled = getattr(self.od_config, "enable_sleep_mode", False)
@@ -1659,10 +1703,18 @@ class DiffusionWorker:
         finally:
             del weight_transfer_engine
 
+        unified_mode = is_unified(getattr(self, "od_config", None))
         if model_runner is not None:
             mgr = getattr(model_runner, "kv_transfer_manager", None)
             if mgr is None:
                 mgr = getattr(model_runner, "_kv_transfer_manager", None)
+            if unified_mode:
+                try:
+                    close_weight_stack = getattr(model_runner, "close_weight_stack", None)
+                    if close_weight_stack is not None:
+                        close_weight_stack()
+                except Exception:
+                    logger.exception("Failed to close diffusion unified weight stack during shutdown")
             try:
                 offload_backend = getattr(model_runner, "offload_backend", None)
                 if offload_backend is not None:
@@ -1686,6 +1738,14 @@ class DiffusionWorker:
                 a2a_permute.clear_a2a_permute_workspaces()
         except Exception:
             logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+
+        if unified_mode:
+            try:
+                from vllm_omni.diffusion.weight_management.group import destroy_allgather_groups
+
+                destroy_allgather_groups()
+            except Exception:
+                logger.exception("Failed to destroy diffusion AllGather groups during shutdown")
 
         try:
             destroy_distributed_env()
@@ -1755,7 +1815,12 @@ class CustomPipelineWorkerExtension:
 
         # Clean up old pipeline
         model_runner = cast(DiffusionModelRunner, worker.model_runner)
-        if model_runner.pipeline is not None:
+        if is_unified(worker.od_config):
+            model_runner.close_weight_stack()
+            worker.lora_manager = None
+            gc.collect()
+            current_omni_platform.empty_cache()
+        elif model_runner.pipeline is not None:
             del model_runner.pipeline
             gc.collect()
             torch.accelerator.empty_cache()
