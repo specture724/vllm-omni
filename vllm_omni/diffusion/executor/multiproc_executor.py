@@ -29,11 +29,6 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
-from vllm_omni.diffusion.offloader.config import (
-    TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
-    resolve_offload,
-)
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -78,9 +73,16 @@ def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
     return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
 
 
+def any_selected_component_uses_allgather(config: object) -> bool:
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
+    return execution_offload_facts(config).weight_collectives
+
+
 def _uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
+    return execution_offload_facts(config).text_encoder_allgather
 
 
 def _schedule_extra_args_signature(extra_args: dict | None) -> str | None:

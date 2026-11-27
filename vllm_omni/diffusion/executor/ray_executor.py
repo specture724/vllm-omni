@@ -41,11 +41,6 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.media import DiffusionMediaOutput
-from vllm_omni.diffusion.offloader.config import (
-    TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
-    resolve_offload,
-)
 from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception
@@ -136,10 +131,12 @@ def _worker_env(od_config: OmniDiffusionConfig) -> dict[str, str]:
 
 
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
     parallel_config = getattr(od_config, "parallel_config", None)
     return bool(
         (getattr(parallel_config, "data_parallel_size", 1) or 1) > 1
-        and any_selected_component_uses_allgather(od_config)
+        and execution_offload_facts(od_config).weight_collectives
     )
 
 
@@ -167,8 +164,9 @@ def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
 
 
 def _uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
+    from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
+    return execution_offload_facts(config).text_encoder_allgather
 
 
 def _move_to_cpu(value: Any) -> Any:
@@ -934,8 +932,10 @@ class RayDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             if new_req.diffusion_kv_metadata is not None:
                 args += (new_req.diffusion_kv_metadata,)
             try:
+                from vllm_omni.diffusion.weight_management.startup import execution_offload_facts
+
                 timeout_options: dict[str, Any] = {}
-                if any_selected_component_uses_allgather(self.od_config):
+                if execution_offload_facts(self.od_config).weight_collectives:
                     timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
                     "execute_model",
