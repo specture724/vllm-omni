@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.weight_management.loader import ExpectedManifest, FinalManifest, Preflight
     from vllm_omni.diffusion.weight_management.offload import PlacementPlan, Unit
     from vllm_omni.diffusion.weight_management.policy import OffloadPolicy
-    from vllm_omni.diffusion.weight_management.startup import FaultPlan  # type: ignore[attr-defined]
+    from vllm_omni.diffusion.weight_management.startup import FaultPlan
 
 
 class WeightStack(str, enum.Enum):

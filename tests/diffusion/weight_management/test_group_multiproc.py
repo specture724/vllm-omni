@@ -245,3 +245,66 @@ def test_point0_and_point1_validation_fails_all_ranks(scenario, expected_error):
     res = _run(2, scenario)
     for rank in range(2):
         assert res[rank]["error"] == expected_error
+
+
+def _driver_worker(rank: int, world_size: int, port: int, fault_spec: str | None, timeout: float, results) -> None:
+    from tests.diffusion.weight_management.fakes import FakeStackFactory, make_startup_context
+    from vllm_omni.diffusion.weight_management.startup import FaultPlan, run_unified_startup
+
+    configure_cpu_collective_worker()
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=30))
+    cpu_group = dist.new_group(list(range(world_size)), backend="gloo")
+    ch = group.GroupConfirmation(world_size=world_size, rank=rank, cpu_group=cpu_group, timeout_seconds=timeout)
+    factory = FakeStackFactory()
+    faults = FaultPlan.parse(fault_spec) if fault_spec else None
+    ctx = make_startup_context(rank=rank, world_size=world_size, faults=faults)
+    try:
+        handle = run_unified_startup(ctx, factory=factory, group=ch)
+        handle.mark_in_service()
+        state = handle.state.value
+        handle.close()
+        results.put((rank, {"state": state, "closed": handle.state.value}))
+    except Exception as exc:
+        results.put(
+            (
+                rank,
+                {
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "slot_closed": factory.offloader.slot_closed if factory.offloader is not None else 0,
+                },
+            )
+        )
+    finally:
+        group.destroy_allgather_groups()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_driver(world_size: int, fault_spec: str | None, timeout: float = 10.0) -> dict[int, dict]:
+    ctx = collective_context("cpu")
+    queue = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(target=_driver_worker, args=(rank, world_size, port, fault_spec, timeout, queue))
+        for rank in range(world_size)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0, f"driver worker exited with {p.exitcode}"
+    return dict(queue.get(timeout=5) for _ in range(world_size))
+
+
+def test_driver_two_rank_startup_and_single_rank_fault():
+    ok = _run_driver(2, None)
+    for rank in range(2):
+        assert ok[rank] == {"state": "in_service", "closed": "closed"}
+
+    failed = _run_driver(2, "prepare@1:raise")
+    assert failed[1]["error"] == "PrepareError"
+    assert failed[0]["error"] == PeerFailureError.__name__
+    assert failed[0]["slot_closed"] == 1
