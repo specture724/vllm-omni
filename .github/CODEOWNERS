@@ -153,3 +153,8 @@
 # Diffusion offloader (CPU offloading, DLO)
 # — docs/design/module/diffusion/offloader.md
 /vllm_omni/diffusion/offloader/ @yuanheng-zhao @david6666666 @lishunyang12
+
+# Diffusion weight management (unified startup transaction, selector, coexistence)
+# — docs/design/module/diffusion/weight_management.md
+/vllm_omni/diffusion/weight_management/ @specture724 @david6666666 @yuanheng-zhao
+/tests/diffusion/weight_management/coexistence/ @specture724 @david6666666 @yuanheng-zhao
